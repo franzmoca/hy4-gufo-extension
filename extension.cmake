@@ -1,18 +1,28 @@
 # Hy4 Flash external model extension.
 
+# Host side: artifact probe, chat template, tool syntax and registration.
 gufo_extension_target(
   NAME gufo_hy4flash
   SOURCES
+    chat_template.cpp
     extension.cpp
     probe.cpp
+    text_contract.cpp
+    tool_calls.cpp
   LINK_LIBRARIES
     gufo_ext_runtime
+    gufo_ext_core
 )
 
 if(TARGET gufo_hy4flash)
   target_include_directories(gufo_hy4flash PUBLIC
     "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>"
   )
+  # Registration leaves the provider to gufo_hy4flash_text in HIP builds.
+  if(ENGINE_ENABLE_HIP)
+    set_property(SOURCE "${GUFO_EXTENSION_BUILD_ROOT}/extension.cpp"
+      APPEND PROPERTY COMPILE_DEFINITIONS ENGINE_ENABLE_HIP=1)
+  endif()
 endif()
 
 if(ENGINE_ENABLE_HIP)
@@ -79,6 +89,23 @@ if(TARGET gufo_hy4flash_hip)
     -O3 $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>)
   target_include_directories(gufo_hy4flash_hip PUBLIC
     "$<BUILD_INTERFACE:${GUFO_EXTENSION_BUILD_ROOT}>")
+endif()
+
+# Serving runner, prompt cache and the provider registration.
+gufo_extension_target(
+  NAME gufo_hy4flash_text
+  SOURCES
+    continuation_adapter.cpp
+    provider.cpp
+    runner.cpp
+  LINK_LIBRARIES
+    gufo_hy4flash_hip
+    gufo_hy4flash
+    gufo_ext_runtime
+    gufo_ext_hip
+)
+if(TARGET gufo_hy4flash_text)
+  target_compile_options(gufo_hy4flash_text PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
 endif()
 
 # Probes against a model: built by `hy4flash_probes`, not by default.

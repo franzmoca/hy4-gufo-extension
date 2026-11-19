@@ -205,6 +205,31 @@ These are judgment calls made without the maintainer; revisit any of them.
    the nixpkgs web UI step and backport.
 9. **Nothing leaves the machine** while the maintainer is away: commits stay
    local, with no GitHub repository or push.
+10. **Prefill in 256-token passes** (`Model::kMaxChunk`): dense and routed
+    projections through the vendored MMQ (the routed grids bounded by the real
+    expert buckets), F32 projections through hipBLAS SGEMM, `wk_b` (K = 192)
+    dequantized to F32 for a strided-batched SGEMM, `wv_b` through the grouped
+    MMQ, and attention as two SGEMMs around a softmax kernel with sinks, the
+    SWA window and the indexer's selection mask. Passes of up to 8 tokens keep
+    the matvecs.
+11. **The gate for kernel changes is the KL divergence** from llama.cpp's
+    logits over 4,094 positions (see Correctness oracle), not greedy identity
+    or perplexity, both of which rounding moves on this model.
+12. **Serving without DSpark-era machinery.** The runner is serial (one
+    session per step, no batched decode), prefill is exact in 256-token
+    passes, and the prompt cache stores tokens, the full-attention layers'
+    latent rows and the indexers' pooled keys as append rows; the SWA and
+    indexer rings (55 MB per checkpoint), logits and position are private
+    state. Window-row components for the SWA rings would make checkpoints
+    smaller and are a later change.
+13. **Default serving context 32,768** when `--context` is absent: the native
+    context would take 7 GiB of latent rows per session.
+14. **Tool arguments are typed by the scanner.** Hy4's `<arg_value>` carries no
+    type and a registered dialect's scanner gets no schema, so a value that
+    parses as non-string JSON is typed and anything else is a string. A
+    string parameter whose value looks like a number is then rejected by the
+    schema check. Fixing this needs a Gufo API change (schema-aware
+    interpretation for registered dialects, as the host does for Qwen).
 
 ## Phases
 
@@ -232,6 +257,21 @@ These are judgment calls made without the maintainer; revisit any of them.
    `tool-images` suites.
 8. **Measurement and documentation.** Benchmark card, `EXPERIMENTS.md`,
    `QUALITY.md` (KL against llama.cpp on the same GGUF).
+
+## Serving status (2026-11-19)
+
+`gufo serve llm` serves the model with the prompt cache (RAM and disk). Gufo's
+functional suites at the pin (`0a473ebf`), one session, `--context` default,
+development build:
+
+- `conversation`, `long-context` and `cache` (disk restart included) passed.
+- `tools`: `native-tools` passed; `auto-tools` fails one assertion that a
+  12-token limit cuts any call short. Hy4's tags are single tokens, so
+  `record(value="alpha")` completes in 11. With that limit at 8 (a local copy
+  of the test) the whole suite passed. The assertion is a Gufo test
+  assumption to raise upstream, not a runner defect.
+
+Greedy decode through the server runs at 16.5 tok/s.
 
 ## Read from the Tencent files
 

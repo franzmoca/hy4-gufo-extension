@@ -26,8 +26,6 @@ namespace {
 
 // The reference Engram norms leave eps unset: the FP32 machine epsilon.
 constexpr float kEngramEps = 1.1920929e-07f;
-// Indexer value | gate rows kept per layer: a pass plus a pool on each side.
-constexpr std::uint32_t kIdxRing = Model::kMaxChunk + 8;
 // Attention scores per batched pass ([query rows][keys] floats).
 constexpr std::size_t kScoreFloats = std::size_t{64} << 20;
 
@@ -184,10 +182,20 @@ bool Model::AllocScratch(std::string* error) {
   return true;
 }
 
-std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::string* error) {
+std::uint32_t Model::SessionContext(std::uint32_t max_context) const {
   const Config& c = config_;
   max_context = std::max<std::uint32_t>(max_context, c.kpool);
-  max_context = (max_context + c.kpool - 1) / c.kpool * c.kpool;
+  return (max_context + c.kpool - 1) / c.kpool * c.kpool;
+}
+
+std::uint32_t Model::KvRing(std::uint32_t layer, std::uint32_t max_context) const {
+  max_context = SessionContext(max_context);
+  return config_.is_swa[layer] ? std::min(max_context, config_.swa_window + kMaxChunk) : max_context;
+}
+
+std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::string* error) {
+  const Config& c = config_;
+  max_context = SessionContext(max_context);
   std::unique_ptr<Session> s(new Session(this, max_context));
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::uint32_t pools = max_context / c.kpool + 1;
@@ -197,10 +205,10 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::st
   s->idx_pooled_.assign(c.n_layer, nullptr);
   bool ok = true;
   for (std::uint32_t i = 0; ok && i < c.n_layer; ++i) {
-    s->ring_[i] = c.is_swa[i] ? std::min(max_context, c.swa_window + kMaxChunk) : max_context;
+    s->ring_[i] = KvRing(i, max_context);
     ok = DeviceAlloc(&s->cache_[i], std::size_t{s->ring_[i]} * dk, &s->allocations_);
     if (ok && c.has_indexer[i]) {
-      ok = DeviceAlloc(&s->idx_rows_[i], std::size_t{kIdxRing} * 2 * c.idx_dim, &s->allocations_) &&
+      ok = DeviceAlloc(&s->idx_rows_[i], std::size_t{Model::kIndexerRing} * 2 * c.idx_dim, &s->allocations_) &&
            DeviceAlloc(&s->idx_pooled_[i], std::size_t{pools} * c.idx_dim, &s->allocations_);
     }
   }
@@ -249,6 +257,7 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.n_vocab) return Fail(error, "hy4: token out of range");
   }
 
+  if (write_hook_) write_hook_(write_user_, pos0, pos0 + n);
   std::vector<std::int32_t> pos(n);
   for (std::uint32_t i = 0; i < n; ++i) pos[i] = static_cast<std::int32_t>(pos0 + i);
   HY4_CHECK(hipMemcpyAsync(s.tokens, tokens.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
@@ -454,7 +463,7 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
                              hipMemcpyDeviceToDevice, st));
   HY4_CHECK(hipMemcpy2DAsync(s.ivg + d, 2 * d * sizeof(float), s.ffn_b, d * sizeof(float), d * sizeof(float), n,
                              hipMemcpyDeviceToDevice, st));
-  HY4_CHECK(hy4_store_rows(s.ivg, 2 * d, idx_rows_[il], kIdxRing, s.pos, n, 2 * d, st));
+  HY4_CHECK(hy4_store_rows(s.ivg, 2 * d, idx_rows_[il], Model::kIndexerRing, s.pos, n, 2 * d, st));
 
   // Pool the groups this chunk completes; a pooled key is roped at its first
   // member's position.
@@ -471,7 +480,7 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
     const std::uint32_t ng = static_cast<std::uint32_t>(groups.size());
     HY4_CHECK(hipMemcpyAsync(s.groups, groups.data(), ng * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
     HY4_CHECK(hipMemcpyAsync(s.group_pos, group_pos.data(), ng * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-    HY4_CHECK(hy4_kpool_pool(idx_rows_[il], kIdxRing, s.groups, ng, c.kpool, l.idx_ape.f32(), l.idx_comp_norm.f32(),
+    HY4_CHECK(hy4_kpool_pool(idx_rows_[il], Model::kIndexerRing, s.groups, ng, c.kpool, l.idx_ape.f32(), l.idx_comp_norm.f32(),
                              c.rms_eps, idx_pooled_[il], pool_rows, d, st));
     HY4_CHECK(hy4_rope(idx_pooled_[il] + std::size_t(groups[0]) * d, s.group_pos, ng, 1, d, 0, d - c.n_rot, c.n_rot,
                        base, st));

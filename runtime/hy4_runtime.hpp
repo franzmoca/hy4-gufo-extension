@@ -111,6 +111,8 @@ public:
   static constexpr std::uint32_t kMaxChunk = 256;
   /// Passes up to this many tokens use matvecs; longer ones use GEMMs.
   static constexpr std::uint32_t kVecMax = 8;
+  /// Rows of each indexer layer's value and gate ring.
+  static constexpr std::uint32_t kIndexerRing = kMaxChunk + 8;
 
   ~Model();
   Model(const Model&) = delete;
@@ -128,6 +130,10 @@ public:
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(std::uint32_t max_context,
                                                        std::string* error);
+  /// The context a session created for `max_context` holds (a multiple of kpool).
+  [[nodiscard]] std::uint32_t SessionContext(std::uint32_t max_context) const;
+  /// Latent rows a layer keeps for a session of `max_context` (Session::KvRing).
+  [[nodiscard]] std::uint32_t KvRing(std::uint32_t layer, std::uint32_t max_context) const;
 
   /// Hashes `tokens` (positions pos0..) against `history` (the tokens before
   /// them) and copies their FP8 Engram rows into `rows` [module][token][col][d];
@@ -169,8 +175,42 @@ public:
   [[nodiscard]] bool Evaluate(std::span<const std::int32_t> tokens, std::vector<float>* logits,
                               bool all_logits, std::string* error);
 
+  /// Evaluates `tokens` and keeps the last one's logits (LastLogits).
+  [[nodiscard]] bool Step(std::span<const std::int32_t> tokens, std::string* error) {
+    return Evaluate(tokens, &last_logits_, false, error);
+  }
+  /// The logits after the last Step, [n_vocab] on the host.
+  [[nodiscard]] std::vector<float>& LastLogits() { return last_logits_; }
+
   /// Forgets every evaluated token; the next evaluation starts at 0.
-  void Reset() { history_.clear(); }
+  void Reset() {
+    history_.clear();
+    last_logits_.clear();
+  }
+
+  /// Called before an evaluation of positions [first, end) writes any row.
+  using WriteHook = void (*)(void* user, std::uint32_t first, std::uint32_t end);
+  void SetWriteHook(WriteHook hook, void* user) {
+    write_hook_ = hook;
+    write_user_ = user;
+  }
+
+  /// Begins restoring a state of `tokens` evaluated tokens: returns the token
+  /// history to fill; the caller fills the rows, rings and logits.
+  [[nodiscard]] std::int32_t* BeginRestore(std::uint32_t tokens) {
+    history_.assign(tokens, 0);
+    last_logits_.assign(model_->config().n_vocab, 0.0f);
+    return history_.data();
+  }
+
+  // Device state, for prompt-cache capture and restore. Every layer keeps
+  // latent rows [KvRing(layer)][kv_lora + n_rot] (position p in row
+  // p % KvRing); indexer layers also keep a value | gate ring
+  // [kIndexerRing][2 idx_dim] and pooled keys [max_context / kpool + 1][idx_dim].
+  [[nodiscard]] float* KvRows(std::uint32_t layer) const { return cache_[layer]; }
+  [[nodiscard]] std::uint32_t KvRing(std::uint32_t layer) const { return ring_[layer]; }
+  [[nodiscard]] float* IndexerRing(std::uint32_t layer) const { return idx_rows_[layer]; }
+  [[nodiscard]] float* IndexerPools(std::uint32_t layer) const { return idx_pooled_[layer]; }
 
   [[nodiscard]] std::uint32_t Position() const {
     return static_cast<std::uint32_t>(history_.size());
@@ -215,6 +255,9 @@ private:
   // Attention selection mask [kMaxChunk][max_context].
   float* mask_ = nullptr;
   std::vector<void*> allocations_;
+  std::vector<float> last_logits_;
+  WriteHook write_hook_ = nullptr;
+  void* write_user_ = nullptr;
   double engram_seconds_ = 0.0;
   LayerProbe probe_ = nullptr;
   void* probe_user_ = nullptr;

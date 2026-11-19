@@ -22,7 +22,7 @@
       "speculative": [
         "dfly"
       ],
-      "target": "gufo_hy4flash",
+      "target": "gufo_hy4flash_text",
       "entry": "hy4flash_provider_register",
       "serving": {
         "draft_options": {
@@ -51,6 +51,11 @@
       "requires": []
     },
     "gufo_hy4flash_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "gufo_hy4flash_text": {
       "requires": [
         "hip"
       ]
