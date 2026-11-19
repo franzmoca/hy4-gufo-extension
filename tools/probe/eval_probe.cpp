@@ -137,6 +137,35 @@ int main(int argc, char** argv) {
       if (!session->Evaluate(std::span(&toks.back(), 1), &logits, false, &error)) return 1;
       single.insert(single.end(), logits.begin(), logits.end());
     }
+    // Row 0 of the first pass, layer by layer, against the one-token step.
+    struct Dump {
+      std::vector<std::vector<float>> layers;
+      std::size_t width;
+    };
+    const std::size_t width = std::size_t{model->config().hc} * model->config().n_embd;
+    auto record = [](void* user, int, const float* h, std::uint32_t) {
+      auto* d = static_cast<Dump*>(user);
+      d->layers.emplace_back(h, h + d->width);
+    };
+    Dump one{{}, width}, many{{}, width};
+    {
+      auto a = model->CreateSession(ctx, &error);
+      if (!a || !a->Evaluate(prompt, &logits, false, &error)) return 1;
+      a->SetLayerProbe(record, &one);
+      if (!a->Evaluate(std::span(toks.data(), 1), &logits, false, &error)) return 1;
+      auto b = model->CreateSession(ctx, &error);
+      if (!b || !b->Evaluate(prompt, &logits, false, &error)) return 1;
+      b->SetLayerProbe(record, &many);
+      if (!b->Evaluate(std::span(toks.data(), std::min<std::size_t>(passcheck, toks.size())), &logits, false, &error)) {
+        return 1;
+      }
+      for (std::size_t l = 0; l < one.layers.size() && l < many.layers.size(); ++l) {
+        double d = 0.0;
+        for (std::size_t i = 0; i < width; ++i) d = std::max(d, double(std::fabs(one.layers[l][i] - many.layers[l][i])));
+        std::printf("layer %zu row0 max diff %.3g\n", l, d);
+        if (d > 0) break;
+      }
+    }
     auto again = model->CreateSession(ctx, &error);
     if (!again || !again->Evaluate(prompt, &logits, false, &error)) return 1;
     std::vector<float> multi;

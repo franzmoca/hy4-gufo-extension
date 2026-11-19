@@ -262,14 +262,20 @@ These are judgment calls made without the maintainer; revisit any of them.
     layers' selections on every pass; a restored state has none, so its first
     step is a plain one. `--speculative` is not used: Gufo's serve knows no
     `dfly` backend, so the drafter is a provider option.
-17. **The DFly2 gate is the verify pass's KL, not identical text.** A verify
-    pass of n > 1 tokens runs the vendored matvecs with n columns, whose
-    summation order differs from the 1-column decode. Against one-token steps
-    over the same tokens it gives KL 0.0018 (0.0021 for a 16-token batched
-    pass), 40 times under the llama.cpp noise floor; greedy replies then match
-    until a near tie and may differ after it. Bit-identical replies would need
-    column-count-independent matvecs, which is not worth their cost.
-
+17. **Verify passes compute exactly what one-token decoding would.** The gate
+    is identical replies and draft counts with and without the drafter, and
+    `hy4_eval_probe --passcheck N` (logits of greedy tokens decoded one by one
+    against the same tokens N per pass: 0 difference at N = 2 to 8, short and
+    2,700-token contexts). Two paths of passes up to 8 tokens had to change:
+    the routed gate and up projections run one token per launch (the vendored
+    launcher's multi-token MoE kernel sums in another order; it reuses no
+    weight row across tokens, so this costs only launches), and attention runs
+    each token's two GEMMs over exactly the keys its own step sees (hipBLAS
+    picks kernels by shape). Batched prefill passes (n > 8) keep their GEMMs.
+    Before this, verify passes differed from one-token steps by KL 0.0018, and
+    two greedy requests could diverge after a near tie depending on how their
+    tokens had been grouped into passes, which Gufo's `reasoning-budget` suite
+    caught.
 18. **The confidence head sets the draft length.** `sigmoid(head(h'))` was
     trained to predict each slot's accept rate; the drafter stops once the
     product over its slots falls under 0.45 (`HY4_DFLY_MIN_ACCEPT` overrides),
@@ -389,6 +395,13 @@ drafts is inside run-to-run noise.
 - **Chat template:** the embedded template matches Tencent's except that it
   also accepts `reasoning_effort` `max`. Every special token carries the
   `:opensource` suffix (`<think:opensource>`, `<｜hy_start:opensource｜>`).
+
+## Next decode work
+
+- Sparse layers score every earlier key and mask all but the 2,048 selected
+  (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per
+  token, and a verify pass now reads it once per token. Gathering only the
+  selected rows (as the drafter does) cuts both.
 
 ## Open questions
 

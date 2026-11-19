@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -480,9 +481,34 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_k));
   const float zero = 0.0f;
   const float one = 1.0f;
+  if (n <= Model::kVecMax) {
+    // Each token over exactly the keys a one-token pass would see, so a
+    // verify pass computes what decoding its tokens one by one would.
+    for (std::uint32_t t = 0; t < n; ++t) {
+      const std::int32_t p = static_cast<std::int32_t>(Position() + t);
+      const std::int32_t lo_t = window ? std::max<std::int32_t>(0, p - static_cast<std::int32_t>(window) + 1) : 0;
+      const auto keys_t = static_cast<std::uint32_t>(p - lo_t + 1);
+      const float* k = keys + std::size_t(lo_t - lo) * dk;
+      const int rows = static_cast<int>(heads);
+      if (hipblasSgemm(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(keys_t), rows, static_cast<int>(dk), &scale,
+                       k, static_cast<int>(dk), s.qfull + std::size_t{t} * heads * dk, static_cast<int>(dk), &zero,
+                       s.scores, static_cast<int>(keys_t)) != HIPBLAS_STATUS_SUCCESS) {
+        return Fail(error, "hy4: attention score gemm failed");
+      }
+      HY4_CHECK(hy4_attn_softmax(s.scores, 1, heads, keys_t, lo_t, s.pos + t, window,
+                                 sel ? mask_ + std::size_t{t} * n_keys + (lo_t - lo) : nullptr, l.attn_sinks.f32(),
+                                 st));
+      if (hipblasSgemm(blas, HIPBLAS_OP_N, HIPBLAS_OP_N, static_cast<int>(c.kv_lora), rows, static_cast<int>(keys_t),
+                       &one, k, static_cast<int>(dk), s.scores, static_cast<int>(keys_t), &zero,
+                       s.att + std::size_t{t} * heads * c.kv_lora,
+                       static_cast<int>(c.kv_lora)) != HIPBLAS_STATUS_SUCCESS) {
+        return Fail(error, "hy4: attention value gemm failed");
+      }
+    }
+  }
   const std::uint32_t per = static_cast<std::uint32_t>(
       std::max<std::size_t>(1, kScoreFloats / (std::size_t{heads} * n_keys)));
-  for (std::uint32_t t0 = 0; t0 < n; t0 += per) {
+  for (std::uint32_t t0 = n <= Model::kVecMax ? n : 0; t0 < n; t0 += per) {
     const std::uint32_t nt = std::min(per, n - t0);
     const int rows = static_cast<int>(nt * heads);
     const float* q = s.qfull + std::size_t{t0} * heads * dk;
@@ -632,12 +658,20 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
     HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
     return true;
   }
-  HY4_CHECK(hy4_mmq_moe_vec_typed(l.gate_exps.type, l.gate_exps.data, s.latent, s.ids, s.ffn_a,
-                                  static_cast<int>(f), static_cast<int>(c.n_latent), static_cast<int>(n),
-                                  static_cast<int>(c.n_expert), static_cast<int>(used), st));
-  HY4_CHECK(hy4_mmq_moe_vec_typed(l.up_exps.type, l.up_exps.data, s.latent, s.ids, s.ffn_b, static_cast<int>(f),
-                                  static_cast<int>(c.n_latent), static_cast<int>(n), static_cast<int>(c.n_expert),
-                                  static_cast<int>(used), st));
+  // One token per launch: the vendored launcher sums a multi-token batch in
+  // another order than one token, and a verify pass must compute what
+  // one-token decoding would (no weight row is shared across tokens anyway).
+  for (std::uint32_t t = 0; t < n; ++t) {
+    const float* x = s.latent + std::size_t{t} * c.n_latent;
+    const std::int32_t* ids = s.ids + std::size_t{t} * used;
+    const std::size_t at = std::size_t{t} * used * f;
+    HY4_CHECK(hy4_mmq_moe_vec_typed(l.gate_exps.type, l.gate_exps.data, x, ids, s.ffn_a + at, static_cast<int>(f),
+                                    static_cast<int>(c.n_latent), 1, static_cast<int>(c.n_expert),
+                                    static_cast<int>(used), st));
+    HY4_CHECK(hy4_mmq_moe_vec_typed(l.up_exps.type, l.up_exps.data, x, ids, s.ffn_b + at, static_cast<int>(f),
+                                    static_cast<int>(c.n_latent), 1, static_cast<int>(c.n_expert),
+                                    static_cast<int>(used), st));
+  }
   HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, s.route_w, s.ffn_c, n * used, f, c.swiglu_clamp[il], st));
   // Down: every slot has its own input, so each slot is a one-expert row.
   HY4_CHECK(hy4_mmq_moe_vec_typed(l.down_exps.type, l.down_exps.data, s.ffn_c, s.ids, s.ffn_a,
