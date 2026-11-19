@@ -14,6 +14,9 @@
 #include <string>
 #include <variant>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "runtime/hy4_internal.hpp"
 #include "runtime/hy4_runtime.hpp"
 
@@ -208,6 +211,12 @@ std::unique_ptr<Model> Model::Load(const std::string& trunk_path, std::string* e
       return nullptr;
     }
     m->engram_table_ = static_cast<const std::uint8_t*>(t->data);
+    m->engram_bytes_ = t->dimensions[1] * c.engram_dim;
+    // Rows are read at random: no readahead around each fault.
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto begin = reinterpret_cast<std::uintptr_t>(m->engram_table_) & ~(page - 1);
+    const auto end = reinterpret_cast<std::uintptr_t>(m->engram_table_) + m->engram_bytes_;
+    (void)madvise(reinterpret_cast<void*>(begin), end - begin, MADV_RANDOM);
   }
 
   if (hipStreamCreateWithFlags(&m->stream_, hipStreamNonBlocking) != hipSuccess) {
@@ -345,6 +354,10 @@ void Model::EngramGather(std::span<const std::int32_t> history, std::span<const 
     if (p < pos0) return history[static_cast<std::size_t>(p)];
     return tokens[static_cast<std::size_t>(p - pos0)];
   };
+  // Row offsets first, so every page read is issued before the first copy
+  // waits on one.
+  const std::size_t total = c.engram_layers.size() * n * cols;
+  std::vector<std::uint64_t> offsets(total);
   std::vector<std::uint64_t> toks(n_gram);
   for (std::size_t e = 0; e < c.engram_layers.size(); ++e) {
     const std::uint64_t* mult = c.engram_mult.data() + e * n_gram;
@@ -364,14 +377,20 @@ void Model::EngramGather(std::span<const std::int32_t> history, std::span<const 
         rolling ^= toks[o] * mult[o];
         for (std::uint32_t h = 0; h < n_head; ++h) {
           const std::uint32_t col = (o - 1) * n_head + h;
-          const std::uint64_t row = rolling % primes[col] + offs[col];
           const std::size_t at = (e * n + i) * cols + col;
-          std::memcpy(rows + at * d, engram_table_ + row * d, d);
+          offsets[at] = (rolling % primes[col] + offs[col]) * d;
           valid[at] = dead ? 0.0f : 1.0f;
         }
       }
     }
   }
+  const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+  for (const std::uint64_t off : offsets) {
+    const auto first = reinterpret_cast<std::uintptr_t>(engram_table_ + off) & ~(page - 1);
+    const auto last = reinterpret_cast<std::uintptr_t>(engram_table_ + off + d - 1) & ~(page - 1);
+    (void)madvise(reinterpret_cast<void*>(first), last - first + page, MADV_WILLNEED);
+  }
+  for (std::size_t at = 0; at < total; ++at) std::memcpy(rows + at * d, engram_table_ + offsets[at], d);
 }
 
 }  // namespace gufo::models::hy4_flash

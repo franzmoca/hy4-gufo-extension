@@ -60,6 +60,7 @@ gufo_extension_target(
   SOURCES
     runtime/hy4_model.cpp
     runtime/hy4_forward.cpp
+    runtime/tokenizer.cpp
   LINK_LIBRARIES
     gufo_hy4flash_mmq
     gufo_ext_runtime
@@ -84,7 +85,7 @@ if(BUILD_TESTING AND TARGET gufo_hy4flash_hip)
   if(NOT TARGET hy4flash_probes)
     add_custom_target(hy4flash_probes)
   endif()
-  foreach(name IN ITEMS eval_probe)
+  foreach(name IN ITEMS eval_probe tokenize_probe)
     gufo_extension_target(
       NAME hy4flash_${name}
       SOURCES tools/probe/${name}.cpp

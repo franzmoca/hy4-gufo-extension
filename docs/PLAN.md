@@ -137,6 +137,21 @@ minutes. With buffered loading it loads in 25 s and decodes greedy at
 `"The capital of France is"` tokenizes to `802 8778 299 12749 341` (no BOS) and
 continues ` ___. Paris is also known as the "City of Light". ...`.
 
+Compare by token ids through `llama-server` (`/completion` with an id list,
+`n_probs`, `post_sampling_probs: false`): `llama-completion` tokenizes a text
+prompt its own way and is not a like-for-like reference.
+
+Long-context comparisons must aggregate. Next-token distributions past
+2,048 tokens depend on which pools the indexer keeps, and those flip with
+rounding: on one 3,712-token prompt, llama.cpp itself gives the top token
+p 0.68 with its default F16 cache and p 0.20 with an F32 cache. Single
+positions there are inconclusive. The gate is perplexity in the kpool regime:
+`llama-perplexity -c 4096` (second halves, positions 2,048-4,095) against
+`hy4_eval_probe --ppl 4096` on the same text. Reference, two chunks of Gufo
+docs: PPL 14.927 ± 0.964 (F16 cache) and 14.930 (F32 cache). This engine:
+**14.762**, within the reference's error. Short prompts match greedy token
+for token.
+
 ## Engine design (decided 2026-11-19, while working unattended)
 
 These are judgment calls made without the maintainer; revisit any of them.

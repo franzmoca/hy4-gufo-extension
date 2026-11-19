@@ -144,6 +144,7 @@ private:
   std::uint64_t resident_bytes_ = 0;
   hipStream_t stream_ = nullptr;
   const std::uint8_t* engram_table_ = nullptr;  // host mapping, FP8 rows
+  std::uint64_t engram_bytes_ = 0;
 
   // Scratch for one evaluation of up to kMaxChunk tokens (device unless noted).
   struct Scratch;
