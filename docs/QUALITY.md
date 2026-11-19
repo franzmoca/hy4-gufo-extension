@@ -71,5 +71,9 @@ with DFly2 and the vision sidecar:
 | `image-inputs` | passed |
 | `tool-images` | passed but `tool_images_two_calls`: the model answers `red, blue` to "separated by a comma and no spaces" |
 
+After the prefill kernel work (E10-E16, 2026-11-20), `conversation`,
+`long-context` and `cache` give the same results: all pass but the same
+`legacy-tool-cancel-disk` case.
+
 The harness marks drafter runs failed in its measurements ("AR request
 executed speculative drafts"): it knows only Gufo's own speculative backends.

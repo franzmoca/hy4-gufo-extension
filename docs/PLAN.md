@@ -485,6 +485,22 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   10.3 → 9.0 s (E10). The wk_b absorption on the matrix cores, writing the
   binary16 queries the attention reads: 9.0 → 8.24 s (E11). Lesson from E11:
   order the grid so that the blocks in flight touch neighbouring rows.
+  Then E12-E16: hyper-connection mix 8 tokens per block, paired projections
+  quantized once, the attention softmax on every thread, keys converted to
+  binary16 once per pass, a routed tile width per expert: 8.24 → 7.18 s.
+
+- **Prefill profile after E16** (3,712 tokens, 7.0 s of kernels): vendored
+  MMQ 4.3 s (Q8_0 dense 1.72 s at high efficiency; routed Q4_K/Q6_K 2.6 s,
+  limited by padding and compute rather than weight reloads, E16), the
+  attention 0.66 s, activation quantization 0.42 s, the indexer score 0.18 s
+  (bound by its warp sums; a faster form changes the summation order, which
+  the selection's near ties are sensitive to), the FP32 router GEMM 0.2 s,
+  hyper-connection kernels 0.43 s, the attention gate 0.12 s. Candidates:
+  fuse the attention gate's sigmoid product into the `wo` input quantization
+  (needs a pre-quantized MMQ entry), fuse `HcPost` into the next `HcMix`
+  (both read the four streams), and in the attention a conflict-free value
+  transpose (staging is now cheap; P.V is about 20% of the kernel). Register
+  prefetch of key tiles does not fit beside the query fragments (E15).
 
 - **Designs to borrow for the prefill attention.** ds41's
   `attention_f16_kernel` (`ds41_v41.hip.cpp`) is the same MLA shape: block
