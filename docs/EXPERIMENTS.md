@@ -12,6 +12,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E4 | Fused binary16 attention in the vision tower | retained |
 | E5 | Binary16 GEMM operands in the vision tower | retained |
 | E6 | Prefill results against the pass split | measurement |
+| E7 | Fused matrix-core prefill attention | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -100,3 +101,27 @@ cached system prefix moves the pass boundaries): both replies describe the
 image correctly, and every reply is reproducible for the same request
 history. The release build gives byte-identical replies to the development
 build for the same history.
+
+## E7: Fused matrix-core prefill attention (2026-11-19)
+
+Prefill passes (more than 8 tokens) computed attention as FP32 SGEMMs of every
+row of the pass against every key up to the pass end, then masked: 6.8 s of an
+18.0 s 3,712-token prefill. `hy4_mla_prefill` replaces them with one kernel:
+block (token, 16 heads), four waves; each token walks only its own causal,
+window or selected keys in 32-key tiles staged as binary16; Q.K on WMMA split
+by dimension across the waves, FP32 online softmax seeded by the sink, P.V on
+WMMA split by output dimension. Verify passes (8 tokens or fewer) keep their
+per-token GEMMs, so E3's exactness holds (`--passcheck 4`: 0 difference).
+
+| 3,712-token prefill (`hy4_eval_probe`) | run 1 | run 2 |
+| --- | --- | --- |
+| SGEMM attention | 18.00 s | 18.03 s |
+| fused attention | 14.67 s, 14.66 s | 14.67 s |
+
+206 → 253 tok/s (+23%); the kernel takes 2.7 s. KL against llama.cpp
+improves from 0.096 ± 0.010 to 0.081 ± 0.007 (same top 91.4% → 91.9%;
+llama.cpp's own floor 0.070 and 92.0%). `--chunkcheck 12`: layer 0 no longer
+depends on the split (the first difference moves to layer 1), mean KL after
+the split 0.0063 → 0.0049. `kernels_test` checks the kernel against the
+double precision reference at Hy4's shape (causal, gathered window, indexer
+selections). Retained.

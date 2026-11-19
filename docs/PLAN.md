@@ -473,19 +473,14 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
 
 ## Next decode work
 
-- **Prefill attention (first).** Profile of a 3,712-token prefill (18.0 s,
-  206 tok/s): quantized MMQ 8.9 s (Q4_K experts 5.2 s at tile width 16:
-  each 256-token pass re-reads the experts), FP32 SGEMM attention 6.8 s, the
-  rest 1.9 s. 1024-token passes cut MMQ to 4.9 s but grew attention to
-  10.3 s (every row of a pass scores every key up to the pass end), so the
-  total stayed 18.2 s. Plan: a fused MLA prefill kernel (one block per token
-  and 16 heads, four waves sharing 64-key tiles: Q.K over 576 dims split by
-  key block, P.V over 512 dims split 128 per wave, binary16 WMMA with FP32
-  online softmax and sinks, each token walking only its own causal, window
-  or selected keys; keys converted to binary16 [keys][576] and V transposed
-  [512][keys] per pass), then 1024-token passes. Gate: KL against llama.cpp
-  and a kernels_test case against MlaReference. Rows depending only on their
-  own keys also serves batch invariance below.
+- **Prefill attention.** Done as E7: a fused kernel, 18.0 → 14.7 s on a
+  3,712-token prefill. Next in the same kernel, from the designs below: Q
+  staged transposed, the next tile prefetched into registers, V transposed in
+  LDS instead of the strided gather, more heads per block (32, as ds41 and
+  DS4) so key tiles are read once per 32 heads. Then retry 1024-token passes,
+  which the SGEMM attention made slower: now that attention scales with each
+  token's own keys, fewer, wider passes should cut MMQ's re-reads of the
+  experts (8.9 s, the largest share now).
 
 - **Designs to borrow for the prefill attention.** ds41's
   `attention_f16_kernel` (`ds41_v41.hip.cpp`) is the same MLA shape: block
@@ -515,7 +510,8 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   layer 0 on, KL 0.006 and 2% flipped greedy tokens after the split. Layer 0
   differing means the dense projections and experts vary with the pass width
   too, not only attention: bisect layer 0's operations with the probe before
-  choosing which kernels to make row-independent.
+  choosing which kernels to make row-independent. After E7 layer 0 matches
+  across splits; the first difference is in layer 1 (0.0026).
 
 - Sparse layers score every earlier key and mask all but the 2,048 selected
   (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per

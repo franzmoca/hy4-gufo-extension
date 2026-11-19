@@ -733,6 +733,204 @@ __global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
   if (threadIdx.x == 0) out[blockIdx.x] = picked == (int32_t)dim ? 0 : picked;
 }
 
+// ------------------------------------------------- fused prefill attention
+
+// MLA prefill attention on the matrix cores, each token over exactly its own
+// keys, so its result does not depend on the pass it is evaluated in.
+// Block (token, 16 heads), four waves. Keys come in 32-row tiles staged in LDS
+// as binary16 [key][576]. Scores: wave w multiplies the heads' Q (binary16 in
+// registers) by K over dimensions 144 w .. 144 w + 143; the four partials
+// meet in LDS. Thread h < 16 runs head h's FP32 online softmax, the sink
+// seeding its maximum and denominator, and writes binary16 probabilities.
+// Values: wave w accumulates output dimensions 128 w .. 128 w + 127 in FP32.
+// Fragment layout (wave32 v_wmma_f32_16x16x16_f16): A holds row L%16 and 16
+// contiguous k, B column L%16 and 16 contiguous k; accumulator element i is
+// row 2i + L/16, column L%16.
+constexpr uint32_t kMlaDk = 576;
+constexpr uint32_t kMlaDv = 512;
+constexpr uint32_t kMlaHeads = 16;
+constexpr uint32_t kMlaWaves = 4;
+constexpr uint32_t kMlaTile = 32;
+constexpr uint32_t kMlaKtPitch = kMlaDk + 8;      // halves; 16-byte rows
+constexpr uint32_t kMlaProbPitch = kMlaTile + 8;  // halves
+constexpr uint32_t kMlaQkSteps = kMlaDk / kMlaWaves / 16;  // 9
+constexpr uint32_t kMlaPvTiles = kMlaDv / kMlaWaves / 16;  // 8
+
+using MlaHalf16 =
+    __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using MlaFloat8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+__device__ __forceinline__ MlaFloat8 MlaWmma(MlaHalf16 a, MlaHalf16 b,
+                                             MlaFloat8 c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+
+__device__ __forceinline__ MlaHalf16 MlaLoad16(const _Float16* p) {
+  union {
+    MlaHalf16 h;
+    uint4 u[2];
+  } v;
+  v.u[0] = *reinterpret_cast<const uint4*>(p);
+  v.u[1] = *reinterpret_cast<const uint4*>(p + 8);
+  return v.h;
+}
+
+// The key position of slot j of token t, or -1 when the slot holds no visible
+// key: a selection slot that is empty, in the future or outside the window.
+__device__ __forceinline__ int32_t MlaKey(const int32_t* sel_t, int32_t first,
+                                          uint32_t j, uint32_t count, int32_t p,
+                                          int32_t lo_t) {
+  if (j >= count)
+    return -1;
+  if (!sel_t)
+    return first + (int32_t)j;
+  const int32_t k = sel_t[j];
+  return k >= lo_t && k <= p ? k : -1;
+}
+
+__global__ void __launch_bounds__(32 * kMlaWaves)
+    MlaPrefill(const float* q, const float* keys, int32_t lo,
+               const int32_t* pos, uint32_t window, const int32_t* sel,
+               uint32_t n_sel, const float* sinks, float scale, float* out,
+               uint32_t heads) {
+  __shared__ __align__(16) _Float16 kt[kMlaTile * kMlaKtPitch];
+  __shared__ __align__(16) _Float16 probs[kMlaHeads * kMlaProbPitch];
+  __shared__ float part[kMlaWaves][kMlaHeads][kMlaTile];
+  __shared__ int32_t rows[kMlaTile];
+  __shared__ float m_s[kMlaHeads], l_s[kMlaHeads], alpha_s[kMlaHeads];
+
+  const uint32_t t = blockIdx.x;
+  const uint32_t h0 = blockIdx.y * kMlaHeads;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane = tid % 32;
+  const uint32_t wave = tid / 32;
+  const uint32_t row = lane % 16;
+  const uint32_t half = lane / 16;
+
+  const int32_t p = pos[t];
+  const int32_t lo_t = window ? max(lo, p - (int32_t)window + 1) : lo;
+  const int32_t* sel_t = sel ? sel + (uint64_t)t * n_sel : nullptr;
+  const uint32_t count = sel         ? n_sel
+                         : p >= lo_t ? (uint32_t)(p - lo_t + 1)
+                                     : 0u;
+
+  // This wave's slice of the 16 heads' queries, binary16.
+  MlaHalf16 qa[kMlaQkSteps];
+  {
+    const float* qr = q + ((uint64_t)t * heads + h0 + row) * kMlaDk +
+                      wave * (kMlaDk / kMlaWaves);
+#pragma unroll
+    for (uint32_t s = 0; s < kMlaQkSteps; ++s)
+#pragma unroll
+      for (uint32_t e = 0; e < 16; ++e)
+        qa[s][e] = (_Float16)qr[s * 16 + e];
+  }
+  if (tid < kMlaHeads) {
+    m_s[tid] = sinks ? sinks[h0 + tid] : -INFINITY;
+    l_s[tid] = sinks ? 1.0f : 0.0f;
+  }
+  MlaFloat8 acc[kMlaPvTiles] = {};
+
+  for (uint32_t j0 = 0; j0 < count; j0 += kMlaTile) {
+    if (tid < kMlaTile)
+      rows[tid] = MlaKey(sel_t, lo_t, j0 + tid, count, p, lo_t);
+    __syncthreads();
+    // Stage the tile: each thread converts float4 groups of the 32 rows.
+    for (uint32_t i = tid; i < kMlaTile * (kMlaDk / 4); i += blockDim.x) {
+      const uint32_t r = i / (kMlaDk / 4);
+      const uint32_t c = (i % (kMlaDk / 4)) * 4;
+      float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      if (rows[r] >= 0)
+        v = *reinterpret_cast<const float4*>(
+            keys + (uint64_t)(rows[r] - lo) * kMlaDk + c);
+      _Float16* d = kt + r * kMlaKtPitch + c;
+      d[0] = (_Float16)v.x;
+      d[1] = (_Float16)v.y;
+      d[2] = (_Float16)v.z;
+      d[3] = (_Float16)v.w;
+    }
+    __syncthreads();
+
+    // Partial scores over this wave's dimensions.
+#pragma unroll
+    for (uint32_t b = 0; b < kMlaTile / 16; ++b) {
+      MlaFloat8 sc = {};
+      const _Float16* kr =
+          kt + (b * 16 + row) * kMlaKtPitch + wave * (kMlaDk / kMlaWaves);
+#pragma unroll
+      for (uint32_t s = 0; s < kMlaQkSteps; ++s)
+        sc = MlaWmma(qa[s], MlaLoad16(kr + s * 16), sc);
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i)
+        part[wave][2 * i + half][b * 16 + row] = sc[i];
+    }
+    __syncthreads();
+
+    // Online softmax, one thread per head.
+    if (tid < kMlaHeads) {
+      const uint32_t h = tid;
+      float x[kMlaTile];
+      float mx = m_s[h];
+#pragma unroll
+      for (uint32_t k = 0; k < kMlaTile; ++k) {
+        float v = -INFINITY;
+        if (rows[k] >= 0)
+          v = (part[0][h][k] + part[1][h][k] + part[2][h][k] + part[3][h][k]) *
+              scale;
+        x[k] = v;
+        mx = fmaxf(mx, v);
+      }
+      const float alpha = mx == -INFINITY ? 1.0f : __expf(m_s[h] - mx);
+      float sum = 0.0f;
+#pragma unroll
+      for (uint32_t k = 0; k < kMlaTile; ++k) {
+        const float e = x[k] == -INFINITY ? 0.0f : __expf(x[k] - mx);
+        sum += e;
+        probs[h * kMlaProbPitch + k] = (_Float16)e;
+      }
+      l_s[h] = l_s[h] * alpha + sum;
+      m_s[h] = mx;
+      alpha_s[h] = alpha;
+    }
+    __syncthreads();
+
+    // Rescale and accumulate this wave's output dimensions.
+#pragma unroll
+    for (uint32_t i = 0; i < 8; ++i) {
+      const float a = alpha_s[2 * i + half];
+#pragma unroll
+      for (uint32_t c = 0; c < kMlaPvTiles; ++c)
+        acc[c][i] *= a;
+    }
+#pragma unroll
+    for (uint32_t b = 0; b < kMlaTile / 16; ++b) {
+      const MlaHalf16 pa = MlaLoad16(probs + row * kMlaProbPitch + b * 16);
+#pragma unroll
+      for (uint32_t c = 0; c < kMlaPvTiles; ++c) {
+        const uint32_t d = wave * (kMlaDv / kMlaWaves) + c * 16 + row;
+        MlaHalf16 vb;
+#pragma unroll
+        for (uint32_t k = 0; k < 16; ++k)
+          vb[k] = kt[(b * 16 + k) * kMlaKtPitch + d];
+        acc[c] = MlaWmma(pa, vb, acc[c]);
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t h = 2 * i + half;
+    const float l = l_s[h];
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    float* orow = out + ((uint64_t)t * heads + h0 + h) * kMlaDv +
+                  wave * (kMlaDv / kMlaWaves) + row;
+#pragma unroll
+    for (uint32_t c = 0; c < kMlaPvTiles; ++c)
+      orow[c * 16] = acc[c][i] * inv;
+  }
+}
+
 // Device warp size (32 on gfx1151), for grids of one warp per row.
 uint32_t WarpSize() {
   static const uint32_t ws = [] {
@@ -998,6 +1196,20 @@ int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64
 int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t stream) {
   if (blocks == 0) return 0;
   DequantQ8_0<<<Blocks(blocks * 32), kBlock, 0, stream>>>((const BlockQ8_0*)src, blocks, out);
+  return Status();
+}
+
+int hy4_mla_prefill(const float* q, const float* keys, int32_t lo,
+                    const int32_t* pos, uint32_t window, const int32_t* sel,
+                    uint32_t n_sel, const float* sinks, float scale, float* out,
+                    uint32_t n, uint32_t heads, uint32_t dk, uint32_t dv,
+                    hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (dk != kMlaDk || dv != kMlaDv || heads % kMlaHeads != 0)
+    return 1;
+  MlaPrefill<<<dim3(n, heads / kMlaHeads), 32 * kMlaWaves, 0, stream>>>(
+      q, keys, lo, pos, window, sel, n_sel, sinks, scale, out, heads);
   return Status();
 }
 

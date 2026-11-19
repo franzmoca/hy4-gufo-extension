@@ -585,7 +585,8 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
     keys = s.keys;
   }
   const std::uint32_t n_keys = static_cast<std::uint32_t>(last - lo + 1);
-  if (sel) HY4_CHECK(hy4_selection_mask(sel, n_sel, mask_, n, n_keys, st));
+  if (sel && n <= Model::kVecMax)
+    HY4_CHECK(hy4_selection_mask(sel, n_sel, mask_, n, n_keys, st));
   const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_k));
   const float zero = 0.0f;
   const float one = 1.0f;
@@ -614,26 +615,12 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
       }
     }
   }
-  const std::uint32_t per = static_cast<std::uint32_t>(
-      std::max<std::size_t>(1, kScoreFloats / (std::size_t{heads} * n_keys)));
-  for (std::uint32_t t0 = n <= Model::kVecMax ? n : 0; t0 < n; t0 += per) {
-    const std::uint32_t nt = std::min(per, n - t0);
-    const int rows = static_cast<int>(nt * heads);
-    const float* q = s.qfull + std::size_t{t0} * heads * dk;
-    // S (row-major [rows][n_keys]) = scale Q K^T.
-    if (hipblasSgemm(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(n_keys), rows, static_cast<int>(dk), &scale,
-                     keys, static_cast<int>(dk), q, static_cast<int>(dk), &zero, s.scores,
-                     static_cast<int>(n_keys)) != HIPBLAS_STATUS_SUCCESS) {
-      return Fail(error, "hy4: attention score gemm failed");
-    }
-    HY4_CHECK(hy4_attn_softmax(s.scores, nt, heads, n_keys, lo, s.pos + t0, window,
-                               sel ? mask_ + std::size_t{t0} * n_keys : nullptr, l.attn_sinks.f32(), st));
-    // O (row-major [rows][kv_lora]) = P V, V the first kv_lora columns of the key rows.
-    if (hipblasSgemm(blas, HIPBLAS_OP_N, HIPBLAS_OP_N, static_cast<int>(c.kv_lora), rows, static_cast<int>(n_keys),
-                     &one, keys, static_cast<int>(dk), s.scores, static_cast<int>(n_keys), &zero,
-                     s.att + std::size_t{t0} * heads * c.kv_lora, static_cast<int>(c.kv_lora)) != HIPBLAS_STATUS_SUCCESS) {
-      return Fail(error, "hy4: attention value gemm failed");
-    }
+  if (n > Model::kVecMax) {
+    // Prefill: each token over exactly its own keys on the matrix cores, so a
+    // token's result does not depend on how its span was cut into passes.
+    HY4_CHECK(hy4_mla_prefill(s.qfull, keys, lo, s.pos, window, sel, n_sel,
+                              l.attn_sinks.f32(), scale, s.att, n, heads, dk,
+                              c.kv_lora, st));
   }
   if (n > Model::kVecMax) {
     HY4_CHECK(hy4_mmq_dense_grouped_typed(l.wv_b.type, l.wv_b.data, s.att, s.attv, static_cast<int>(c.head_v),

@@ -13,3 +13,6 @@
   single `mmproj*.gguf` beside the model), with M-RoPE image positions
   ([E4](docs/EXPERIMENTS.md#e4-fused-binary16-attention-in-the-vision-tower-2026-11-19),
   [E5](docs/EXPERIMENTS.md#e5-binary16-gemm-operands-in-the-vision-tower-2026-11-19)).
+- Prefill 23% faster (206 → 253 tok/s on 3,712 tokens) with fused
+  matrix-core attention, and closer to llama.cpp (KL 0.096 → 0.081)
+  ([E7](docs/EXPERIMENTS.md#e7-fused-matrix-core-prefill-attention-2026-11-19)).

@@ -466,6 +466,78 @@ void TestMlaAttention() {
        1e-5, "mla_attention selection");
 }
 
+// The matrix-core prefill attention against the same reference, at Hy4's
+// shape: full causal spans, a gathered window starting past position 0, and
+// indexer selections with empty, future and out-of-window slots.
+void TestMlaPrefill() {
+  const uint32_t heads = 32, dk = 576, dv = 512, ring = 400;
+  const float scale = 1.0f / 24.0f;
+  const auto cache = Random(ring * dk, -1, 1);
+  const auto sinks = Random(heads, -1, 1);
+  const std::vector<int32_t> pos{0, 31, 32, 150, 299};
+  const uint32_t n = (uint32_t)pos.size();
+  const auto q = Random(n * heads * dk, -1, 1);
+  auto* dq = Device(q);
+  auto* dc = Device(cache);
+  auto* dp = Device(pos);
+  auto* ds = Device(sinks);
+  const auto run = [&](const float* keys, int32_t lo, uint32_t window,
+                       const std::vector<int32_t>* sel, uint32_t n_sel,
+                       bool sink,
+                       const std::vector<std::vector<int32_t>>& want_keys,
+                       const std::string& what) {
+    float* out = Device(std::vector<float>(n * heads * dv));
+    Expect(hy4_mla_prefill(
+               dq, keys, lo, dp, window, sel ? Device(*sel) : nullptr, n_sel,
+               sink ? ds : nullptr, scale, out, n, heads, dk, dv, nullptr) == 0,
+           what + " status");
+    Near(Host(out, n * heads * dv),
+         MlaReference(q, cache, ring, want_keys, sink ? sinks.data() : nullptr,
+                      scale, heads, dk, dv),
+         4e-3, what);
+  };
+  for (bool sink : {true, false}) {
+    std::vector<std::vector<int32_t>> keys(n);
+    for (uint32_t t = 0; t < n; ++t)
+      for (int32_t k = 0; k <= pos[t]; ++k)
+        keys[t].push_back(k);
+    run(dc, 0, 0, nullptr, 0, sink, keys,
+        std::string("mla_prefill causal") + (sink ? " sinks" : ""));
+  }
+  {
+    // Window 64 over keys gathered from position 20 (positions below 20 are
+    // never read: token 0 sees none and keeps only the sink).
+    const int32_t lo = 20;
+    const uint32_t window = 64;
+    std::vector<std::vector<int32_t>> keys(n);
+    for (uint32_t t = 0; t < n; ++t)
+      for (int32_t k = std::max(lo, pos[t] - (int32_t)window + 1); k <= pos[t];
+           ++k)
+        keys[t].push_back(k);
+    run(dc + std::size_t{lo} * dk, lo, window, nullptr, 0, true, keys,
+        "mla_prefill window");
+  }
+  {
+    const uint32_t n_sel = 40;
+    std::vector<int32_t> sel(n * n_sel, -1);
+    std::vector<std::vector<int32_t>> keys(n);
+    std::uniform_int_distribution<int32_t> any(0, ring - 1);
+    for (uint32_t t = 0; t < n; ++t)
+      for (uint32_t i = 0; i < n_sel; ++i) {
+        if (i % 5 == 4)
+          continue;  // empty slot
+        const int32_t k = any(g_rng);
+        sel[t * n_sel + i] = k;
+        if (k <= pos[t])
+          keys[t].push_back(k);  // a future key is skipped
+      }
+    run(dc, 0, 0, &sel, n_sel, true, keys, "mla_prefill selection");
+  }
+  Expect(hy4_mla_prefill(dq, dc, 0, dp, 0, nullptr, 0, ds, scale, nullptr, n,
+                         24, dk, dv, nullptr) != 0,
+         "mla_prefill rejects 24 heads");
+}
+
 void TestRows() {
   const uint32_t ring = 6, dim = 40, n = 4;
   const uint64_t src_stride = 48;
@@ -874,6 +946,7 @@ int main() {
   TestGemv();
   TestRope();
   TestMlaAttention();
+  TestMlaPrefill();
   TestRows();
   TestElementwise();
   TestRoute();
