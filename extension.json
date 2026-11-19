@@ -6,30 +6,64 @@
   "entry": "hy4flash_register",
   "registration_target": "gufo_hy4flash",
   "depends": [],
-  "platforms": ["linux"],
+  "platforms": [
+    "linux"
+  ],
   "providers": [
     {
       "id": "hy4flash",
       "capability": "text_generation",
-      "keys": ["gguf:hy_v4_flash"],
-      "model_ids": ["Hy4 Flash"],
-      "speculative": ["dfly"],
+      "keys": [
+        "gguf:hy_v4_flash"
+      ],
+      "model_ids": [
+        "Hy4 Flash"
+      ],
+      "speculative": [
+        "dfly"
+      ],
       "target": "gufo_hy4flash",
       "entry": "hy4flash_provider_register",
-      "serving": {"draft_options": {"dfly": "--dfly-model"}}
+      "serving": {
+        "draft_options": {
+          "dfly": "--dfly-model"
+        }
+      }
     }
   ],
   "options": [
     {
       "name": "--dfly-model",
       "type": "path",
-      "commands": ["serve", "bench", "prompt"],
-      "providers": ["hy4flash"],
+      "commands": [
+        "serve",
+        "bench",
+        "prompt"
+      ],
+      "providers": [
+        "hy4flash"
+      ],
       "help": "DFly2 drafter GGUF for --speculative dfly"
     }
   ],
   "targets": {
-    "gufo_hy4flash": {"requires": []}
+    "gufo_hy4flash": {
+      "requires": []
+    },
+    "gufo_hy4flash_hip": {
+      "requires": [
+        "hip"
+      ]
+    },
+    "hy4flash_eval_probe": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    }
   },
-  "licenses": ["LICENSE", "LICENSES/gufo.txt"]
+  "licenses": [
+    "LICENSE",
+    "LICENSES/gufo.txt"
+  ]
 }

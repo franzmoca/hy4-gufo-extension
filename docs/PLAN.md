@@ -52,9 +52,8 @@ ships DFly2: AngelSlim has one `nextn` layer, Xylolabs has none.
   routed experts run in a 1536-wide latent space (`ffn_routed_up` /
   `ffn_routed_down` project in and out), with 1536 intermediate width. There
   is one shared expert, and the SwiGLU limit is 10 on routed experts only.
-- **Engram:** bigram and trigram hashes, 8 heads per order, at
-  `engram_layer_ids` [2, 12, 22, 32]. The model card says 1, 11, 21, 31, so
-  check against the PR. Unlike DS4.1, each looked-up row is RMS-normed
+- **Engram:** bigram and trigram hashes, 8 heads per order, at layers
+  1, 11, 21 and 31 (0-based). Unlike DS4.1, each looked-up row is RMS-normed
   (eps = FP32 machine epsilon) and scaled by its head weight. The key/value
   projection has a bias, the gate is DS4.1's, and a token with no valid n-gram
   (or an image position) gets no Engram delta.
@@ -98,13 +97,26 @@ Not needed: expert streaming. The trunk is resident.
   the prompt cache and the runtime. Decode reads 64 rows per token
   (4 layers × 2 orders × 8 heads), 96 bytes each.
 
-## Expected decode speed (estimate, to check)
+## Expected decode speed (from the GGUF tensor table)
 
-Per token, about 7.7 GB of weights are read: Q8_0 attention and shared experts
-(~105 MB per layer), 16 Q4_K latent experts (~64 MB per layer), and the 0.74 GB
-F16 head. At ~215 GB/s achieved, that caps AR decode near 28 tok/s. The Q8_0
-attention outweighs the routed experts, so requantizing attention is a later
-lever. For scale, an M5 Max reaches 48 tok/s on the same quant with llama.cpp.
+Weights read per decoded token, from the trunk's real tensor types (all
+non-expert tensors, 16 of 512 experts, one embedding row):
+
+| Part | GB/token |
+| --- | ---: |
+| Attention and indexer (Q8_0) | 5.31 |
+| Routed experts (16 × Q4_K gate/up, Q4_K or Q6_K down) | 2.81 |
+| Dense layer 0, shared experts, latent projections (Q8_0) | 1.42 |
+| LM head (F16) | 0.74 |
+| Engram projections (Q8_0) | 0.10 |
+| **Total** | **10.4** |
+
+At ~215 GB/s achieved, that caps AR decode near 20 tok/s. Attention is half
+the traffic: the 30 SWA layers carry 64 heads, so their `attn_gate`
+(3072 × 16384), `attn_output` and `attn_q_b` are twice the sparse layers'. The
+first lever after correctness is therefore a lower-bit attention quant, not
+expert work. For scale, an M5 Max reaches 48 tok/s on the same quant with
+llama.cpp.
 
 ## Correctness oracle
 
@@ -115,6 +127,57 @@ Every phase compares against those dumps. Transformers BF16 is out of reach in
 memory (440 GB) except for single-layer checks. DFly2 has no llama.cpp
 implementation: its oracle is a BF16 PyTorch run of the five draft layers over
 target states dumped from our engine.
+
+Status (2026-11-19): `tools/oracle/llama-ref.nix` builds the PR. It must load
+with `--load-mode none --override-tensor '^per_layer_token_embd\.weight$=CPU'
+--lazy-mode on`; the default mmap load thrashes, since the 98 GB trunk on the
+GPU leaves too little page cache for its own mapping, and stalls for over 15
+minutes. With buffered loading it loads in 25 s and decodes greedy at
+**14.4 tok/s** (33 ms/token prompt, 5 tokens), the baseline to beat.
+`"The capital of France is"` tokenizes to `802 8778 299 12749 341` (no BOS) and
+continues ` ___. Paris is also known as the "City of Light". ...`.
+
+## Engine design (decided 2026-11-19, while working unattended)
+
+These are judgment calls made without the maintainer; revisit any of them.
+
+1. **A new engine, not a fork of DS4.1's.** DS4.1's 26K lines carry expert
+   streaming, DSpark, adapters, steering and the bounded prefill replay, none
+   of which Hy4 needs first. The Hy4 engine starts small and copies specific
+   DS4.1 pieces in when it needs them, recording each in `UPSTREAM.md`.
+2. **Correctness first, on llama.cpp's own kernels.** Quantized projections go
+   through the llama.cpp-derived `mmvq`/`mmq` kernels that DS4.1 vendors
+   (`kernels/rocm/mmq/`), copied here with the `ds41_` prefix renamed to
+   `hy4_`. Two extensions in one Gufo binary must not share symbols. The vector
+   path already takes Q8_0, Q4_K and Q6_K at run time. The arithmetic then
+   matches the oracle's closely, so per-layer comparisons stay tight. Custom
+   GEMVs are an optimization after correctness.
+3. **Small custom kernels** cover what the vendored path cannot: `attn_k_b`
+   (K = 192, not a multiple of 256), the F16 head, Q8_0 embedding rows, norms,
+   iHC pre/post, the router, MLA attention with sinks, the kpool indexer and
+   Engram.
+4. **Evaluation in chunks of up to 8 tokens.** `mmvq` serves N ≤ 8, so one
+   evaluation takes 1-8 tokens: decode is N = 1, and prefill loops over chunks
+   of 8. Large-batch MMQ prefill is phase 5.
+5. **KV in FP32 at first.** Each layer stores one 576-wide latent row per token
+   (512 normed `kv_cmpr` + 64 roped `k_pe`). Sparse layers keep every row;
+   SWA layers keep a 512-row ring. FP32 costs 27.6 KB per token for the 12
+   sparse layers (1.8 GB at 64K). F16 like llama.cpp's default cache is a later
+   memory/speed change.
+6. **Full attention below 2,048 tokens.** A sparse layer selects at most 511
+   pooled 4-token groups plus its own group, so at up to 2,048 tokens it
+   attends to all of them. The indexer's pooled keys are still written from
+   the first token, and selection is enabled and tested past 2,048.
+7. **Engram rows are read on the host** from the memory-mapped FP8 shard
+   (page cache), 64 rows of 96 bytes per token, then uploaded. There's no
+   async read pipeline until profiles show it matters.
+8. **Development builds** run in a Gufo worktree at the flake pin
+   (`~/projects/gufo-hy4`, `0a473ebf`) with this repository as the extension
+   directory. The llama.cpp oracle is built by
+   `tools/oracle/llama-ref.nix`: the PR on Gufo's `gfx1151` ROCm 10 set, without
+   the nixpkgs web UI step and backport.
+9. **Nothing leaves the machine** while the maintainer is away: commits stay
+   local, with no GitHub repository or push.
 
 ## Phases
 
@@ -165,13 +228,31 @@ target states dumped from our engine.
   - `confidence_head` is 3072 → 1.
   - At Q8_0 it comes to about 0.9 GB.
 
+## Read from the trunk GGUF
+
+- 1,379 tensors, `general.architecture` `hy_v4_flash`. Sampling defaults are
+  temperature 0.9, top-p 1.0, no top-k.
+- **Engram layers** are `ple.layers` [1, 11, 21, 31] (0-based). The config's
+  [2, 12, 22, 32] counts from 1. Its metadata stores the hash multipliers,
+  head offsets, head vocabulary sizes (64 heads), a 120,832-entry token map and
+  the pad token 120002. Per Engram layer there are `engram_kv` (Q8_0,
+  1536 × 15360), `engram_kv_b`, `engram_gate`, `engram_hc_scale`,
+  `engram_lookup_norm` [96, 16] and `engram_pre_gamma`.
+- **Types:** Q8_0 for attention, the indexer, the shared experts, the latent
+  projections, layer 0 and the token embedding. Routed gate/up are Q4_K.
+  Routed down is Q6_K on 20 layers and Q4_K on 21, so the expert GEMV needs
+  both. F32 for the router, norms, HC, sinks and indexer compressor; F16 for
+  the head.
+- **HC weights:** `hc_*_fn` [12288, 8] and `hc_*_base` [8], i.e. 4 pre plus 4
+  post weights and no comb matrix, which confirms iHC. The head reduces the
+  streams through `output_hc_fn/base/scale`.
+- **Chat template:** the embedded template matches Tencent's except that it
+  also accepts `reasoning_effort` `max`. Every special token carries the
+  `:opensource` suffix (`<think:opensource>`, `<｜hy_start:opensource｜>`).
+
 ## Open questions
 
-- Names: repository `hy4-gufo-extension`, extension `hy4flash`, provider
-  `hy4flash`?
-- Engram layer indices: config [2, 12, 22, 32] or card [1, 11, 21, 31].
-- Is the Q6_K expert `down` present in Xylolabs Q4_K_M (llama.cpp's mixed
-  recipe), or is everything Q4_K? Read the GGUF tensor types.
 - Does the DFly2 draft need the target's final hidden state at all 5 positions,
   or only the anchor's (`dfly_mtp_fusion` "slot0")? Transformers 5.23's
   `hy_v4_flash` code should say; the Tencent repo ships no modeling code.
+- What does `reasoning_effort` `max` render? It is in the Xylolabs template only.

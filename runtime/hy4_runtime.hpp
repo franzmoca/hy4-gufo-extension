@@ -1,0 +1,214 @@
+#ifndef HY4FLASH_RUNTIME_HY4_RUNTIME_HPP_
+#define HY4FLASH_RUNTIME_HY4_RUNTIME_HPP_
+
+// Hy4 Flash model loading and evaluation on HIP. The graph follows
+// llama.cpp's hy_v4_flash (ggml-org/llama.cpp#32517); docs/PLAN.md describes
+// the design.
+
+#include <hip/hip_runtime_api.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
+namespace gufo::models::hy4_flash {
+
+struct Config {
+  std::uint32_t n_layer = 0;
+  std::uint32_t n_embd = 0;
+  std::uint32_t n_vocab = 0;
+  std::uint32_t n_ff_dense = 0;
+  std::uint32_t n_dense_lead = 0;
+  std::vector<std::uint32_t> n_head;  // per layer
+  std::vector<bool> is_swa;           // per layer
+  std::vector<bool> has_indexer;      // per layer
+  std::uint32_t q_lora = 0;
+  std::uint32_t kv_lora = 0;
+  std::uint32_t head_k = 0;  // nope + rope (256)
+  std::uint32_t head_v = 0;  // 256
+  std::uint32_t n_rot = 0;   // 64
+  float rope_base = 0.0f;
+  float rope_base_swa = 0.0f;
+  std::uint32_t swa_window = 0;
+  float rms_eps = 0.0f;
+  // MoE
+  std::uint32_t n_expert = 0;
+  std::uint32_t n_expert_used = 0;
+  std::uint32_t n_ff_exp = 0;
+  std::uint32_t n_latent = 0;
+  float expert_scale = 1.0f;
+  bool expert_norm = true;
+  std::vector<float> swiglu_clamp;  // per layer
+  // Hyper-connections
+  std::uint32_t hc = 0;
+  float hc_eps = 0.0f;
+  float hc_magnitude = 0.0f;
+  // Indexer
+  std::uint32_t idx_heads = 0;
+  std::uint32_t idx_dim = 0;
+  std::uint32_t idx_top_k = 0;
+  std::uint32_t kpool = 0;
+  // Engram
+  std::vector<std::uint32_t> engram_layers;
+  std::uint32_t engram_ngram = 0;
+  std::uint32_t engram_heads_per_ngram = 0;
+  std::uint32_t engram_dim = 0;
+  std::vector<std::uint64_t> engram_mult;
+  std::vector<std::uint32_t> engram_offsets;
+  std::vector<std::uint32_t> engram_primes;
+  std::vector<std::int64_t> engram_token_map;
+  std::uint32_t engram_pad = 0;
+
+  [[nodiscard]] std::uint32_t EngramCols() const {
+    return (engram_ngram - 1) * engram_heads_per_ngram;
+  }
+  [[nodiscard]] int EngramIndex(std::uint32_t layer) const;
+};
+
+/// A resident weight: device bytes, ggml type and GGUF dimensions.
+struct Tensor {
+  const void* data = nullptr;
+  int type = 0;
+  std::vector<std::uint64_t> dims;
+  [[nodiscard]] explicit operator bool() const { return data != nullptr; }
+  [[nodiscard]] const float* f32() const { return static_cast<const float*>(data); }
+};
+
+struct Layer {
+  Tensor attn_norm, attn_sinks, wq_a, q_a_norm, wq_b, wkv_a, kv_a_norm, wk_b, wv_b, wo, attn_gate,
+      attn_post_norm;
+  Tensor hc_attn_fn, hc_attn_base, hc_attn_scale, hc_ffn_fn, hc_ffn_base, hc_ffn_scale;
+  Tensor ffn_norm, ffn_post_norm;
+  // Dense lead layer.
+  Tensor ffn_gate, ffn_up, ffn_down;
+  // MoE.
+  Tensor gate_inp, exp_bias, routed_down, routed_up, gate_exps, up_exps, down_exps, gate_shexp,
+      up_shexp, down_shexp;
+  // Indexer.
+  Tensor idx_k, idx_k_norm, idx_value, idx_gate, idx_ape, idx_comp_norm, idx_q_b, idx_proj;
+  // Engram.
+  Tensor engram_kv, engram_kv_b, engram_gate, engram_lookup_norm, engram_pre_gamma,
+      engram_hc_scale;
+};
+
+struct Weights {
+  Tensor tok_embd, output, output_norm, hc_head_fn, hc_head_base, hc_head_scale;
+  std::vector<Layer> layers;
+};
+
+class Session;
+
+/// The loaded model. One evaluation runs at a time (scratch is shared).
+class Model {
+public:
+  /// Most tokens one evaluation takes.
+  static constexpr std::uint32_t kMaxChunk = 8;
+
+  ~Model();
+  Model(const Model&) = delete;
+  Model& operator=(const Model&) = delete;
+
+  /// `trunk_path` is the first GGUF shard; the reader maps the others (the
+  /// Engram table) beside it.
+  [[nodiscard]] static std::unique_ptr<Model> Load(const std::string& trunk_path,
+                                                   std::string* error);
+
+  [[nodiscard]] const Config& config() const { return config_; }
+  [[nodiscard]] const Weights& weights() const { return weights_; }
+  [[nodiscard]] hipStream_t stream() const { return stream_; }
+  [[nodiscard]] std::uint64_t ResidentBytes() const { return resident_bytes_; }
+
+  [[nodiscard]] std::unique_ptr<Session> CreateSession(std::uint32_t max_context,
+                                                       std::string* error);
+
+  /// Hashes `tokens` (positions pos0..) against `history` (the tokens before
+  /// them) and copies their FP8 Engram rows into `rows` [module][token][col][d];
+  /// `valid` [module][token][col].
+  void EngramGather(std::span<const std::int32_t> history, std::span<const std::int32_t> tokens,
+                    std::uint32_t pos0, std::uint8_t* rows, float* valid) const;
+
+private:
+  friend class Session;
+  Model() = default;
+  bool AllocScratch(std::string* error);
+
+  struct Shards;
+  std::unique_ptr<Shards> shards_;
+  Config config_;
+  Weights weights_;
+  std::vector<void*> allocations_;
+  std::uint64_t resident_bytes_ = 0;
+  hipStream_t stream_ = nullptr;
+  const std::uint8_t* engram_table_ = nullptr;  // host mapping, FP8 rows
+
+  // Scratch for one evaluation of up to kMaxChunk tokens (device unless noted).
+  struct Scratch;
+  std::unique_ptr<Scratch> scratch_;
+};
+
+/// One sequence's state: KV rows, indexer pools and token history.
+class Session {
+public:
+  ~Session();
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+  /// Evaluates `tokens` at the next positions; with `logits` set, writes the
+  /// logits of every evaluated token ([n][n_vocab], host) when `all_logits`,
+  /// else of the last one.
+  [[nodiscard]] bool Evaluate(std::span<const std::int32_t> tokens, std::vector<float>* logits,
+                              bool all_logits, std::string* error);
+
+  /// Forgets every evaluated token; the next evaluation starts at 0.
+  void Reset() { history_.clear(); }
+
+  [[nodiscard]] std::uint32_t Position() const {
+    return static_cast<std::uint32_t>(history_.size());
+  }
+  [[nodiscard]] std::uint32_t MaxContext() const { return max_context_; }
+  [[nodiscard]] const std::vector<std::int32_t>& History() const { return history_; }
+
+  /// Optional per-layer dump: called with the layer index (-1 for the head
+  /// input) and the hc stream state [n][hc][n_embd] on the host.
+  using LayerProbe = void (*)(void* user, int layer, const float* h, std::uint32_t n);
+  void SetLayerProbe(LayerProbe probe, void* user) {
+    probe_ = probe;
+    probe_user_ = user;
+  }
+
+private:
+  friend class Model;
+  Session(Model* model, std::uint32_t max_context) : model_(model), max_context_(max_context) {}
+  bool EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<float>* logits, bool all_logits,
+                     std::string* error);
+  bool Attention(std::uint32_t il, std::uint32_t n, std::string* error);
+  bool Ffn(std::uint32_t il, std::uint32_t n, std::string* error);
+  bool Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, const std::int32_t** sel,
+               std::uint32_t* n_sel, std::string* error);
+
+  Model* model_;
+  std::uint32_t max_context_;
+  std::vector<std::int32_t> history_;
+  // Per layer: latent rows [ring][kv_lora + n_rot].
+  std::vector<float*> cache_;
+  std::vector<std::uint32_t> ring_;
+  // Per indexer layer: value | gate rows [kIdxRing][2 idx_dim] and pooled
+  // keys [max_context / kpool][idx_dim].
+  std::vector<float*> idx_rows_;
+  std::vector<float*> idx_pooled_;
+  // Indexer scores [kMaxChunk][pool rows] and selections
+  // [kMaxChunk][(top pools + 1) kpool].
+  float* score_ = nullptr;
+  std::int32_t* sel_ = nullptr;
+  std::vector<void*> allocations_;
+  LayerProbe probe_ = nullptr;
+  void* probe_user_ = nullptr;
+};
+
+}  // namespace gufo::models::hy4_flash
+
+#endif  // HY4FLASH_RUNTIME_HY4_RUNTIME_HPP_
