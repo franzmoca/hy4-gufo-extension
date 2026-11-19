@@ -473,6 +473,20 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
 
 ## Next decode work
 
+- **Prefill attention (first).** Profile of a 3,712-token prefill (18.0 s,
+  206 tok/s): quantized MMQ 8.9 s (Q4_K experts 5.2 s at tile width 16:
+  each 256-token pass re-reads the experts), FP32 SGEMM attention 6.8 s, the
+  rest 1.9 s. 1024-token passes cut MMQ to 4.9 s but grew attention to
+  10.3 s (every row of a pass scores every key up to the pass end), so the
+  total stayed 18.2 s. Plan: a fused MLA prefill kernel (one block per token
+  and 16 heads, four waves sharing 64-key tiles: Q.K over 576 dims split by
+  key block, P.V over 512 dims split 128 per wave, binary16 WMMA with FP32
+  online softmax and sinks, each token walking only its own causal, window
+  or selected keys; keys converted to binary16 [keys][576] and V transposed
+  [512][keys] per pass), then 1024-token passes. Gate: KL against llama.cpp
+  and a kernels_test case against MlaReference. Rows depending only on their
+  own keys also serves batch invariance below.
+
 - **Prefill batch invariance.** A token's result depends on the passes its
   span was cut into (GEMMs over different row counts, the vec path at 8 or
   fewer), so a restore that re-prefills a gap with other chunk shapes can

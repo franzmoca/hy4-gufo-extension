@@ -93,6 +93,7 @@ int main(int argc, char** argv) {
   std::uint32_t ppl = 0;
   std::string kl_path;
   std::uint32_t passcheck = 0;
+  std::uint32_t chunkcheck = 0;
   for (int i = 3; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     if (a == "--gen") gen = std::atoi(argv[i + 1]);
@@ -101,6 +102,7 @@ int main(int argc, char** argv) {
     else if (a == "--ppl") ppl = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--kl") kl_path = argv[i + 1];
     else if (a == "--passcheck") passcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--chunkcheck") chunkcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
   }
   if (prompt.empty() && kl_path.empty()) {
     std::fprintf(stderr, "no tokens\n");
@@ -123,6 +125,78 @@ int main(int argc, char** argv) {
   }
 
   std::vector<float> logits;
+  if (chunkcheck) {
+    // The prompt prefilled whole (passes of kMaxChunk from token 0) and split
+    // at token `chunkcheck` (as after a prompt-cache restore there): the
+    // first layer where token `chunkcheck`'s streams differ, and the logits
+    // of every token after the split.
+    if (chunkcheck >= prompt.size()) {
+      std::fprintf(stderr, "--chunkcheck must be below the prompt length %zu\n", prompt.size());
+      return 2;
+    }
+    const std::size_t vocab = model->config().n_vocab;
+    const std::size_t width = std::size_t{model->config().hc} * model->config().n_embd;
+    struct Rows {
+      std::uint32_t want_pass;  // the pass holding the token, counted by layer-0 calls
+      std::uint32_t row;
+      std::size_t width;
+      std::int64_t passes = -1;
+      std::vector<std::vector<float>> layers;
+    };
+    auto record = [](void* user, int layer, const float* h, std::uint32_t) {
+      auto* r = static_cast<Rows*>(user);
+      if (layer == 0) ++r->passes;
+      if (r->passes != r->want_pass) return;
+      const float* row = h + std::size_t{r->row} * r->width;
+      r->layers.emplace_back(row, row + r->width);
+    };
+    const std::uint32_t split = chunkcheck;
+    Rows whole{split / hy4::Model::kMaxChunk, split % hy4::Model::kMaxChunk, width};
+    Rows cut{0, 0, width};
+    std::vector<float> whole_logits, cut_logits;
+    {
+      auto a = model->CreateSession(ctx, &error);
+      if (!a) return 1;
+      a->SetLayerProbe(record, &whole);
+      if (!a->Evaluate(prompt, &whole_logits, true, &error)) return 1;
+      auto b = model->CreateSession(ctx, &error);
+      if (!b || !b->Evaluate(std::span(prompt.data(), split), &logits, false, &error)) return 1;
+      b->SetLayerProbe(record, &cut);
+      if (!b->Evaluate(std::span(prompt.data() + split, prompt.size() - split), &cut_logits, true, &error)) return 1;
+    }
+    for (std::size_t l = 0; l < whole.layers.size() && l < cut.layers.size(); ++l) {
+      double d = 0.0;
+      for (std::size_t i = 0; i < width; ++i) d = std::max(d, double(std::fabs(whole.layers[l][i] - cut.layers[l][i])));
+      if (d > 0 || l + 1 == whole.layers.size()) {
+        std::printf("token %u: first differing layer %zu, max diff %.3g\n", split, l, d);
+        break;
+      }
+    }
+    const std::size_t rows = prompt.size() - split;
+    int same = 0;
+    double max_diff = 0.0, sum_kl = 0.0;
+    for (std::size_t r = 0; r < rows; ++r) {
+      const float* p = whole_logits.data() + (split + r) * vocab;
+      const float* q = cut_logits.data() + r * vocab;
+      same += std::max_element(p, p + vocab) - p == std::max_element(q, q + vocab) - q;
+      const double mp = *std::max_element(p, p + vocab), mq = *std::max_element(q, q + vocab);
+      double zp = 0.0, zq = 0.0;
+      for (std::size_t v = 0; v < vocab; ++v) {
+        zp += std::exp(p[v] - mp);
+        zq += std::exp(q[v] - mq);
+        max_diff = std::max(max_diff, double(std::fabs(p[v] - q[v])));
+      }
+      double kl = 0.0;
+      for (std::size_t v = 0; v < vocab; ++v) {
+        const double lp = p[v] - mp - std::log(zp), lq = q[v] - mq - std::log(zq);
+        kl += std::exp(lp) * (lp - lq);
+      }
+      sum_kl += kl;
+    }
+    std::printf("chunkcheck %u: %d/%zu same top, max |dlogit| %.4f, mean KL %.6f\n", split, same, rows, max_diff,
+                sum_kl / double(rows));
+    return 0;
+  }
   if (passcheck) {
     // Greedy tokens one per pass, then the same tokens `passcheck` per pass on
     // a fresh session: how far a multi-token (verify) pass moves the logits.
