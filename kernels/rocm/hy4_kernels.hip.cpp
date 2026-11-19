@@ -679,6 +679,14 @@ __global__ void GatherRows(const float* src, uint32_t ring, int32_t first, uint3
   }
 }
 
+__global__ void DequantQ8_0(const BlockQ8_0* src, uint64_t blocks, float* out) {
+  for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < blocks * 32;
+       i += (uint64_t)gridDim.x * blockDim.x) {
+    const BlockQ8_0& b = src[i / 32];
+    out[i] = __half2float(b.d) * (float)b.qs[i % 32];
+  }
+}
+
 __global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
   __shared__ float scratch[32];
   __shared__ int32_t picked;
@@ -929,6 +937,12 @@ int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t cou
                     hipStream_t stream) {
   if (count == 0) return 0;
   GatherRows<<<dim3(Blocks(dim, 16), count), kBlock, 0, stream>>>(src, ring, first, dim, dst);
+  return Status();
+}
+
+int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t stream) {
+  if (blocks == 0) return 0;
+  DequantQ8_0<<<Blocks(blocks * 32), kBlock, 0, stream>>>((const BlockQ8_0*)src, blocks, out);
   return Status();
 }
 

@@ -6,6 +6,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -44,7 +45,13 @@ template <typename T>
 bool DeviceAlloc(T** p, std::size_t count, std::vector<void*>* owned) {
   void* v = nullptr;
   if (gufo::hip::AllocateDevice(&v, std::max<std::size_t>(count, 1) * sizeof(T)) != hipSuccess) return false;
-  (void)hipMemset(v, 0, std::max<std::size_t>(count, 1) * sizeof(T));
+  // hipMemset runs on the null stream, which the engine's non-blocking stream
+  // does not wait for: finish it before any kernel can touch the buffer.
+  if (hipMemset(v, 0, std::max<std::size_t>(count, 1) * sizeof(T)) != hipSuccess ||
+      hipDeviceSynchronize() != hipSuccess) {
+    (void)hipFree(v);
+    return false;
+  }
   owned->push_back(v);
   *p = static_cast<T*>(v);
   return true;
@@ -151,6 +158,7 @@ bool Model::AllocScratch(std::string* error) {
       DeviceAlloc(&s.latent, std::size_t{n} * c.n_latent, owned) &&
       DeviceAlloc(&s.logits_r, std::size_t{n} * c.n_expert, owned) &&
       DeviceAlloc(&s.ids, std::size_t{n} * c.n_expert_used, owned) &&
+      HostAlloc(&s.ids_host, std::size_t{n} * c.n_expert_used, owned) &&
       DeviceAlloc(&s.route_w, std::size_t{n} * c.n_expert_used, owned) &&
       DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) && DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
       DeviceAlloc(&s.logits, std::size_t{n} * c.n_vocab, owned) &&
@@ -163,6 +171,16 @@ bool Model::AllocScratch(std::string* error) {
     return Fail(error, "hy4: hipblas init failed");
   }
   blas_ = blas;
+  // wk_b (K = 192, outside the MMQ tiles) as F32 for strided-batched GEMMs.
+  for (Layer& l : weights_.layers) {
+    const std::uint64_t count = l.wk_b.dims[0] * l.wk_b.dims[1] * l.wk_b.dims[2];
+    float* f = nullptr;
+    if (!DeviceAlloc(&f, count, owned) || hy4_dequant_q8_0(l.wk_b.data, count / 32, f, stream_) != 0) {
+      return Fail(error, "hy4: wk_b dequantization failed");
+    }
+    l.wk_b_f32 = f;
+  }
+  if (hipStreamSynchronize(stream_) != hipSuccess) return Fail(error, "hy4: wk_b dequantization failed");
   return true;
 }
 
@@ -240,7 +258,9 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   const std::uint32_t modules = static_cast<std::uint32_t>(c.engram_layers.size());
   const std::uint32_t cols = modules ? c.EngramCols() : 0;
   if (modules) {
+    const auto g0 = std::chrono::steady_clock::now();
     m.EngramGather(history_, tokens, pos0, s.engram_host, s.engram_valid_host);
+    engram_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - g0).count();
     for (std::uint32_t e = 0; e < modules; ++e) {
       for (std::uint32_t i = 0; i < n; ++i) {
         float any = 0.0f;
@@ -337,8 +357,21 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
 
   // Absorb wk_b into the query: q_abs[h] = wk_b[h] (512 x 192) q_nope[h].
   if (l.wk_b.type != HY4_TYPE_Q8_0 || l.wv_b.type != HY4_TYPE_Q8_0) return Fail(error, "hy4: wk_b/wv_b must be Q8_0");
-  HY4_CHECK(hy4_gemv_q8_0_grouped(l.wk_b.data, s.q, s.qfull, c.kv_lora, nope, heads, n,
-                                  std::uint64_t{heads} * c.head_k, c.head_k, std::uint64_t{heads} * dk, dk, st));
+  if (n > Model::kVecMax) {
+    // Per head: qfull[t][h][0:kv_lora] = wk_b[h] q[t][h][0:nope], column-major.
+    const float one = 1.0f;
+    const float zero = 0.0f;
+    if (hipblasSgemmStridedBatched(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(c.kv_lora), static_cast<int>(n),
+                                   static_cast<int>(nope), &one, l.wk_b_f32, static_cast<int>(nope),
+                                   static_cast<hipblasStride>(c.kv_lora) * nope, s.q,
+                                   static_cast<int>(heads * c.head_k), c.head_k, &zero, s.qfull,
+                                   static_cast<int>(heads * dk), dk, static_cast<int>(heads)) != HIPBLAS_STATUS_SUCCESS) {
+      return Fail(error, "hy4: wk_b gemm failed");
+    }
+  } else {
+    HY4_CHECK(hy4_gemv_q8_0_grouped(l.wk_b.data, s.q, s.qfull, c.kv_lora, nope, heads, n,
+                                    std::uint64_t{heads} * c.head_k, c.head_k, std::uint64_t{heads} * dk, dk, st));
+  }
   HY4_CHECK(hipMemcpy2DAsync(s.qfull + c.kv_lora, dk * sizeof(float), s.q + nope, c.head_k * sizeof(float),
                              c.n_rot * sizeof(float), std::size_t{n} * heads, hipMemcpyDeviceToDevice, st));
   HY4_CHECK(hy4_store_rows(s.kva, dk, cache_[il], ring_[il], s.pos, n, dk, st));
@@ -385,9 +418,15 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
       return Fail(error, "hy4: attention value gemm failed");
     }
   }
-  HY4_CHECK(hy4_gemv_q8_0_grouped(l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
-                                  std::uint64_t{heads} * c.kv_lora, c.kv_lora, std::uint64_t{heads} * c.head_v,
-                                  c.head_v, st));
+  if (n > Model::kVecMax) {
+    HY4_CHECK(hy4_mmq_dense_grouped_typed(l.wv_b.type, l.wv_b.data, s.att, s.attv, static_cast<int>(c.head_v),
+                                          static_cast<int>(n), static_cast<int>(c.kv_lora), static_cast<int>(heads),
+                                          st));
+  } else {
+    HY4_CHECK(hy4_gemv_q8_0_grouped(l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
+                                    std::uint64_t{heads} * c.kv_lora, c.kv_lora, std::uint64_t{heads} * c.head_v,
+                                    c.head_v, st));
+  }
   if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_sigmoid_mul(s.attv, s.gate, std::uint64_t{n} * heads * c.head_v, st));
   if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, ex, error)) return false;
@@ -488,6 +527,14 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex, error)) return false;
   if (n > Model::kVecMax) {
     if (l.gate_exps.type != l.up_exps.type) return Fail(error, "hy4: gate and up experts differ in type");
+    // Bound the routed grids by the real expert buckets (results unchanged).
+    HY4_CHECK(hipMemcpyAsync(s.ids_host, s.ids, std::size_t{n} * used * sizeof(std::int32_t), hipMemcpyDeviceToHost,
+                             st));
+    HY4_CHECK(hipStreamSynchronize(st));
+    std::vector<unsigned int> counts(c.n_expert, 0);
+    for (std::uint32_t i = 0; i < n * used; ++i) ++counts[static_cast<std::uint32_t>(s.ids_host[i]) % c.n_expert];
+    hy4_mmq_set_routed_max_expert_rows(static_cast<int>(*std::max_element(counts.begin(), counts.end())));
+    hy4_mmq_set_routed_tile_cols(hy4_mmq_routed_tile_cols_for_counts(counts.data(), static_cast<int>(c.n_expert)));
     HY4_CHECK(hy4_mmq_moe_swiglu_typed(l.gate_exps.type, l.gate_exps.data, l.up_exps.data, s.latent, s.ids,
                                        s.route_w, s.ffn_a, s.ffn_c, static_cast<int>(f),
                                        static_cast<int>(c.n_latent), static_cast<int>(n),
@@ -495,6 +542,8 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
     HY4_CHECK(hy4_mmq_moe_typed(l.down_exps.type, l.down_exps.data, s.ffn_c, s.ids, s.ffn_a,
                                 static_cast<int>(c.n_latent), static_cast<int>(f), static_cast<int>(n * used),
                                 static_cast<int>(c.n_expert), 1, st));
+    hy4_mmq_set_routed_max_expert_rows(0);
+    hy4_mmq_set_routed_tile_cols(0);
     HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
     if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
     HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));

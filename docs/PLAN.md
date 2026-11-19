@@ -152,6 +152,18 @@ docs: PPL 14.927 ± 0.964 (F16 cache) and 14.930 (F32 cache). This engine:
 **14.762**, within the reference's error. Short prompts match greedy token
 for token.
 
+Perplexity is still too coarse a gate: this model is chaotic under rounding
+(a 1e-6 relative change in one attention output moves a next-token
+probability by 0.05, through near-tied expert choices), so numerically
+equivalent kernels give chunk perplexities 5% apart. The gate is the KL
+divergence from llama.cpp's own logits on the same tokens:
+`llama-perplexity -c 4096 --chunks 2 --kl-divergence-base base.kld` once,
+then `hy4_eval_probe MODEL - --kl base.kld`. Reference noise floor (its F32
+against its F16 cache): mean KL 0.070, same top token 92.0%. This engine,
+batched path: 0.096 ± 0.010 and 91.4%; with the routed experts on the matvec
+path instead: 0.087 and 91.8% (indistinguishable). Greedy-token identity is
+not a gate for kernel changes here.
+
 ## Engine design (decided 2026-11-19, while working unattended)
 
 These are judgment calls made without the maintainer; revisit any of them.

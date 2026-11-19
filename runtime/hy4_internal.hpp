@@ -53,6 +53,7 @@ struct Model::Scratch {
   float* latent = nullptr;  // [chunk][n_latent]
   float* logits_r = nullptr;  // [chunk][n_expert]
   std::int32_t* ids = nullptr;   // [chunk][used]
+  std::int32_t* ids_host = nullptr;  // pinned copy, batched passes
   float* route_w = nullptr;      // [chunk][used]
   float* moe = nullptr;          // [chunk][n_latent]
   float* shared = nullptr;       // [chunk][n_embd]

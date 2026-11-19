@@ -88,6 +88,8 @@ struct Layer {
   // MoE.
   Tensor gate_inp, exp_bias, routed_down, routed_up, gate_exps, up_exps, down_exps, gate_shexp,
       up_shexp, down_shexp;
+  // wk_b dequantized to F32 [heads][kv_lora][nope], for batched passes.
+  const float* wk_b_f32 = nullptr;
   // Indexer.
   Tensor idx_k, idx_k_norm, idx_value, idx_gate, idx_ape, idx_comp_norm, idx_q_b, idx_proj;
   // Engram.
@@ -174,6 +176,8 @@ public:
     return static_cast<std::uint32_t>(history_.size());
   }
   [[nodiscard]] std::uint32_t MaxContext() const { return max_context_; }
+  /// Host seconds spent gathering Engram rows since creation.
+  [[nodiscard]] double EngramSeconds() const { return engram_seconds_; }
   [[nodiscard]] const std::vector<std::int32_t>& History() const { return history_; }
 
   /// Optional per-layer dump: called with the layer index (-1 for the head
@@ -211,6 +215,7 @@ private:
   // Attention selection mask [kMaxChunk][max_context].
   float* mask_ = nullptr;
   std::vector<void*> allocations_;
+  double engram_seconds_ = 0.0;
   LayerProbe probe_ = nullptr;
   void* probe_user_ = nullptr;
 };

@@ -4,16 +4,20 @@
 //
 //   hy4_eval_probe MODEL.gguf TOKENS [--gen N] [--ctx N] [--logits FILE]
 //   hy4_eval_probe MODEL.gguf TOKENS --ppl N
+//   hy4_eval_probe MODEL.gguf - --kl BASE
 //
 // TOKENS is a comma-separated id list or @FILE with whitespace-separated ids;
 // several prompts joined with '+' each run in a fresh session (after the
 // first, only their top probabilities are printed).
 // --logits writes the prompt's last-token logits as raw float32. --ppl N
 // scores like llama-perplexity -c N: chunks of N tokens in fresh sessions,
-// the second half of each chunk scored.
+// the second half of each chunk scored. --kl BASE reads a llama-perplexity
+// --kl-divergence-base file (its tokens and log-probabilities) and reports
+// the KL divergence from it, the same-top-token rate and the perplexity.
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -87,14 +91,16 @@ int main(int argc, char** argv) {
   std::uint32_t ctx = 8192;
   std::string logits_path;
   std::uint32_t ppl = 0;
+  std::string kl_path;
   for (int i = 3; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     if (a == "--gen") gen = std::atoi(argv[i + 1]);
     else if (a == "--ctx") ctx = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--logits") logits_path = argv[i + 1];
     else if (a == "--ppl") ppl = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--kl") kl_path = argv[i + 1];
   }
-  if (prompt.empty()) {
+  if (prompt.empty() && kl_path.empty()) {
     std::fprintf(stderr, "no tokens\n");
     return 2;
   }
@@ -115,6 +121,96 @@ int main(int argc, char** argv) {
   }
 
   std::vector<float> logits;
+  if (!kl_path.empty()) {
+    std::ifstream in(kl_path, std::ios::binary);
+    char magic[8] = {};
+    std::uint32_t n_ctx = 0;
+    std::int32_t n_vocab = 0;
+    std::int32_t n_chunk = 0;
+    in.read(magic, 8);
+    in.read(reinterpret_cast<char*>(&n_ctx), 4);
+    in.read(reinterpret_cast<char*>(&n_vocab), 4);
+    in.read(reinterpret_cast<char*>(&n_chunk), 4);
+    if (!in || std::string(magic, 8) != "_logits_" || n_vocab != static_cast<std::int32_t>(model->config().n_vocab)) {
+      std::fprintf(stderr, "bad KL base file\n");
+      return 1;
+    }
+    std::vector<std::int32_t> toks(std::size_t{n_ctx} * n_chunk);
+    in.read(reinterpret_cast<char*>(toks.data()), static_cast<std::streamsize>(toks.size() * 4));
+    const std::size_t vocab = static_cast<std::size_t>(n_vocab);
+    const std::size_t nv = 2 * ((vocab + 1) / 2) + 4;
+    std::vector<std::uint16_t> rec(nv);
+    double sum_kl = 0.0, sum_kl2 = 0.0, nll = 0.0, nll_base = 0.0;
+    std::size_t count = 0, same_top = 0;
+    std::vector<double> logp(vocab);
+    for (std::int32_t ch = 0; ch < n_chunk; ++ch) {
+      auto s = model->CreateSession(n_ctx, &error);
+      if (!s) {
+        std::fprintf(stderr, "session failed: %s\n", error.c_str());
+        return 1;
+      }
+      const std::int32_t* ct = toks.data() + std::size_t(ch) * n_ctx;
+      const std::size_t first = n_ctx / 2;
+      double chunk_kl = 0.0;
+      std::size_t chunk_n = 0;
+      for (std::size_t i = 0; i < n_ctx; i += hy4::Model::kMaxChunk) {
+        const std::size_t n = std::min<std::size_t>(hy4::Model::kMaxChunk, n_ctx - i);
+        const bool need = i + n > first;
+        if (!s->Evaluate(std::span<const std::int32_t>(ct + i, n), need ? &logits : nullptr, true, &error)) {
+          std::fprintf(stderr, "kl failed: %s\n", error.c_str());
+          return 1;
+        }
+        if (!need) continue;
+        for (std::size_t j = 0; j < n; ++j) {
+          const std::size_t at = i + j;
+          if (at < first || at + 1 >= n_ctx) continue;
+          in.read(reinterpret_cast<char*>(rec.data()), static_cast<std::streamsize>(nv * 2));
+          if (!in) {
+            std::fprintf(stderr, "KL base file ended early\n");
+            return 1;
+          }
+          float scale = 0.0f, min_lp = 0.0f;
+          std::memcpy(&scale, rec.data(), 4);
+          std::memcpy(&min_lp, rec.data() + 2, 4);
+          const std::uint16_t* q = rec.data() + 4;
+          const float* row = logits.data() + j * vocab;
+          const float mx = *std::max_element(row, row + vocab);
+          double den = 0.0;
+          for (std::size_t v = 0; v < vocab; ++v) den += std::exp(static_cast<double>(row[v] - mx));
+          const double lse = mx + std::log(den);
+          double kl = 0.0;
+          std::size_t top_base = 0, top = 0;
+          float best_base = -1e30f;
+          for (std::size_t v = 0; v < vocab; ++v) {
+            const float lb = scale * q[v] + min_lp;
+            if (lb > best_base) {
+              best_base = lb;
+              top_base = v;
+            }
+            if (row[v] > row[top]) top = v;
+            if (lb > -16.0f) kl += std::exp(static_cast<double>(lb)) * (lb - (row[v] - lse));
+          }
+          const std::int32_t next = ct[at + 1];
+          nll += lse - row[next];
+          nll_base -= scale * q[next] + min_lp;
+          sum_kl += kl;
+          sum_kl2 += kl * kl;
+          chunk_kl += kl;
+          same_top += top == top_base;
+          ++count;
+          ++chunk_n;
+        }
+      }
+      std::printf("chunk %d: mean KL %.5f\n", ch, chunk_kl / static_cast<double>(chunk_n));
+      std::fflush(stdout);
+    }
+    const double mean = sum_kl / static_cast<double>(count);
+    const double err = std::sqrt((sum_kl2 / static_cast<double>(count) - mean * mean) / static_cast<double>(count));
+    std::printf("KL %.5f +/- %.5f, same top %.2f%%, PPL %.4f (base %.4f) over %zu tokens\n", mean, err,
+                100.0 * static_cast<double>(same_top) / static_cast<double>(count),
+                std::exp(nll / static_cast<double>(count)), std::exp(nll_base / static_cast<double>(count)), count);
+    return 0;
+  }
   if (ppl > 0) {
     const std::size_t vocab = model->config().n_vocab;
     double nll = 0.0;
@@ -169,8 +265,8 @@ int main(int argc, char** argv) {
   }
   const auto p1 = std::chrono::steady_clock::now();
   const std::size_t vocab = model->config().n_vocab;
-  std::printf("prompt %zu tokens in %.3f s (%.1f tok/s)\n", prompt.size(), Seconds(p0, p1),
-              prompt.size() / Seconds(p0, p1));
+  std::printf("prompt %zu tokens in %.3f s (%.1f tok/s), Engram gather %.3f s\n", prompt.size(), Seconds(p0, p1),
+              prompt.size() / Seconds(p0, p1), session->EngramSeconds());
   if (!logits_path.empty()) {
     std::ofstream f(logits_path, std::ios::binary);
     f.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(vocab * sizeof(float)));
