@@ -71,6 +71,7 @@ gufo_extension_target(
     runtime/hy4_model.cpp
     runtime/hy4_dfly.cpp
     runtime/hy4_forward.cpp
+    runtime/hy4_vision.cpp
     runtime/tokenizer.cpp
   LINK_LIBRARIES
     gufo_hy4flash_mmq
@@ -85,6 +86,7 @@ if(TARGET gufo_hy4flash_hip)
   gufo_extension_hip_sources(gufo_hy4flash_hip
     SOURCES
       kernels/rocm/hy4_kernels.hip.cpp
+      kernels/rocm/hy4_vision.hip.cpp
   )
   target_compile_options(gufo_hy4flash_hip PRIVATE
     -O3 $<$<COMPILE_LANGUAGE:HIP>:-Wno-unused-command-line-argument>)
@@ -97,8 +99,10 @@ gufo_extension_target(
   NAME gufo_hy4flash_text
   SOURCES
     continuation_adapter.cpp
+    image_resize.cpp
     provider.cpp
     runner.cpp
+    vision_prompt.cpp
   LINK_LIBRARIES
     gufo_hy4flash_hip
     gufo_hy4flash
@@ -114,7 +118,7 @@ if(BUILD_TESTING AND TARGET gufo_hy4flash_hip)
   if(NOT TARGET hy4flash_probes)
     add_custom_target(hy4flash_probes)
   endif()
-  foreach(name IN ITEMS eval_probe tokenize_probe)
+  foreach(name IN ITEMS eval_probe tokenize_probe vision_probe)
     gufo_extension_target(
       NAME hy4flash_${name}
       SOURCES tools/probe/${name}.cpp

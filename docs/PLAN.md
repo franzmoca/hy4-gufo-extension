@@ -281,6 +281,38 @@ These are judgment calls made without the maintainer; revisit any of them.
     product over its slots falls under 0.45 (`HY4_DFLY_MIN_ACCEPT` overrides),
     capped by `--dfly-draft-tokens` (default 7). On prose this avoids the long
     blocks that made fixed lengths slower than plain decoding.
+19. **Vision follows Transformers' HY V4 VL, with M-RoPE.** There is no
+    `hy_v4_flash` modeling code. HY V4 VL shares the tower and the merger, and
+    Tencent's `config.json` declares interleaved M-RoPE (`mrope_section`
+    [12, 10, 10] on both rope bases). The llama.cpp branch rotates image rows
+    at plain 1D positions; we follow the config.
+    - Preprocessing (`processor_config.json`): smart-resize to multiples of
+      32 within 4,096 to 4,194,304 pixels (`detail: low` caps at 512²),
+      antialiased bicubic (Transformers ignores the config's `resample` 1),
+      mean and std 0.5.
+    - Tower: 16-pixel patch conv with bias, plus the 128×128 learned position
+      grid interpolated bilinearly with scale `(side + 0.1) / 128`. Then 27
+      pre-LN blocks (LayerNorm with bias, eps 1e-5; bidirectional attention,
+      16 heads of 72; GELU-erf MLP 4304). Then the merger: RMSNorm, 2×2
+      stride-2 conv to 4608, GELU, 1×1 conv to 3072, and the learned newline
+      after every merged row. An image of H×W merged cells gives H·(W+1) rows
+      between `<｜hy_image▁start｜>` and `<｜hy_image▁end｜>`.
+    - Positions: image row (r, c) rotates at (s, s + r, s + c), where s is the
+      text position the image starts at. Rotary pair i of 32 uses the height
+      position when i % 3 == 1 and the width position when i % 3 == 2
+      (i < 30), else the temporal one. Text after the image continues at
+      s + max(H, W + 1). A pooled indexer key rotates at its first member's
+      3D position (judgment: HY V4 VL has no pooling). Attention masks, rings
+      and windows keep sequence positions.
+    - Engram: an image row gets no Engram delta, and image rows in an n-gram's
+      history count as padding (as llama.cpp does; HY V4 VL has no Engram).
+    - Serving: an image is one prefill span (`PrefillStop`), encoded before
+      its first row is evaluated. Its identity (encoder, placement, pixels)
+      extends the cache identity. The metadata component carries the rope
+      offset and the rope position of the open pool group's first member, so
+      a restore continues the positions.
+    - The tower runs in FP32 (hipBLAS SGEMM) at first; attention is chunked
+      by queries.
 
 ## Phases
 
@@ -351,6 +383,22 @@ the product of its accept chances stays at least the threshold), same prompts:
 
 0.45 is the default (decision 18); one run per arm, so its 4% over fixed three
 drafts is inside run-to-run noise.
+
+Vision (decision 19), with DFly2 drafting:
+
+- The tower matches a float64 numpy transcription of HYV4VLVisionModel run on
+  the GGUF weights (`tools/probe/vision_probe.cpp`; relative RMS 1e-5 at 6×8
+  patches and 6e-6 at 20×22, the latter across three attention chunks).
+- The owl logo (2048²) is described correctly at full size (4,193 prompt
+  tokens) and at `detail: low` (305). llama.cpp's matmul diagram
+  (2875×1500) is transcribed exactly, axis labels included.
+- `image-inputs` passed. `tool-images` fails one assertion: asked for two
+  colors "separated by a comma and no spaces", the model answers
+  `red, blue`. With that comparison ignoring the space (a local copy of the
+  test) the whole suite passed. Both runs are flagged only because the
+  harness rejects extension speculative drafts (as before).
+- Cost: encoding a 2048² image takes 37.5 s in FP32 (16,384 patches; the
+  attention over all of them dominates), out of a 58 s first token.
 
 ## Read from the Tencent files
 
@@ -424,6 +472,10 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per
   token, and a verify pass now reads it once per token. Gathering only the
   selected rows (as the drafter does) cuts both.
+
+- **Vision tower speed.** FP32 SGEMM and a materialized 16-head score
+  matrix: 37.5 s at 2048². Fused F16/WMMA attention and F16 weights are the
+  likely route; check against the numpy reference.
 
 ## Open questions
 

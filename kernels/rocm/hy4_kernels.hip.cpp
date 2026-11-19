@@ -284,7 +284,11 @@ __global__ void GemvQ8_0Grouped(const BlockQ8_0* w, const float* x, float* y, ui
 
 // --------------------------------------------------------------------- rope
 
-__global__ void Rope(float* x, const int32_t* pos, uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
+// Interleaved M-RoPE (mrope_section [12, 10, 10] of 32 pairs): pair i takes
+// the height position when i % 3 == 1 and the width one when i % 3 == 2, for
+// i < 30, else the temporal one. Without `pos_hw` every pair takes `pos`.
+__global__ void Rope(float* x, const int32_t* pos, const int32_t* pos_hw,
+                     uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
                      uint32_t offset, uint32_t n_rot, float base) {
   const uint32_t t = blockIdx.y;
   const uint32_t pairs = n_rot / 2;
@@ -293,7 +297,10 @@ __global__ void Rope(float* x, const int32_t* pos, uint32_t heads, uint64_t tok_
   const uint32_t h = idx / pairs;
   const uint32_t i = idx % pairs;
   float* row = x + t * tok_stride + h * head_stride + offset;
-  const float theta = (float)pos[t] * powf(base, -2.0f * (float)i / (float)n_rot);
+  int32_t p = pos[t];
+  if (pos_hw != nullptr && i < 30 && i % 3 != 0)
+    p = pos_hw[2 * t + (i % 3 - 1)];
+  const float theta = (float)p * powf(base, -2.0f * (float)i / (float)n_rot);
   float s, c;
   sincosf(theta, &s, &c);
   const float x0 = row[2 * i];
@@ -831,10 +838,20 @@ int hy4_gemv_q8_0_grouped(const void* w, const float* x, float* y, uint32_t m, u
 
 int hy4_rope(float* x, const int32_t* pos, uint32_t n, uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
              uint32_t offset, uint32_t n_rot, float base, hipStream_t stream) {
+  return hy4_rope_3d(x, pos, nullptr, n, heads, tok_stride, head_stride, offset,
+                     n_rot, base, stream);
+}
+
+int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
+                uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
+                uint32_t offset, uint32_t n_rot, float base,
+                hipStream_t stream) {
   if (n == 0) return 0;
+  if (pos_hw != nullptr && n_rot != 64)
+    return 1;
   const uint32_t work = heads * (n_rot / 2);
-  Rope<<<dim3((work + kBlock - 1) / kBlock, n), kBlock, 0, stream>>>(x, pos, heads, tok_stride, head_stride,
-                                                                     offset, n_rot, base);
+  Rope<<<dim3((work + kBlock - 1) / kBlock, n), kBlock, 0, stream>>>(
+      x, pos, pos_hw, heads, tok_stride, head_stride, offset, n_rot, base);
   return Status();
 }
 

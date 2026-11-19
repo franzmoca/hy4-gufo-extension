@@ -4,10 +4,11 @@
 // Hy4 Flash's chat encoding: the GGUF's `tokenizer.chat_template` (Tencent's
 // template with the `:opensource` token suffix), rendered in C++.
 
+#include <cstddef>
+#include <gufo/ext/text.hpp>
 #include <string>
 #include <string_view>
-
-#include <gufo/ext/text.hpp>
+#include <vector>
 
 namespace gufo::models::hy4_flash {
 
@@ -29,6 +30,10 @@ struct Hy4Tokens {
   static constexpr std::string_view kResponseOpen = "<tool_response:opensource>";
   static constexpr std::string_view kResponseClose = "</tool_response:opensource>";
   static constexpr std::string_view kReasoningMode = "<｜reasoning_mode:opensource｜>";
+  static constexpr std::string_view kImageStart =
+      "<｜hy_image▁start:opensource｜>";
+  static constexpr std::string_view kImagePad = "<｜hy_image▁pad:opensource｜>";
+  static constexpr std::string_view kImageEnd = "<｜hy_image▁end:opensource｜>";
 };
 
 /// The template's `reasoning_effort`: `no_think`, `high` or `max`.
@@ -36,8 +41,12 @@ struct Hy4Tokens {
 
 /// Renders `request` as the template does with add_generation_prompt: the
 /// prompt ends inside an open assistant turn (after `<think>` when thinking).
-/// `developer` messages render as system messages.
-[[nodiscard]] std::string RenderChat(const ext::ChatRequest& request);
+/// `developer` messages render as system messages. An image part renders as
+/// its start, pad and end tokens; with `image_offsets` it renders as nothing
+/// and its byte offset in the result is appended instead.
+[[nodiscard]] std::string RenderChat(
+    const ext::ChatRequest& request,
+    std::vector<std::size_t>* image_offsets = nullptr);
 
 }  // namespace gufo::models::hy4_flash
 

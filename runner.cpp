@@ -4,9 +4,9 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <gufo/ext/component_cache_resources.hpp>
 #include <gufo/ext/gguf_identity.hpp>
@@ -28,15 +28,17 @@
 #include "continuation_adapter.hpp"
 #include "runtime/hy4_dfly.hpp"
 #include "runtime/hy4_runtime.hpp"
+#include "runtime/hy4_vision.hpp"
 #include "runtime/tokenizer.hpp"
 #include "text_contract.hpp"
+#include "vision_prompt.hpp"
 
 namespace gufo::models::hy4_flash {
 namespace {
 
 using namespace gufo::ext;
 
-constexpr std::string_view kStateAbi = "hy4-flash-gfx1151-state-v1";
+constexpr std::string_view kStateAbi = "hy4-flash-gfx1151-state-v2";
 // Without --context: the native context needs 7 GiB of latent rows per
 // session at 256K, so serving defaults to this.
 constexpr std::uint32_t kDefaultContext = 32768;
@@ -84,6 +86,62 @@ std::vector<std::uint8_t> ProcessIdentity(const void* model, std::uint32_t max_c
   return {canonical.begin(), canonical.end()};
 }
 
+// A request's images and their encodings, which a session reads as it
+// evaluates their rows.
+class ImageSource final : public ImageInputs {
+public:
+  ImageSource(std::shared_ptr<const ImagePrompt> prompt, VisionEncoder& encoder)
+      : prompt_(std::move(prompt)),
+        encoder_(&encoder),
+        rows_(prompt_->images.size()) {
+    for (const auto& image : prompt_->images)
+      spans_.push_back(image.span);
+  }
+  [[nodiscard]] std::span<const ImageSpan> Spans() const override {
+    return spans_;
+  }
+  [[nodiscard]] const float* Embeddings(std::size_t index,
+                                        std::string* error) override {
+    auto& rows = rows_.at(index);
+    if (!rows) {
+      const auto& image = prompt_->images[index];
+      rows = encoder_->Encode(image.pixels.pixels.data(), image.pixels.width,
+                              image.pixels.height, error);
+      if (!rows)
+        return nullptr;
+      if (rows->rows() != image.span.Rows()) {
+        rows.reset();
+        if (error)
+          *error = "hy4 vision: encoder rows differ from the prompt's";
+        return nullptr;
+      }
+    }
+    return rows->data();
+  }
+  [[nodiscard]] const ImagePrompt* prompt() const { return prompt_.get(); }
+
+private:
+  std::shared_ptr<const ImagePrompt> prompt_;
+  VisionEncoder* encoder_;
+  std::vector<ImageSpan> spans_;
+  std::vector<std::shared_ptr<const DeviceRows>> rows_;
+};
+
+// An image's rows are one prefill span: the cache never keeps a frontier
+// inside one, so a restore continues from text.
+class ImageContext final : public TextPromptContext {
+public:
+  std::shared_ptr<const ImagePrompt> prompt;
+  [[nodiscard]] std::size_t PrefillStop(std::size_t position,
+                                        bool up) const override {
+    for (const auto& image : prompt->images) {
+      if (position > image.span.first && position < image.span.End())
+        return up ? image.span.End() : image.span.first;
+    }
+    return position;
+  }
+};
+
 class Hy4TextRunnerState final : public TextRunnerState {
 public:
   Hy4TextRunnerState(Session& session, cache::Adapter& adapter, cache::Slot& slot)
@@ -97,8 +155,16 @@ public:
   [[nodiscard]] Session& session() const { return *session_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
+  [[nodiscard]] const std::shared_ptr<ImageSource>& images() const {
+    return images_;
+  }
+  void set_images(std::shared_ptr<ImageSource> images) {
+    images_ = std::move(images);
+    session_->SetImages(images_);
+  }
 
 private:
+  std::shared_ptr<ImageSource> images_;
   Session* session_{};
   cache::Adapter* adapter_{};
   cache::Slot* slot_{};
@@ -138,11 +204,15 @@ std::vector<std::int32_t> EngineTokens(std::span<const TextRunnerToken> tokens) 
 
 class Hy4TextRunner final : public HipTextModelRunner {
 public:
-  Hy4TextRunner(std::shared_ptr<Model> model, std::unique_ptr<Tokenizer> tokenizer, std::string model_name,
-                std::uint32_t max_context, std::string artifact_fingerprint, std::size_t sessions,
-                std::shared_ptr<Drafter> drafter, std::uint32_t draft_tokens)
+  Hy4TextRunner(std::shared_ptr<Model> model,
+                std::unique_ptr<Tokenizer> tokenizer, std::string model_name,
+                std::uint32_t max_context, std::string artifact_fingerprint,
+                std::size_t sessions, std::shared_ptr<Drafter> drafter,
+                std::uint32_t draft_tokens,
+                std::shared_ptr<VisionEncoder> vision)
       : model_(std::move(model)),
         drafter_(std::move(drafter)),
+        vision_(std::move(vision)),
         draft_tokens_(draft_tokens),
         tokenizer_(std::move(tokenizer)),
         model_name_(std::move(model_name)),
@@ -189,7 +259,7 @@ public:
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
-                .supports_vision = false,
+                .supports_vision = vision_ != nullptr,
                 .incremental_prefill = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
@@ -199,7 +269,9 @@ public:
                 .prefix_reuse = true,
             },
         .sampling_defaults = SamplingDefaults(),
-        .scheduling = {.pass_tokens = Model::kMaxChunk, .max_layer_groups = 1u, .max_yield_decode_width = 1u},
+        .scheduling = {.pass_tokens = Model::kMaxChunk,
+                       .max_layer_groups = 1u,
+                       .max_yield_decode_width = 1u},
     };
   }
 
@@ -209,8 +281,10 @@ public:
     std::optional<std::size_t> capacity;
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) capacity = free_bytes;
     return {
-        .resident_weights_bytes =
-            static_cast<std::size_t>(model_->ResidentBytes() + (drafter_ ? drafter_->ResidentBytes() : 0)),
+        .resident_weights_bytes = static_cast<std::size_t>(
+            model_->ResidentBytes() +
+            (drafter_ ? drafter_->ResidentBytes() : 0) +
+            (vision_ ? vision_->ResidentBytes() : 0)),
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
@@ -245,6 +319,8 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
+    if (HasImages(request))
+      return RunnerTokens(PrepareImages(request)->tokens);
     auto tokens = RunnerTokens(tokenizer_->EncodeWithSpecials(RenderChat(request)));
     if (tokens.empty()) return std::nullopt;
     return tokens;
@@ -263,6 +339,30 @@ public:
   }
 
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(const ChatRequest& request) const override {
+    if (HasImages(request)) {
+      // Images extend the cache identity at their first row; a prefix ending
+      // at or before an image holds only the earlier images.
+      auto prompt = PrepareImages(request);
+      auto context = std::make_shared<ImageContext>();
+      context->cache_identity = prompt->cache_identity;
+      for (const auto& image : prompt->images) {
+        const auto identity = prompt->IdentityForPrefix(image.span.first);
+        context->cache_prefixes.push_back(
+            {image.span.first, {identity.begin(), identity.end()}});
+      }
+      TextPreparedPrompt prepared{RunnerTokens(prompt->tokens), nullptr};
+      auto continuation = request;
+      continuation.messages.emplace_back(ext::ChatRole::kUser, "");
+      const auto continued = PrepareImages(continuation)->tokens;
+      prepared.cache_prefix_tokens = static_cast<std::size_t>(
+          std::mismatch(prompt->tokens.begin(), prompt->tokens.end(),
+                        continued.begin(), continued.end())
+              .first -
+          prompt->tokens.begin());
+      context->prompt = std::move(prompt);
+      prepared.context = std::move(context);
+      return prepared;
+    }
     auto prepared = TextModelRunner::PreparePrompt(request);
     if (prepared) {
       // The stable frontier: what a following user turn keeps of this prompt.
@@ -277,6 +377,30 @@ public:
       }
     }
     return prepared;
+  }
+
+  [[nodiscard]] std::optional<std::size_t> CountPromptTokens(
+      const ChatRequest& request) const override {
+    if (HasImages(request))
+      return PrepareImages(request)->tokens.size();
+    return TextModelRunner::CountPromptTokens(request);
+  }
+
+  void SetPromptContext(
+      TextRunnerState& state,
+      std::shared_ptr<const TextPromptContext> context) const override {
+    auto& hy4 = RequireState(state);
+    if (!context) {
+      hy4.set_images(nullptr);
+      return;
+    }
+    const auto* image = dynamic_cast<const ImageContext*>(context.get());
+    if (image == nullptr || !vision_)
+      throw std::invalid_argument("invalid Hy4 prompt context");
+    // The same prompt keeps its encodings.
+    if (hy4.images() && hy4.images()->prompt() == image->prompt.get())
+      return;
+    hy4.set_images(std::make_shared<ImageSource>(image->prompt, *vision_));
   }
 
   [[nodiscard]] std::string Decode(std::span<const TextRunnerToken> tokens) const override {
@@ -298,7 +422,17 @@ public:
       throw std::logic_error("Hy4 prefill offset does not match retained state");
     }
     if (offset >= prompt.size()) throw std::logic_error("Hy4 prefill has no remaining input");
-    const std::size_t consumed = std::min<std::size_t>(max_input_tokens, prompt.size() - offset);
+    std::size_t consumed =
+        std::min<std::size_t>(max_input_tokens, prompt.size() - offset);
+    // A step never ends inside an image: it stops before the image, or takes
+    // the whole image when it starts there.
+    if (const auto& images = hy4.images()) {
+      for (const auto& span : images->Spans()) {
+        const std::size_t end = offset + consumed;
+        if (end > span.first && end < span.End())
+          consumed = (span.first > offset ? span.first : span.End()) - offset;
+      }
+    }
     const auto tokens = EngineTokens(prompt.subspan(offset, consumed));
     std::string error;
     if (!hy4.session().Step(tokens, &error)) throw std::runtime_error("Hy4 prefill failed: " + error);
@@ -424,6 +558,19 @@ public:
   }
 
 private:
+  [[nodiscard]] static bool HasImages(const ChatRequest& request) {
+    return std::ranges::any_of(request.messages,
+                               [](const auto& m) { return !m.images.empty(); });
+  }
+  [[nodiscard]] std::shared_ptr<const ImagePrompt> PrepareImages(
+      const ChatRequest& request) const {
+    if (!vision_)
+      throw std::invalid_argument(
+          "image input requires the Hy4 Flash --mmproj BF16 sidecar");
+    return std::make_shared<const ImagePrompt>(PrepareImagePrompt(
+        *tokenizer_, request, vision_->Identity(), max_context_));
+  }
+
   [[nodiscard]] std::string DecodeToken(std::int32_t token) const { return tokenizer_->Decode(token); }
   [[nodiscard]] bool IsStopToken(std::int32_t token) const { return token == tokenizer_->eos(); }
 
@@ -447,6 +594,7 @@ private:
 
   std::shared_ptr<Model> model_;
   std::shared_ptr<Drafter> drafter_;
+  std::shared_ptr<VisionEncoder> vision_;
   std::uint32_t draft_tokens_{0};
   // Draft while the confidence head's chance that every draft so far is
   // accepted stays at least this (HY4_DFLY_MIN_ACCEPT overrides).
@@ -502,10 +650,6 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
       draft_path = files.front().string();
     }
   }
-  if (!options.vision_model_path.empty()) {
-    set_error("Hy4 Flash has no vision encoder yet");
-    return nullptr;
-  }
   if (options.session_count == 0) {
     set_error("HTTP session count must be at least one");
     return nullptr;
@@ -555,6 +699,35 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
     server::Logger::Info("loader", "event=hy4_dfly_loaded resident_bytes=" + std::to_string(drafter->ResidentBytes()) +
                                        " draft_tokens=" + std::to_string(draft_tokens));
   }
+  // The vision sidecar: --mmproj, else the one mmproj*.gguf beside the model.
+  std::string vision_path = options.vision_model_path;
+  if (vision_path.empty()) {
+    std::error_code ec;
+    std::vector<std::filesystem::path> found;
+    const auto directory =
+        std::filesystem::path(options.model_path).parent_path();
+    for (const auto& entry : std::filesystem::directory_iterator(
+             directory.empty() ? "." : directory, ec)) {
+      const auto name = entry.path().filename().string();
+      if (name.starts_with("mmproj") && entry.path().extension() == ".gguf")
+        found.push_back(entry.path());
+    }
+    if (found.size() == 1)
+      vision_path = found.front().string();
+  }
+  std::shared_ptr<VisionEncoder> vision;
+  if (!vision_path.empty()) {
+    std::unique_ptr<VisionEncoder> loaded_vision = VisionEncoder::Load(
+        vision_path, model->config().n_embd, model->stream(), &load_error);
+    if (!loaded_vision) {
+      set_error("Failed to load the Hy4 Flash vision sidecar: " + load_error);
+      return nullptr;
+    }
+    vision = std::move(loaded_vision);
+    model->SetImageToken(tokenizer->Find(Hy4Tokens::kImagePad));
+    server::Logger::Info("loader", "event=hy4_vision_loaded resident_bytes=" +
+                                       std::to_string(vision->ResidentBytes()));
+  }
   std::string model_fingerprint = options.disk_cache.model_artifact_fingerprint;
   try {
     if (!options.disk_cache.directory.empty() && model_fingerprint.empty()) {
@@ -563,9 +736,10 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
     const std::string name(reader->GetMetadataString("general.name").value_or("Hy4 Flash"));
     server::Logger::Info("loader", "event=hy4_loaded resident_bytes=" + std::to_string(model->ResidentBytes()) +
                                        " context=" + std::to_string(max_context));
-    return std::make_shared<Hy4TextRunner>(std::move(model), std::move(tokenizer), name, max_context,
-                                           std::move(model_fingerprint), options.session_count, std::move(drafter),
-                                           draft_tokens);
+    return std::make_shared<Hy4TextRunner>(
+        std::move(model), std::move(tokenizer), name, max_context,
+        std::move(model_fingerprint), options.session_count, std::move(drafter),
+        draft_tokens, std::move(vision));
   } catch (const std::exception& e) {
     set_error(std::string("Hy4 load failed: ") + e.what());
     return nullptr;

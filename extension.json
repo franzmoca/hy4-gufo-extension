@@ -80,6 +80,12 @@
         "testing"
       ],
       "role": "test"
+    },
+    "hy4flash_vision_probe": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [

@@ -14,8 +14,16 @@ struct Model::Scratch {
   std::int32_t* tokens = nullptr;  // [chunk]
   std::int32_t* pos = nullptr;     // [chunk]
   std::int32_t* groups = nullptr;  // [chunk] complete kpool groups
-  std::int32_t* group_pos = nullptr;
+  std::int32_t* group_pos =
+      nullptr;  // their first member's (temporal) rope position
+  std::int32_t* group_hw =
+      nullptr;  // [chunk][2], with images: its height and width ones
   std::int32_t* n_pool = nullptr;  // [chunk]
+  // Rope positions: temporal [chunk], and height | width [chunk][2] when the
+  // pass has image rows (rope_3d).
+  std::int32_t* rope = nullptr;
+  std::int32_t* rope_hw = nullptr;
+  bool rope_3d = false;
   // Engram rows: pinned host staging and device copies.
   std::uint8_t* engram_host = nullptr;  // [modules][chunk][cols][d]
   float* engram_valid_host = nullptr;   // [modules][chunk][cols]

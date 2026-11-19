@@ -1,10 +1,13 @@
 #include "chat_template.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
+#include <gufo/ext/json.hpp>
+#include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
-
-#include <gufo/ext/json.hpp>
 
 namespace gufo::models::hy4_flash {
 namespace {
@@ -82,7 +85,39 @@ std::string ToolsPrompt(const std::vector<ext::ChatTool>& tools) {
   return out;
 }
 
-std::string Content(const ChatMessage& message) { return message.content + message.framing_suffix; }
+// The message text with `image` at each image part's offset.
+std::string Content(const ChatMessage& message, std::string_view image) {
+  std::vector<std::size_t> offsets;
+  for (const auto& part : message.images)
+    offsets.push_back(std::min(part.offset, message.content.size()));
+  std::ranges::stable_sort(offsets);
+  std::string out;
+  std::size_t cursor = 0;
+  for (const std::size_t offset : offsets) {
+    out.append(message.content, cursor, offset - cursor);
+    out += image;
+    cursor = offset;
+  }
+  out.append(message.content, cursor);
+  return out + message.framing_suffix;
+}
+
+// A marker no message text contains, for RenderChat's image offsets.
+std::string ImageMarker(const ext::ChatRequest& request) {
+  static std::atomic<std::uint64_t> counter{std::random_device{}()};
+  for (;;) {
+    const std::string marker =
+        "\x01hy4-image-" + std::to_string(counter++) + "\x01";
+    const bool used =
+        std::ranges::any_of(request.messages, [&](const ChatMessage& m) {
+          return m.content.find(marker) != std::string::npos ||
+                 m.framing_suffix.find(marker) != std::string::npos ||
+                 m.thought.find(marker) != std::string::npos;
+        });
+    if (!used)
+      return marker;
+  }
+}
 
 void Turn(std::string& out, std::string_view role, std::string_view body) {
   out += T::kStart;
@@ -110,8 +145,16 @@ std::string_view ReasoningEffortName(const ReasoningOptions& reasoning) {
   return effort == ReasoningEffort::kMax || effort == ReasoningEffort::kXHigh ? "max" : "high";
 }
 
-std::string RenderChat(const ext::ChatRequest& request) {
+std::string RenderChat(const ext::ChatRequest& request,
+                       std::vector<std::size_t>* image_offsets) {
   const auto& messages = request.messages;
+  const std::string marker = image_offsets ? ImageMarker(request)
+                                           : std::string(T::kImageStart) +
+                                                 std::string(T::kImagePad) +
+                                                 std::string(T::kImageEnd);
+  const auto Content = [&](const ChatMessage& message) {
+    return hy4_flash::Content(message, marker);
+  };
   std::vector<ext::ChatTool> tools;
   if (request.tool_choice != ext::ChatRequest::ToolChoice::kNone) tools = request.tools;
   const std::string_view effort = ReasoningEffortName(request.reasoning);
@@ -170,6 +213,9 @@ std::string RenderChat(const ext::ChatRequest& request) {
       continue;
     }
     if (m.role == ChatRole::kSystem || m.role == ChatRole::kDeveloper) {
+      if (!m.images.empty())
+        throw std::invalid_argument(
+            "Hy4 Flash system messages cannot contain images");
       std::string body;
       if (i == 0) {
         if (!tools.empty()) body += ToolsPrompt(tools);
@@ -229,6 +275,19 @@ std::string RenderChat(const ext::ChatRequest& request) {
     out += T::kMiddle;
     out += T::kThinkOpen;
     if (no_think) out += T::kThinkClose;
+  }
+  if (image_offsets) {
+    image_offsets->clear();
+    std::string clean;
+    std::size_t cursor = 0;
+    for (std::size_t at = out.find(marker); at != std::string::npos;
+         at = out.find(marker, cursor)) {
+      clean.append(out, cursor, at - cursor);
+      image_offsets->push_back(clean.size());
+      cursor = at + marker.size();
+    }
+    clean.append(out, cursor);
+    out = std::move(clean);
   }
   return out;
 }

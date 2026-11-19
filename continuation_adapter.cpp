@@ -28,8 +28,12 @@ constexpr Rows kSmallChunkRows = 2048;
 constexpr Rows kLatentChunkRows = 256;
 
 struct Metadata {
-  std::uint32_t version{1};
+  std::uint32_t version{2};
   std::uint32_t position{};
+  // Rope state after images (Session::RestoreRope): the text offset, and the
+  // rope position of the open pool group's first member.
+  std::int32_t rope_delta{};
+  std::int32_t group_rope[3]{};
 };
 static_assert(std::is_trivially_copyable_v<Metadata>);
 
@@ -435,6 +439,15 @@ cache::Completion ContinuationAdapter::CapturePrivatePiece(const cache::Slot& sl
     throw std::invalid_argument("invalid Hy4 private piece");
   }
   Metadata metadata{.position = static_cast<std::uint32_t>(state.Tokens())};
+  if (c.part == ContinuationPart::kMetadata) {
+    const auto group_first =
+        metadata.position / model_->config().kpool * model_->config().kpool;
+    metadata.rope_delta = state.session->RopeDelta();
+    if (group_first < metadata.position) {
+      const auto rope = state.session->RopeAt(group_first);
+      std::copy(rope.begin(), rope.end(), metadata.group_rope);
+    }
+  }
   auto pieces = PrivateRegion(state, c);
   if (c.part == ContinuationPart::kMetadata) pieces = {{&metadata, 0, total, true}};
   return Transfer(state, false, stream, [&](gufo::hip::TransferStream& transfer) {
@@ -511,6 +524,12 @@ bool ContinuationAdapter::Validate(cache::Slot& slot, std::span<const cache::Com
   }
   const auto n = state.expected.front().valid_rows;
   if (state.metadata.version != Metadata{}.version || state.metadata.position != n) return refuse();
+  const auto group_first = static_cast<std::uint32_t>(
+      n / model_->config().kpool * model_->config().kpool);
+  const auto& m = state.metadata;
+  state.session->RestoreRope(
+      m.rope_delta, group_first,
+      {m.group_rope[0], m.group_rope[1], m.group_rope[2]});
   state.restoring = false;
   state.coverage.clear();
   state.expected.clear();

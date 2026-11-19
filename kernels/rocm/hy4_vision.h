@@ -1,0 +1,39 @@
+#ifndef HY4FLASH_KERNELS_ROCM_HY4_VISION_H_
+#define HY4FLASH_KERNELS_ROCM_HY4_VISION_H_
+
+/* Kernels of Hy4 Flash's vision tower and merger (runtime/hy4_vision.cpp).
+ * FP32, row-major [rows][dim]. Each returns 0, or 1 on a launch error. */
+
+#include <hip/hip_runtime_api.h>
+#include <stdint.h>
+
+/* y = (x - mean) / sqrt(var + eps) * weight + bias, per row. */
+int hy4_vis_layer_norm(const float* x, const float* weight, const float* bias,
+                       float* y, uint32_t rows, uint32_t dim, float eps,
+                       hipStream_t stream);
+
+/* y = y + bias (per column), then GELU (erf) when `gelu`. */
+int hy4_vis_bias(float* y, const float* bias, uint32_t rows, uint32_t dim,
+                 int gelu, hipStream_t stream);
+
+/* x += y + bias (bias per column; null for none). */
+int hy4_vis_residual(float* x, const float* y, const float* bias, uint32_t rows,
+                     uint32_t dim, hipStream_t stream);
+
+/* In-place softmax of each of `rows` rows of `cols` scores. */
+int hy4_vis_softmax(float* scores, uint32_t rows, uint32_t cols,
+                    hipStream_t stream);
+
+/* The 2x2 stride-2 convolution's input columns: x is the patch grid
+ * [gh][gw][dim]; out row (i * gw/2 + j) holds, at ic * 4 + kh * 2 + kw, patch
+ * (2i + kh, 2j + kw)'s channel ic (the GGUF kernel's [oc][ic][kh][kw] order).
+ */
+int hy4_vis_merge_gather(const float* x, uint32_t gh, uint32_t gw, uint32_t dim,
+                         float* out, hipStream_t stream);
+
+/* dst [oh][ow + 1][dim]: the rows of src [oh][ow][dim], each merged row
+ * followed by `newline`. */
+int hy4_vis_newline(const float* src, const float* newline, float* dst,
+                    uint32_t oh, uint32_t ow, uint32_t dim, hipStream_t stream);
+
+#endif /* HY4FLASH_KERNELS_ROCM_HY4_VISION_H_ */

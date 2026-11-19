@@ -104,6 +104,28 @@ struct Weights {
 
 class Session;
 
+/// An image's rows in a session's input: `height` merged rows of `width`
+/// cells, each followed by a newline row, from position `first`.
+struct ImageSpan {
+  std::uint32_t first = 0;
+  std::uint32_t height = 0;
+  std::uint32_t width = 0;
+  [[nodiscard]] std::uint32_t Rows() const { return height * (width + 1); }
+  [[nodiscard]] std::uint32_t End() const { return first + Rows(); }
+};
+
+/// A prompt's images: where their rows are and their input embeddings.
+class ImageInputs {
+public:
+  virtual ~ImageInputs() = default;
+  /// In position order, not overlapping.
+  [[nodiscard]] virtual std::span<const ImageSpan> Spans() const = 0;
+  /// Device rows [Rows()][n_embd] of image `index`, encoded on first use on
+  /// the model's stream; null on failure.
+  [[nodiscard]] virtual const float* Embeddings(std::size_t index,
+                                                std::string* error) = 0;
+};
+
 /// The loaded model. One evaluation runs at a time (scratch is shared).
 class Model {
 public:
@@ -140,6 +162,10 @@ public:
   /// `valid` [module][token][col].
   void EngramGather(std::span<const std::int32_t> history, std::span<const std::int32_t> tokens,
                     std::uint32_t pos0, std::uint8_t* rows, float* valid) const;
+  /// The image row token: Engram treats it as padding, and a session takes
+  /// its rows' embeddings from ImageInputs.
+  void SetImageToken(std::int32_t token) { image_token_ = token; }
+  [[nodiscard]] std::int32_t ImageToken() const { return image_token_; }
 
 private:
   friend class Session;
@@ -157,6 +183,7 @@ private:
   void* blas_ = nullptr;  // hipblasHandle_t
   const std::uint8_t* engram_table_ = nullptr;  // host mapping, FP8 rows
   std::uint64_t engram_bytes_ = 0;
+  std::int32_t image_token_ = -1;
 
   // Scratch for one evaluation of up to kMaxChunk tokens (device unless noted).
   struct Scratch;
@@ -209,9 +236,27 @@ public:
   /// Forgets every evaluated token; the next evaluation starts at 0.
   void Reset() {
     history_.clear();
+    rope_.clear();
+    rope_delta_ = 0;
     last_logits_.clear();
     tap_ready_ = false;
   }
+  /// The images of the prompt being evaluated (null: none). Rows of an image
+  /// span take its embeddings and rotate at 3D positions (docs/PLAN.md,
+  /// decision 19).
+  void SetImages(std::shared_ptr<ImageInputs> images) {
+    images_ = std::move(images);
+  }
+  /// A text token at position p rotates at p + RopeDelta().
+  [[nodiscard]] std::int32_t RopeDelta() const { return rope_delta_; }
+  /// The temporal, height and width rope positions of evaluated position p.
+  [[nodiscard]] std::array<std::int32_t, 3> RopeAt(std::uint32_t p) const {
+    return rope_.at(p);
+  }
+  /// After BeginRestore: the restored state's rope offset, and the rope
+  /// position of `group_first` (the first member of the open pool group).
+  void RestoreRope(std::int32_t delta, std::uint32_t group_first,
+                   std::array<std::int32_t, 3> group_rope);
 
   /// Called before an evaluation of positions [first, end) writes any row.
   using WriteHook = void (*)(void* user, std::uint32_t first, std::uint32_t end);
@@ -224,6 +269,7 @@ public:
   /// history to fill; the caller fills the rows, rings and logits.
   [[nodiscard]] std::int32_t* BeginRestore(std::uint32_t tokens) {
     history_.assign(tokens, 0);
+    RestoreRope(0, 0, {0, 0, 0});
     last_logits_.assign(model_->config().n_vocab, 0.0f);
     tap_ready_ = false;
     return history_.data();
@@ -267,6 +313,14 @@ private:
   Model* model_;
   std::uint32_t max_context_;
   std::vector<std::int32_t> history_;
+  // Per evaluated position: its temporal, height and width rope positions.
+  std::vector<std::array<std::int32_t, 3>> rope_;
+  std::int32_t rope_delta_ = 0;
+  std::shared_ptr<ImageInputs> images_;
+  // The rope positions of the pass being evaluated, from its first position.
+  std::vector<std::array<std::int32_t, 3>> chunk_rope_;
+  [[nodiscard]] std::array<std::int32_t, 3> PassRope(std::uint32_t p,
+                                                     std::uint32_t pos0) const;
   // Per layer: latent rows [ring][kv_lora + n_rot].
   std::vector<float*> cache_;
   std::vector<std::uint32_t> ring_;

@@ -132,34 +132,48 @@ bool Model::AllocScratch(std::string* error) {
   Scratch& s = *scratch_;
   auto* owned = &allocations_;
   const bool ok =
-      DeviceAlloc(&s.tokens, n, owned) && DeviceAlloc(&s.pos, n, owned) && DeviceAlloc(&s.groups, n, owned) &&
-      DeviceAlloc(&s.group_pos, n, owned) && DeviceAlloc(&s.n_pool, n, owned) &&
-      HostAlloc(&s.engram_host, std::size_t{modules} * n * cols * c.engram_dim, owned) &&
+      DeviceAlloc(&s.tokens, n, owned) && DeviceAlloc(&s.pos, n, owned) &&
+      DeviceAlloc(&s.groups, n, owned) && DeviceAlloc(&s.group_pos, n, owned) &&
+      DeviceAlloc(&s.group_hw, 2 * n, owned) &&
+      DeviceAlloc(&s.n_pool, n, owned) && DeviceAlloc(&s.rope, n, owned) &&
+      DeviceAlloc(&s.rope_hw, 2 * n, owned) &&
+      HostAlloc(&s.engram_host, std::size_t{modules} * n * cols * c.engram_dim,
+                owned) &&
       HostAlloc(&s.engram_valid_host, std::size_t{modules} * n * cols, owned) &&
       HostAlloc(&s.engram_any_host, std::size_t{modules} * n, owned) &&
-      DeviceAlloc(&s.engram_rows, std::size_t{modules} * n * cols * c.engram_dim, owned) &&
+      DeviceAlloc(&s.engram_rows,
+                  std::size_t{modules} * n * cols * c.engram_dim, owned) &&
       DeviceAlloc(&s.engram_valid, std::size_t{modules} * n * cols, owned) &&
       DeviceAlloc(&s.engram_any, std::size_t{modules} * n, owned) &&
-      DeviceAlloc(&s.engram_normed, std::size_t{n} * cols * c.engram_dim, owned) &&
-      DeviceAlloc(&s.engram_kv, std::size_t{n} * (c.hc + 1) * c.n_embd, owned) &&
-      DeviceAlloc(&s.h, std::size_t{n} * c.hc * c.n_embd, owned) && DeviceAlloc(&s.post, std::size_t{n} * c.hc, owned) &&
-      DeviceAlloc(&s.x, std::size_t{n} * c.n_embd, owned) && DeviceAlloc(&s.cur, std::size_t{n} * c.n_embd, owned) &&
-      DeviceAlloc(&s.y, std::size_t{n} * c.n_embd, owned) && DeviceAlloc(&s.qr, std::size_t{n} * c.q_lora, owned) &&
-      DeviceAlloc(&s.q, std::size_t{n} * hmax * c.head_k, owned) && DeviceAlloc(&s.kva, std::size_t{n} * dk, owned) &&
+      DeviceAlloc(&s.engram_normed, std::size_t{n} * cols * c.engram_dim,
+                  owned) &&
+      DeviceAlloc(&s.engram_kv, std::size_t{n} * (c.hc + 1) * c.n_embd,
+                  owned) &&
+      DeviceAlloc(&s.h, std::size_t{n} * c.hc * c.n_embd, owned) &&
+      DeviceAlloc(&s.post, std::size_t{n} * c.hc, owned) &&
+      DeviceAlloc(&s.x, std::size_t{n} * c.n_embd, owned) &&
+      DeviceAlloc(&s.cur, std::size_t{n} * c.n_embd, owned) &&
+      DeviceAlloc(&s.y, std::size_t{n} * c.n_embd, owned) &&
+      DeviceAlloc(&s.qr, std::size_t{n} * c.q_lora, owned) &&
+      DeviceAlloc(&s.q, std::size_t{n} * hmax * c.head_k, owned) &&
+      DeviceAlloc(&s.kva, std::size_t{n} * dk, owned) &&
       DeviceAlloc(&s.qfull, std::size_t{n} * hmax * dk, owned) &&
       DeviceAlloc(&s.att, std::size_t{n} * hmax * c.kv_lora, owned) &&
       DeviceAlloc(&s.attv, std::size_t{n} * hmax * c.head_v, owned) &&
       DeviceAlloc(&s.gate, std::size_t{n} * hmax * c.head_v, owned) &&
-      DeviceAlloc(&s.ik, std::size_t{n} * c.idx_dim, owned) && DeviceAlloc(&s.ivg, std::size_t{n} * 2 * c.idx_dim, owned) &&
+      DeviceAlloc(&s.ik, std::size_t{n} * c.idx_dim, owned) &&
+      DeviceAlloc(&s.ivg, std::size_t{n} * 2 * c.idx_dim, owned) &&
       DeviceAlloc(&s.iq, std::size_t{n} * c.idx_heads * c.idx_dim, owned) &&
-      DeviceAlloc(&s.iw, std::size_t{n} * c.idx_heads, owned) && DeviceAlloc(&s.ffn_a, ffn, owned) &&
-      DeviceAlloc(&s.ffn_b, ffn, owned) && DeviceAlloc(&s.ffn_c, ffn, owned) &&
+      DeviceAlloc(&s.iw, std::size_t{n} * c.idx_heads, owned) &&
+      DeviceAlloc(&s.ffn_a, ffn, owned) && DeviceAlloc(&s.ffn_b, ffn, owned) &&
+      DeviceAlloc(&s.ffn_c, ffn, owned) &&
       DeviceAlloc(&s.latent, std::size_t{n} * c.n_latent, owned) &&
       DeviceAlloc(&s.logits_r, std::size_t{n} * c.n_expert, owned) &&
       DeviceAlloc(&s.ids, std::size_t{n} * c.n_expert_used, owned) &&
       HostAlloc(&s.ids_host, std::size_t{n} * c.n_expert_used, owned) &&
       DeviceAlloc(&s.route_w, std::size_t{n} * c.n_expert_used, owned) &&
-      DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) && DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
+      DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) &&
+      DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
       DeviceAlloc(&s.logits, std::size_t{n} * c.n_vocab, owned) &&
       HostAlloc(&s.host_h, std::size_t{n} * c.hc * c.n_embd, owned);
   const bool ok2 = ok && DeviceAlloc(&s.keys, std::size_t{c.swa_window + n} * dk, owned) &&
@@ -260,10 +274,28 @@ void Session::Keep(std::uint32_t tokens) {
   const std::uint32_t evaluated = Position() - pass_pos0_;
   tokens = std::clamp<std::uint32_t>(tokens, 1, evaluated);
   history_.resize(pass_pos0_ + tokens);
+  rope_.resize(history_.size());
   const auto row = PassLogits(tokens - 1);
   last_logits_.assign(row.begin(), row.end());
   // The pass left its last tap_rows_ (= evaluated) rows.
   if (tap_ready_) tap_row_ = tap_rows_ - (evaluated - tokens) - 1;
+}
+
+std::array<std::int32_t, 3> Session::PassRope(std::uint32_t p,
+                                              std::uint32_t pos0) const {
+  return p < pos0 ? rope_.at(p) : chunk_rope_.at(p - pos0);
+}
+
+void Session::RestoreRope(std::int32_t delta, std::uint32_t group_first,
+                          std::array<std::int32_t, 3> group_rope) {
+  rope_delta_ = delta;
+  rope_.resize(history_.size());
+  for (std::size_t p = 0; p < rope_.size(); ++p) {
+    const std::int32_t t = static_cast<std::int32_t>(p) + delta;
+    rope_[p] = {t, t, t};
+  }
+  if (group_first < rope_.size())
+    rope_[group_first] = group_rope;
 }
 
 bool Session::EnableTaps(std::span<const std::uint32_t> layers, std::string* error) {
@@ -314,11 +346,73 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.n_vocab) return Fail(error, "hy4: token out of range");
   }
 
+  // Rope positions (decision 19): an image row (r, c) rotates at (s, s + r,
+  // s + c), with s the position its image starts at; text continues after
+  // the image's square of positions. Committed with the history.
+  struct ImageCopy {
+    std::uint32_t row, image, offset, count;
+  };
+  std::vector<ImageCopy> copies;
+  std::vector<std::array<std::int32_t, 3>> rope(n);
+  std::int32_t delta = rope_delta_;
+  s.rope_3d = false;
+  const std::span<const ImageSpan> spans =
+      images_ ? images_->Spans() : std::span<const ImageSpan>{};
+  for (std::uint32_t i = 0; i < n; ++i) {
+    const std::uint32_t p = pos0 + i;
+    const auto it = std::ranges::find_if(spans, [&](const ImageSpan& span) {
+      return p >= span.first && p < span.End();
+    });
+    if (it == spans.end()) {
+      const std::int32_t t = static_cast<std::int32_t>(p) + delta;
+      rope[i] = {t, t, t};
+      continue;
+    }
+    const std::uint32_t k = static_cast<std::uint32_t>(it - spans.begin());
+    const std::uint32_t offset = p - it->first;
+    const std::int32_t start = static_cast<std::int32_t>(it->first) + delta;
+    rope[i] = {start,
+               start + static_cast<std::int32_t>(offset / (it->width + 1)),
+               start + static_cast<std::int32_t>(offset % (it->width + 1))};
+    s.rope_3d = true;
+    if (!copies.empty() && copies.back().image == k &&
+        copies.back().row + copies.back().count == i) {
+      ++copies.back().count;
+    } else {
+      copies.push_back({i, k, offset, 1});
+    }
+    if (p + 1 == it->End()) {
+      delta = start +
+              static_cast<std::int32_t>(std::max(it->height, it->width + 1)) -
+              static_cast<std::int32_t>(it->End());
+    }
+  }
+  // Encode before this pass writes any row.
+  std::vector<const float*> image_rows(copies.size());
+  for (std::size_t k = 0; k < copies.size(); ++k) {
+    image_rows[k] = images_->Embeddings(copies[k].image, error);
+    if (image_rows[k] == nullptr)
+      return false;
+  }
+
   if (write_hook_) write_hook_(write_user_, pos0, pos0 + n);
-  std::vector<std::int32_t> pos(n);
-  for (std::uint32_t i = 0; i < n; ++i) pos[i] = static_cast<std::int32_t>(pos0 + i);
+  std::vector<std::int32_t> pos(n), rope_t(n), rope_hw(2 * n);
+  for (std::uint32_t i = 0; i < n; ++i) {
+    pos[i] = static_cast<std::int32_t>(pos0 + i);
+    rope_t[i] = rope[i][0];
+    rope_hw[2 * i] = rope[i][1];
+    rope_hw[2 * i + 1] = rope[i][2];
+  }
   HY4_CHECK(hipMemcpyAsync(s.tokens, tokens.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
   HY4_CHECK(hipMemcpyAsync(s.pos, pos.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
+  HY4_CHECK(hipMemcpyAsync(s.rope, rope_t.data(), n * sizeof(std::int32_t),
+                           hipMemcpyHostToDevice, st));
+  if (s.rope_3d) {
+    HY4_CHECK(hipMemcpyAsync(s.rope_hw, rope_hw.data(),
+                             2 * n * sizeof(std::int32_t),
+                             hipMemcpyHostToDevice, st));
+  }
+  chunk_rope_ = rope;
 
   // Engram rows for every module, gathered on the host from the mapping.
   const std::uint32_t modules = static_cast<std::uint32_t>(c.engram_layers.size());
@@ -343,6 +437,14 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   }
 
   HY4_CHECK(hy4_embed_q8_0(w.tok_embd.data, s.tokens, n, c.n_embd, s.x, st));
+  for (std::size_t k = 0; k < copies.size(); ++k) {
+    const ImageCopy& copy = copies[k];
+    HY4_CHECK(
+        hipMemcpyAsync(s.x + std::size_t{copy.row} * c.n_embd,
+                       image_rows[k] + std::size_t{copy.offset} * c.n_embd,
+                       std::size_t{copy.count} * c.n_embd * sizeof(float),
+                       hipMemcpyDeviceToDevice, st));
+  }
   HY4_CHECK(hy4_hc_init(s.x, s.h, n, c.hc, c.n_embd, st));
 
   for (std::uint32_t il = 0; il < c.n_layer; ++il) {
@@ -405,6 +507,8 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   }
   HY4_CHECK(hipStreamSynchronize(st));
   history_.insert(history_.end(), tokens.begin(), tokens.end());
+  rope_.insert(rope_.end(), rope.begin(), rope.end());
+  rope_delta_ = delta;
   return true;
 }
 
@@ -426,8 +530,12 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error)) return false;
   if (!MatVec(l.wkv_a, s.cur, s.kva, dk, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_rms_norm(s.kva, l.kv_a_norm.f32(), s.kva, n, c.kv_lora, dk, c.rms_eps, st));
-  HY4_CHECK(hy4_rope(s.kva, s.pos, n, 1, dk, 0, c.kv_lora, c.n_rot, base, st));
-  HY4_CHECK(hy4_rope(s.q, s.pos, n, heads, std::uint64_t{heads} * c.head_k, c.head_k, nope, c.n_rot, base, st));
+  const std::int32_t* hw = s.rope_3d ? s.rope_hw : nullptr;
+  HY4_CHECK(hy4_rope_3d(s.kva, s.rope, hw, n, 1, dk, 0, c.kv_lora, c.n_rot,
+                        base, st));
+  HY4_CHECK(hy4_rope_3d(s.q, s.rope, hw, n, heads,
+                        std::uint64_t{heads} * c.head_k, c.head_k, nope,
+                        c.n_rot, base, st));
 
   // Absorb wk_b into the query: q_abs[h] = wk_b[h] (512 x 192) q_nope[h].
   if (l.wk_b.type != HY4_TYPE_Q8_0 || l.wv_b.type != HY4_TYPE_Q8_0) return Fail(error, "hy4: wk_b/wv_b must be Q8_0");
@@ -567,12 +675,17 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
 
   // Pool the groups this chunk completes; a pooled key is roped at its first
   // member's position.
-  std::vector<std::int32_t> groups, group_pos;
+  std::vector<std::int32_t> groups, group_pos, group_hw;
+  bool group_3d = false;
   for (std::uint32_t i = 0; i < n; ++i) {
     const std::uint32_t p = pos0 + i;
     if (p % c.kpool == c.kpool - 1) {
       groups.push_back(static_cast<std::int32_t>(p / c.kpool));
-      group_pos.push_back(static_cast<std::int32_t>(p / c.kpool * c.kpool));
+      const auto r = PassRope(p / c.kpool * c.kpool, pos0);
+      group_pos.push_back(r[0]);
+      group_hw.push_back(r[1]);
+      group_hw.push_back(r[2]);
+      group_3d = group_3d || r[1] != r[0] || r[2] != r[0];
     }
   }
   const std::uint32_t pool_rows = max_context_ / c.kpool + 1;
@@ -580,10 +693,16 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
     const std::uint32_t ng = static_cast<std::uint32_t>(groups.size());
     HY4_CHECK(hipMemcpyAsync(s.groups, groups.data(), ng * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
     HY4_CHECK(hipMemcpyAsync(s.group_pos, group_pos.data(), ng * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
+    if (group_3d) {
+      HY4_CHECK(hipMemcpyAsync(s.group_hw, group_hw.data(),
+                               2 * ng * sizeof(std::int32_t),
+                               hipMemcpyHostToDevice, st));
+    }
     HY4_CHECK(hy4_kpool_pool(idx_rows_[il], Model::kIndexerRing, s.groups, ng, c.kpool, l.idx_ape.f32(), l.idx_comp_norm.f32(),
                              c.rms_eps, idx_pooled_[il], pool_rows, d, st));
-    HY4_CHECK(hy4_rope(idx_pooled_[il] + std::size_t(groups[0]) * d, s.group_pos, ng, 1, d, 0, d - c.n_rot, c.n_rot,
-                       base, st));
+    HY4_CHECK(hy4_rope_3d(idx_pooled_[il] + std::size_t(groups[0]) * d,
+                          s.group_pos, group_3d ? s.group_hw : nullptr, ng, 1,
+                          d, 0, d - c.n_rot, c.n_rot, base, st));
   }
 
   // Selection, once a token sees more pools than the top-k keeps; below
@@ -595,7 +714,9 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   for (std::uint32_t i = 0; i < n; ++i) n_pool[i] = static_cast<std::int32_t>((pos0 + i) / c.kpool);
   HY4_CHECK(hipMemcpyAsync(s.n_pool, n_pool.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
   if (!MatVec(l.idx_q_b, s.qr, s.iq, c.idx_heads * d, c.q_lora, n, ex, error)) return false;
-  HY4_CHECK(hy4_rope(s.iq, s.pos, n, c.idx_heads, std::uint64_t{c.idx_heads} * d, d, d - c.n_rot, c.n_rot, base, st));
+  HY4_CHECK(hy4_rope_3d(s.iq, s.rope, s.rope_3d ? s.rope_hw : nullptr, n,
+                        c.idx_heads, std::uint64_t{c.idx_heads} * d, d,
+                        d - c.n_rot, c.n_rot, base, st));
   // The 1 / sqrt(d heads) weight scale does not change the selection.
   if (!MatVec(l.idx_proj, s.cur, s.iw, c.idx_heads, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_indexer_score(s.iq, s.iw, idx_pooled_[il], s.n_pool, n_pool_max, score_, n, c.idx_heads, d, st));

@@ -68,6 +68,13 @@ int hy4_gemv_q8_0_grouped(const void* w, const float* x, float* y, uint32_t m, u
  * base^(-2i / n_rot). */
 int hy4_rope(float* x, const int32_t* pos, uint32_t n, uint32_t heads, uint64_t tok_stride,
              uint64_t head_stride, uint32_t offset, uint32_t n_rot, float base, hipStream_t stream);
+/* hy4_rope at 3D positions: `pos` is the temporal one and `pos_hw` [n][2]
+ * the height and width ones (interleaved M-RoPE, sections [12, 10, 10]; n_rot
+ * must be 64). A null `pos_hw` is hy4_rope. */
+int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
+                uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
+                uint32_t offset, uint32_t n_rot, float base,
+                hipStream_t stream);
 
 /* MLA attention with learnable sinks over latent rows (llama.cpp
  * build_attn_mha with wv_b applied by the caller). q[t, h, 0:dk] holds the

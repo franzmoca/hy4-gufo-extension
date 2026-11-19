@@ -348,7 +348,11 @@ void Model::EngramGather(std::span<const std::int32_t> history, std::span<const 
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   constexpr std::int64_t kDead = -1;
   auto cid = [&](std::int64_t t) -> std::int64_t {
-    return t < 0 || t >= static_cast<std::int64_t>(c.engram_token_map.size()) ? kDead : c.engram_token_map[t];
+    // An image row hashes as padding and gets no Engram delta (decision 19).
+    return t < 0 || t >= static_cast<std::int64_t>(c.engram_token_map.size()) ||
+                   t == image_token_
+               ? kDead
+               : c.engram_token_map[t];
   };
   const std::int64_t pad = c.engram_token_map[c.engram_pad];
   // The token at absolute position p, from the history or this chunk.

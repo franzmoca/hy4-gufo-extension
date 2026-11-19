@@ -369,7 +369,8 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
   std::int32_t pos[kBlock];
   for (std::uint32_t i = 0; i < n; ++i) {
     tokens[i] = i == 0 ? anchor : mask_token_;
-    pos[i] = static_cast<std::int32_t>(a + i);
+    pos[i] = static_cast<std::int32_t>(a + i) +
+             session.RopeDelta();  // text after any image
   }
   HY4_CHECK(hipMemcpyAsync(b.tokens, tokens, sizeof tokens, hipMemcpyHostToDevice, st));
   HY4_CHECK(hipMemcpyAsync(b.pos, pos, sizeof pos, hipMemcpyHostToDevice, st));
