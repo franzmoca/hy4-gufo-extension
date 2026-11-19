@@ -36,14 +36,23 @@
       "name": "--dfly-model",
       "type": "path",
       "commands": [
-        "serve",
-        "bench",
-        "prompt"
+        "serve"
       ],
       "providers": [
         "hy4flash"
       ],
-      "help": "DFly2 drafter GGUF for --speculative dfly"
+      "help": "DFly2 drafter: its safetensors file or checkpoint directory"
+    },
+    {
+      "name": "--dfly-draft-tokens",
+      "type": "integer",
+      "commands": [
+        "serve"
+      ],
+      "providers": [
+        "hy4flash"
+      ],
+      "help": "Tokens DFly2 drafts per step, 1 to 7 (default 3)"
     }
   ],
   "targets": {

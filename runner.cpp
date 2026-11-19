@@ -3,12 +3,16 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <gufo/ext/component_cache_resources.hpp>
 #include <gufo/ext/gguf_identity.hpp>
 #include <gufo/ext/host.hpp>
 #include <gufo/ext/host_budget.hpp>
+#include <gufo/ext/options.hpp>
 #include <gufo/ext/text.hpp>
 #include <limits>
 #include <memory>
@@ -22,6 +26,7 @@
 
 #include "chat_template.hpp"
 #include "continuation_adapter.hpp"
+#include "runtime/hy4_dfly.hpp"
 #include "runtime/hy4_runtime.hpp"
 #include "runtime/tokenizer.hpp"
 #include "text_contract.hpp"
@@ -37,6 +42,8 @@ constexpr std::string_view kStateAbi = "hy4-flash-gfx1151-state-v1";
 constexpr std::uint32_t kDefaultContext = 32768;
 // Prompt-cache transfer streams besides each session's own.
 constexpr std::size_t kBatchTransferStreams = 16;
+// DFly2 drafts per step without --dfly-draft-tokens.
+constexpr std::int64_t kDefaultDraftTokens = 3;
 
 std::size_t CacheCeilingBytes() { return std::max(HostSnapshotCeilingBytes(), HostSnapshotBudgetBytes()); }
 
@@ -130,8 +137,11 @@ std::vector<std::int32_t> EngineTokens(std::span<const TextRunnerToken> tokens) 
 class Hy4TextRunner final : public HipTextModelRunner {
 public:
   Hy4TextRunner(std::shared_ptr<Model> model, std::unique_ptr<Tokenizer> tokenizer, std::string model_name,
-                std::uint32_t max_context, std::string artifact_fingerprint, std::size_t sessions)
+                std::uint32_t max_context, std::string artifact_fingerprint, std::size_t sessions,
+                std::shared_ptr<Drafter> drafter, std::uint32_t draft_tokens)
       : model_(std::move(model)),
+        drafter_(std::move(drafter)),
+        draft_tokens_(draft_tokens),
         tokenizer_(std::move(tokenizer)),
         model_name_(std::move(model_name)),
         max_context_(max_context),
@@ -149,7 +159,9 @@ public:
   [[nodiscard]] std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
       cache::ResourceLedger& ledger, std::size_t ram) const override {
     (void)ram;
-    auto adapter = std::make_unique<ContinuationAdapter>(model_, max_context_, component_identity_);
+    std::vector<std::uint32_t> taps;
+    if (drafter_) taps.assign(drafter_->TargetLayers().begin(), drafter_->TargetLayers().end());
+    auto adapter = std::make_unique<ContinuationAdapter>(model_, max_context_, component_identity_, std::move(taps));
     return hip::CreateHipComponentCacheResources(
         std::move(adapter), ledger,
         {[] { return CacheCeilingBytes(); },
@@ -179,7 +191,7 @@ public:
                 .incremental_prefill = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = false,
+                .multi_token_decode = drafter_ != nullptr,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0u,
                 .prefix_reuse = true,
@@ -195,7 +207,8 @@ public:
     std::optional<std::size_t> capacity;
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) capacity = free_bytes;
     return {
-        .resident_weights_bytes = static_cast<std::size_t>(model_->ResidentBytes()),
+        .resident_weights_bytes =
+            static_cast<std::size_t>(model_->ResidentBytes() + (drafter_ ? drafter_->ResidentBytes() : 0)),
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
@@ -313,6 +326,95 @@ public:
     hy4.set_position(hy4.position() + 1);
   }
 
+  // With the drafter: sample the anchor from the frontier, draft after it,
+  // verify anchor and drafts in one pass, and keep the drafts the target's
+  // own draws agree with. A disagreeing draw is deferred to the next step,
+  // which samples it from the same logits, so sampling stays exact.
+  [[nodiscard]] TextDecodeStep DecodeStep(TextRunnerState& state, std::size_t max_tokens,
+                                          sampling::SamplerState& sampler) const override {
+    auto& hy4 = RequireState(state);
+    Session& session = hy4.session();
+    if (!drafter_ || max_tokens < 2 || !session.TapsReady()) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    TextDecodeStep step;
+    if (hy4.position() >= max_context_) {
+      step.stop = true;
+      return step;
+    }
+    sampling::SamplerState work = sampler;
+    TextDecodeSelection anchor = Select(hy4, work);
+    const auto count = static_cast<std::uint32_t>(
+        std::min<std::size_t>({draft_tokens_, max_tokens - 1, max_context_ - hy4.position() - 1}));
+    if (anchor.stop || count == 0) {
+      sampler.CopyDrawStateFrom(work);
+      step.stop = anchor.stop;
+      if (anchor.stop) {
+        step.terminal_logprobs = std::move(anchor.logprobs);
+      } else {
+        const TextRunnerToken token = anchor.token;
+        step.selections.push_back(std::move(anchor));
+        Advance(state, token);
+      }
+      return step;
+    }
+    const auto anchor_token = static_cast<std::int32_t>(anchor.token);
+    work.Accept(anchor.token);
+    step.selections.push_back(std::move(anchor));
+
+    std::vector<std::int32_t> drafts;
+    std::string error;
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!drafter_->Draft(session, anchor_token, count, &drafts, &error)) {
+      throw std::runtime_error("Hy4 draft failed: " + error);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    std::vector<std::int32_t> tokens{anchor_token};
+    tokens.insert(tokens.end(), drafts.begin(), drafts.end());
+    if (!session.Verify(tokens, &error)) throw std::runtime_error("Hy4 verify failed: " + error);
+    const auto t2 = std::chrono::steady_clock::now();
+    std::uint32_t kept = 1;
+    for (std::uint32_t i = 0; i < count; ++i) {
+      const auto logits = session.PassLogits(i);
+      const auto token = static_cast<std::int32_t>(work.Sample(logits));
+      if (token != drafts[i]) {
+        work.DeferSample(static_cast<sampling::TokenId>(token));
+        break;
+      }
+      auto logprobs = sampling::CollectLogprobs(logits, static_cast<TextRunnerToken>(token), sampler.config().logprobs);
+      if (hy4.stop_at_eos() && IsStopToken(token)) {
+        step.stop = true;
+        step.terminal_logprobs = std::move(logprobs);
+        break;
+      }
+      work.Accept(static_cast<sampling::TokenId>(token));
+      ++kept;
+      step.selections.push_back({.stop = false,
+                                 .token = static_cast<TextRunnerToken>(token),
+                                 .piece = DecodeToken(token),
+                                 .logprobs = std::move(logprobs)});
+    }
+    session.Keep(kept);
+    hy4.set_position(session.Position());
+    if (profile_) {
+      profile_->rounds += 1;
+      profile_->draft_s += std::chrono::duration<double>(t1 - t0).count();
+      profile_->verify_s += std::chrono::duration<double>(t2 - t1).count();
+      profile_->accepted += kept - 1;
+      if (profile_->rounds % 64 == 0) {
+        server::Logger::Info("dfly", "event=hy4_dfly_profile rounds=" + std::to_string(profile_->rounds) +
+                                         " draft_ms=" + std::to_string(1e3 * profile_->draft_s / profile_->rounds) +
+                                         " verify_ms=" + std::to_string(1e3 * profile_->verify_s / profile_->rounds) +
+                                         " accepted=" + std::to_string(double(profile_->accepted) / profile_->rounds));
+      }
+    }
+    sampler.CopyDrawStateFrom(work);
+    step.draft_rounds = 1;
+    step.draft_tokens = count;
+    step.draft_accepted_tokens = kept - 1;
+    return step;
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(const TextRunnerState& state) const override {
     return RequireState(state).position();
   }
@@ -340,6 +442,14 @@ private:
   }
 
   std::shared_ptr<Model> model_;
+  std::shared_ptr<Drafter> drafter_;
+  std::uint32_t draft_tokens_{0};
+  // HY4_DFLY_PROFILE=1: mean draft and verify times, logged every 64 steps.
+  struct Profile {
+    std::uint64_t rounds{0}, accepted{0};
+    double draft_s{0}, verify_s{0};
+  };
+  std::unique_ptr<Profile> profile_{std::getenv("HY4_DFLY_PROFILE") ? std::make_unique<Profile>() : nullptr};
   std::unique_ptr<Tokenizer> tokenizer_;
   std::string model_name_;
   std::uint32_t max_context_;
@@ -355,8 +465,34 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
     if (error != nullptr) *error = std::move(message);
   };
   if (options.speculative.backend != ext::TextSpeculativeBackend::kDisabled) {
-    set_error("Hy4 Flash has no speculative decoding yet");
+    set_error("Hy4 Flash drafts with DFly2: pass --dfly-model <checkpoint> instead of --speculative");
     return nullptr;
+  }
+  const std::string* dfly_option = ext::FindOption<std::string>(options.provider_options, "--dfly-model");
+  const bool use_dfly = dfly_option != nullptr && !dfly_option->empty();
+  std::string draft_path = use_dfly ? *dfly_option : std::string{};
+  std::int64_t draft_tokens_option = kDefaultDraftTokens;
+  if (const auto* value = ext::FindOption<std::int64_t>(options.provider_options, "--dfly-draft-tokens")) {
+    draft_tokens_option = *value;
+  }
+  if (draft_tokens_option < 1 || draft_tokens_option >= Drafter::kBlock) {
+    set_error("--dfly-draft-tokens must be 1 to 7");
+    return nullptr;
+  }
+  if (use_dfly) {
+    // A checkpoint directory holds the drafter in its one safetensors file.
+    std::error_code ec;
+    if (std::filesystem::is_directory(draft_path, ec)) {
+      std::vector<std::filesystem::path> files;
+      for (const auto& entry : std::filesystem::directory_iterator(draft_path, ec)) {
+        if (entry.path().extension() == ".safetensors") files.push_back(entry.path());
+      }
+      if (files.size() != 1) {
+        set_error("Hy4 DFly2: expected one .safetensors file in " + draft_path);
+        return nullptr;
+      }
+      draft_path = files.front().string();
+    }
   }
   if (!options.vision_model_path.empty()) {
     set_error("Hy4 Flash has no vision encoder yet");
@@ -399,6 +535,18 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
   }
   std::shared_ptr<Model> model(std::move(loaded));
   max_context = model->SessionContext(max_context);
+  std::shared_ptr<Drafter> drafter;
+  const auto draft_tokens = static_cast<std::uint32_t>(draft_tokens_option);
+  if (use_dfly) {
+    std::unique_ptr<Drafter> loaded_drafter = Drafter::Load(draft_path, *model, &load_error);
+    if (!loaded_drafter) {
+      set_error("Failed to load the DFly2 drafter: " + load_error);
+      return nullptr;
+    }
+    drafter = std::move(loaded_drafter);
+    server::Logger::Info("loader", "event=hy4_dfly_loaded resident_bytes=" + std::to_string(drafter->ResidentBytes()) +
+                                       " draft_tokens=" + std::to_string(draft_tokens));
+  }
   std::string model_fingerprint = options.disk_cache.model_artifact_fingerprint;
   try {
     if (!options.disk_cache.directory.empty() && model_fingerprint.empty()) {
@@ -408,7 +556,8 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
     server::Logger::Info("loader", "event=hy4_loaded resident_bytes=" + std::to_string(model->ResidentBytes()) +
                                        " context=" + std::to_string(max_context));
     return std::make_shared<Hy4TextRunner>(std::move(model), std::move(tokenizer), name, max_context,
-                                           std::move(model_fingerprint), options.session_count);
+                                           std::move(model_fingerprint), options.session_count, std::move(drafter),
+                                           draft_tokens);
   } catch (const std::exception& e) {
     set_error(std::string("Hy4 load failed: ") + e.what());
     return nullptr;

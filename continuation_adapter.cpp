@@ -139,8 +139,8 @@ public:
 };
 
 ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model, std::uint32_t context,
-                                         cache::Identity identity)
-    : model_(std::move(model)), context_(context), identity_(std::move(identity)) {
+                                         cache::Identity identity, std::vector<std::uint32_t> tap_layers)
+    : model_(std::move(model)), context_(context), identity_(std::move(identity)), tap_layers_(std::move(tap_layers)) {
   if (!model_ || identity_.empty() || context < 2) throw std::invalid_argument("invalid Hy4 adapter configuration");
   const Config& c = model_->config();
   const auto add = [&](ContinuationPart part, std::uint32_t layer, cache::ComponentDescriptor d,
@@ -226,6 +226,7 @@ std::unique_ptr<cache::Slot> ContinuationAdapter::CreateSlot(cache::MutationGuar
   std::string error;
   auto session = model_->CreateSession(context_, &error);
   if (!session) throw std::runtime_error(error);
+  if (!tap_layers_.empty() && !session->EnableTaps(tap_layers_, &error)) throw std::runtime_error(error);
   return std::make_unique<State>(*this, guard, std::move(session));
 }
 std::vector<cache::ComponentPosition> ContinuationAdapter::Positions(const cache::Slot& slot) const {

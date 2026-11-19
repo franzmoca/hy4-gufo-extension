@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
   std::string logits_path;
   std::uint32_t ppl = 0;
   std::string kl_path;
+  std::uint32_t passcheck = 0;
   for (int i = 3; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     if (a == "--gen") gen = std::atoi(argv[i + 1]);
@@ -99,6 +100,7 @@ int main(int argc, char** argv) {
     else if (a == "--logits") logits_path = argv[i + 1];
     else if (a == "--ppl") ppl = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--kl") kl_path = argv[i + 1];
+    else if (a == "--passcheck") passcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
   }
   if (prompt.empty() && kl_path.empty()) {
     std::fprintf(stderr, "no tokens\n");
@@ -121,6 +123,61 @@ int main(int argc, char** argv) {
   }
 
   std::vector<float> logits;
+  if (passcheck) {
+    // Greedy tokens one per pass, then the same tokens `passcheck` per pass on
+    // a fresh session: how far a multi-token (verify) pass moves the logits.
+    const std::size_t vocab = model->config().n_vocab;
+    const int steps = gen > 0 ? gen : 64;
+    std::vector<std::int32_t> toks;
+    std::vector<float> single;
+    if (!session->Evaluate(prompt, &logits, false, &error)) return 1;
+    for (int i = 0; i < steps; ++i) {
+      const std::int32_t t = static_cast<std::int32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+      toks.push_back(t);
+      if (!session->Evaluate(std::span(&toks.back(), 1), &logits, false, &error)) return 1;
+      single.insert(single.end(), logits.begin(), logits.end());
+    }
+    auto again = model->CreateSession(ctx, &error);
+    if (!again || !again->Evaluate(prompt, &logits, false, &error)) return 1;
+    std::vector<float> multi;
+    for (std::size_t i = 0; i < toks.size(); i += passcheck) {
+      const std::size_t n = std::min<std::size_t>(passcheck, toks.size() - i);
+      if (!again->Evaluate(std::span(toks.data() + i, n), &logits, true, &error)) return 1;
+      multi.insert(multi.end(), logits.begin(), logits.end());
+    }
+    double max_diff = 0.0, sum_diff = 0.0, sum_kl = 0.0;
+    int same = 0;
+    for (int i = 0; i < steps; ++i) {
+      const float* a = single.data() + i * vocab;
+      const float* b = multi.data() + i * vocab;
+      same += std::max_element(a, a + vocab) - a == std::max_element(b, b + vocab) - b;
+      double step_max = 0.0;
+      for (std::size_t v = 0; v < vocab; ++v) {
+        const double d = std::fabs(double(a[v]) - b[v]);
+        step_max = std::max(step_max, d);
+        sum_diff += d;
+      }
+      max_diff = std::max(max_diff, step_max);
+      {
+        const float ma = *std::max_element(a, a + vocab), mb = *std::max_element(b, b + vocab);
+        double za = 0.0, zb = 0.0;
+        for (std::size_t v = 0; v < vocab; ++v) {
+          za += std::exp(double(a[v]) - ma);
+          zb += std::exp(double(b[v]) - mb);
+        }
+        double kl = 0.0;
+        for (std::size_t v = 0; v < vocab; ++v) {
+          const double la = a[v] - ma - std::log(za), lb = b[v] - mb - std::log(zb);
+          kl += std::exp(la) * (la - lb);
+        }
+        sum_kl += kl;
+      }
+      std::printf("%.3f%c", step_max, i % 16 == 15 ? '\n' : ' ');
+    }
+    std::printf("passcheck %u: %d/%d same top, max |dlogit| %.4f, mean %.6f, mean KL %.5f\n", passcheck, same, steps,
+                max_diff, sum_diff / (double(steps) * vocab), sum_kl / steps);
+    return 0;
+  }
   if (!kl_path.empty()) {
     std::ifstream in(kl_path, std::ios::binary);
     char magic[8] = {};

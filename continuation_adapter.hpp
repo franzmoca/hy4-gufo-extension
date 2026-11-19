@@ -37,7 +37,9 @@ struct ContinuationComponent {
 // are private components.
 class ContinuationAdapter final : public cache::Adapter {
 public:
-  ContinuationAdapter(std::shared_ptr<Model>, std::uint32_t context, cache::Identity);
+  /// `tap_layers`: the layers each session taps for a drafter (Session::EnableTaps).
+  ContinuationAdapter(std::shared_ptr<Model>, std::uint32_t context, cache::Identity,
+                      std::vector<std::uint32_t> tap_layers = {});
   ~ContinuationAdapter() override;
   [[nodiscard]] Session& GetSession(cache::Slot&);
   [[nodiscard]] std::vector<cache::BackingClass> BackingPlan(std::size_t ram_bytes) const override;
@@ -87,6 +89,7 @@ private:
   std::vector<ContinuationComponent> components_;
   std::vector<cache::ComponentDescriptor> descriptors_;
   cache::Identity identity_;
+  std::vector<std::uint32_t> tap_layers_;
 };
 
 }  // namespace gufo::models::hy4_flash

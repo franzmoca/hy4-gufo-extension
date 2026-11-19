@@ -4,8 +4,9 @@ An experimental Gufo source extension for Tencent's
 [Hy4 Flash](https://huggingface.co/tencent/Hy4-flash) (`hy_v4_flash`) on
 Linux x86-64 / Strix Halo `gfx1151`.
 
-**Status:** in progress. This revision registers provider metadata and the
-GGUF probe only; it cannot run the model yet. See [docs/PLAN.md](docs/PLAN.md).
+**Status:** experimental. `gufo serve llm` serves chat, tool calls, reasoning
+and the prompt cache (RAM and disk) from one resident session, and drafts with
+Tencent's DFly2. Vision is not wired yet. See [docs/PLAN.md](docs/PLAN.md).
 
 Maintainer: Francesco Moca ([@franzmoca](https://github.com/franzmoca)).
 
@@ -30,3 +31,15 @@ Without Nix, from a Gufo checkout at the revision pinned in `flake.lock`:
 cmake --preset release -DGUFO_EXTENSION_DIRS=/path/to/hy4-gufo-extension
 cmake --build --preset release --parallel 4
 ```
+
+## Serve
+
+```sh
+gufo serve llm -m Hy4-flash-Q4_K_M-00001-of-00002.gguf \
+  --dfly-model /path/to/tencent-dfly2   # optional: DFly2 speculative decoding
+```
+
+The second GGUF shard (the Engram table) must sit beside the first. Without
+`--context` a session holds 32,768 tokens. `--dfly-model` takes the drafter's
+safetensors file or the directory holding it; `--dfly-draft-tokens` (1 to 7)
+sets how many tokens it drafts per step.

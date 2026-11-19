@@ -164,6 +164,13 @@ int hy4_selection_mask(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t
 /* dst [count][dim] = rows of the positions first .. first + count - 1 of a ring. */
 int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t count, uint32_t dim, float* dst,
                     hipStream_t stream);
+/* dst [count][dim] = rows of the positions idx[j] of a ring; a position < 0
+ * or > limit is missing (a zero row). mask [rows][n_keys] = -inf at the
+ * missing j, 0 at the other j < count and at every j >= count. */
+int hy4_gather_indexed(const float* src, uint32_t ring, const int32_t* idx, uint32_t count, int32_t limit,
+                       uint32_t dim, float* dst, float* mask, uint32_t rows, uint32_t n_keys, hipStream_t stream);
+/* x += a * b, elementwise over `count` floats; b repeats every `period` floats. */
+int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64_t period, hipStream_t stream);
 /* out [blocks * 32] = dequantized Q8_0 blocks. */
 int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t stream);
 int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream);

@@ -679,6 +679,29 @@ __global__ void GatherRows(const float* src, uint32_t ring, int32_t first, uint3
   }
 }
 
+__global__ void GatherIndexed(const float* src, uint32_t ring, const int32_t* idx, int32_t limit, uint32_t dim,
+                              float* dst) {
+  const uint32_t r = blockIdx.y;
+  const int32_t p = idx[r];
+  const bool ok = p >= 0 && p <= limit;
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
+    dst[(uint64_t)r * dim + c] = ok ? src[(uint64_t)((uint32_t)p % ring) * dim + c] : 0.0f;
+  }
+}
+
+__global__ void IndexMask(const int32_t* idx, uint32_t count, int32_t limit, float* mask, uint32_t n_keys) {
+  const uint32_t t = blockIdx.y;
+  for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < n_keys; j += gridDim.x * blockDim.x) {
+    mask[(uint64_t)t * n_keys + j] = j < count && (idx[j] < 0 || idx[j] > limit) ? -INFINITY : 0.0f;
+  }
+}
+
+__global__ void MulAdd(float* x, const float* a, const float* b, uint64_t count, uint64_t period) {
+  for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < count; i += (uint64_t)gridDim.x * blockDim.x) {
+    x[i] += a[i] * b[i % period];
+  }
+}
+
 __global__ void DequantQ8_0(const BlockQ8_0* src, uint64_t blocks, float* out) {
   for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < blocks * 32;
        i += (uint64_t)gridDim.x * blockDim.x) {
@@ -937,6 +960,21 @@ int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t cou
                     hipStream_t stream) {
   if (count == 0) return 0;
   GatherRows<<<dim3(Blocks(dim, 16), count), kBlock, 0, stream>>>(src, ring, first, dim, dst);
+  return Status();
+}
+
+int hy4_gather_indexed(const float* src, uint32_t ring, const int32_t* idx, uint32_t count, int32_t limit,
+                       uint32_t dim, float* dst, float* mask, uint32_t rows, uint32_t n_keys, hipStream_t stream) {
+  if (count) GatherIndexed<<<dim3(1, count), kBlock, 0, stream>>>(src, ring, idx, limit, dim, dst);
+  if (rows && n_keys) {
+    IndexMask<<<dim3((n_keys + kBlock - 1) / kBlock, rows), kBlock, 0, stream>>>(idx, count, limit, mask, n_keys);
+  }
+  return Status();
+}
+
+int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64_t period, hipStream_t stream) {
+  if (count == 0) return 0;
+  MulAdd<<<Blocks(count), kBlock, 0, stream>>>(x, a, b, count, period);
   return Status();
 }
 

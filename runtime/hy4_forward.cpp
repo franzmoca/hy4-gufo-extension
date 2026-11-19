@@ -241,6 +241,62 @@ bool Session::Evaluate(std::span<const std::int32_t> tokens, std::vector<float>*
   return true;
 }
 
+bool Session::Verify(std::span<const std::int32_t> tokens, std::string* error) {
+  if (tokens.empty() || tokens.size() > kTapRows) return Fail(error, "hy4: verify takes 1 to 8 tokens");
+  pass_pos0_ = Position();
+  tap_ready_ = false;
+  if (!Evaluate(tokens, &pass_logits_, true, error)) return false;
+  last_logits_.assign(pass_logits_.end() - model_->config().n_vocab, pass_logits_.end());
+  return true;
+}
+
+std::span<const float> Session::PassLogits(std::uint32_t row) const {
+  const std::size_t v = model_->config().n_vocab;
+  return std::span<const float>(pass_logits_).subspan(row * v, v);
+}
+
+void Session::Keep(std::uint32_t tokens) {
+  const std::uint32_t evaluated = Position() - pass_pos0_;
+  tokens = std::clamp<std::uint32_t>(tokens, 1, evaluated);
+  history_.resize(pass_pos0_ + tokens);
+  const auto row = PassLogits(tokens - 1);
+  last_logits_.assign(row.begin(), row.end());
+  // The pass left its last tap_rows_ (= evaluated) rows.
+  if (tap_ready_) tap_row_ = tap_rows_ - (evaluated - tokens) - 1;
+}
+
+bool Session::EnableTaps(std::span<const std::uint32_t> layers, std::string* error) {
+  const Config& c = model_->config();
+  if (tap_hidden_) return Fail(error, "hy4: taps already enabled");
+  tap_index_.assign(c.n_layer, -1);
+  tap_sel_count_ = c.idx_top_k / c.kpool * c.kpool;
+  for (const std::uint32_t layer : layers) {
+    if (layer >= c.n_layer || !c.has_indexer[layer] || c.is_swa[layer]) {
+      return Fail(error, "hy4: a tapped layer must be a sparse indexer layer");
+    }
+    tap_index_[layer] = static_cast<int>(tap_layers_.size());
+    tap_layers_.push_back(layer);
+    tap_sel_.push_back(nullptr);
+    if (!DeviceAlloc(&tap_sel_.back(), std::size_t{kTapRows} * tap_sel_count_, &allocations_)) {
+      return Fail(error, "hy4: tap allocation failed");
+    }
+  }
+  tap_has_sel_.assign(layers.size(), false);
+  if (!DeviceAlloc(&tap_hidden_, std::size_t{kTapRows} * c.n_embd, &allocations_)) {
+    return Fail(error, "hy4: tap allocation failed");
+  }
+  return true;
+}
+
+const float* Session::TapHidden() const {
+  return tap_hidden_ + std::size_t{tap_row_} * model_->config().n_embd;
+}
+
+const std::int32_t* Session::TapSelection(std::uint32_t k, std::uint32_t* count) const {
+  *count = tap_sel_count_;
+  return tap_has_sel_[k] ? tap_sel_[k] + std::size_t{tap_row_} * tap_sel_count_ : nullptr;
+}
+
 bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<float>* logits, bool all_logits,
                             std::string* error) {
   Model& m = *model_;
@@ -329,6 +385,14 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   HY4_CHECK(hy4_hc_pre(s.h, w.hc_head_fn.f32(), w.hc_head_scale.f32(), w.hc_head_base.f32(), s.x, nullptr, n, c.hc,
                        c.n_embd, c.rms_eps, c.hc_eps, 1.0f, st));
   HY4_CHECK(hy4_rms_norm(s.x, w.output_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
+  if (tap_hidden_) {
+    const std::uint32_t r = std::min(n, kTapRows);
+    HY4_CHECK(hipMemcpyAsync(tap_hidden_, s.cur + std::size_t{n - r} * c.n_embd, std::size_t{r} * c.n_embd * sizeof(float),
+                             hipMemcpyDeviceToDevice, st));
+    tap_rows_ = r;
+    tap_row_ = r - 1;
+    tap_ready_ = true;
+  }
   if (logits) {
     const std::uint32_t first = all_logits ? 0 : n - 1;
     const std::uint32_t rows = n - first;
@@ -388,6 +452,16 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   const std::int32_t* sel = nullptr;
   std::uint32_t n_sel = 0;
   if (c.has_indexer[il] && !Indexer(il, n, Position(), &sel, &n_sel, error)) return false;
+  if (!tap_index_.empty() && tap_index_[il] >= 0) {
+    const auto k = static_cast<std::uint32_t>(tap_index_[il]);
+    const std::uint32_t r = std::min(n, kTapRows);
+    tap_has_sel_[k] = sel != nullptr;
+    if (sel) {
+      if (n_sel != tap_sel_count_) return Fail(error, "hy4: tap selection size mismatch");
+      HY4_CHECK(hipMemcpyAsync(tap_sel_[k], sel + std::size_t{n - r} * n_sel, std::size_t{r} * n_sel * sizeof(std::int32_t),
+                               hipMemcpyDeviceToDevice, st));
+    }
+  }
 
   // Scores over every key the pass can see, as GEMMs over (token, head)
   // rows: MLA here is MQA over one latent row per key, so each key row is

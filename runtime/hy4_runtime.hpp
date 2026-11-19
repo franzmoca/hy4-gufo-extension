@@ -143,6 +143,7 @@ public:
 
 private:
   friend class Session;
+  friend class Drafter;
   Model() = default;
   bool AllocScratch(std::string* error);
 
@@ -182,10 +183,34 @@ public:
   /// The logits after the last Step, [n_vocab] on the host.
   [[nodiscard]] std::vector<float>& LastLogits() { return last_logits_; }
 
+  /// Evaluates `tokens` (at most kTapRows) and keeps every one's logits
+  /// (PassLogits) until Keep.
+  [[nodiscard]] bool Verify(std::span<const std::int32_t> tokens, std::string* error);
+  /// Logits after token `row` of the last Verify, [n_vocab] on the host.
+  [[nodiscard]] std::span<const float> PassLogits(std::uint32_t row) const;
+  /// Keeps the first `tokens` (>= 1) tokens of the last Verify and forgets
+  /// the rest; LastLogits and the taps then follow the last kept token.
+  void Keep(std::uint32_t tokens);
+
+  /// Draft taps: each evaluation leaves its last kTapRows tokens' final
+  /// hidden (after the output norm) and the indexer selections of the tapped
+  /// layers on the device, for a drafter to read at the frontier.
+  static constexpr std::uint32_t kTapRows = 8;
+  [[nodiscard]] bool EnableTaps(std::span<const std::uint32_t> layers, std::string* error);
+  /// Whether the taps hold the frontier token (a restored state has none).
+  [[nodiscard]] bool TapsReady() const { return tap_ready_; }
+  /// The frontier token's final hidden [n_embd] (device).
+  [[nodiscard]] const float* TapHidden() const;
+  /// The frontier token's selection on tapped layer `k` [count] (device,
+  /// -1 unused, possibly past the frontier), or null when that layer
+  /// attended to every earlier position.
+  [[nodiscard]] const std::int32_t* TapSelection(std::uint32_t k, std::uint32_t* count) const;
+
   /// Forgets every evaluated token; the next evaluation starts at 0.
   void Reset() {
     history_.clear();
     last_logits_.clear();
+    tap_ready_ = false;
   }
 
   /// Called before an evaluation of positions [first, end) writes any row.
@@ -200,6 +225,7 @@ public:
   [[nodiscard]] std::int32_t* BeginRestore(std::uint32_t tokens) {
     history_.assign(tokens, 0);
     last_logits_.assign(model_->config().n_vocab, 0.0f);
+    tap_ready_ = false;
     return history_.data();
   }
 
@@ -252,6 +278,20 @@ private:
   // [kMaxChunk][(top pools + 1) kpool].
   float* score_ = nullptr;
   std::int32_t* sel_ = nullptr;
+  // Draft taps (EnableTaps): rows [kTapRows][n_embd] and, per tapped layer,
+  // selections [kTapRows][tap_sel_count_]; tap_row_ is the frontier's row.
+  std::vector<std::uint32_t> tap_layers_;
+  std::vector<int> tap_index_;  // per layer: its tap, or -1
+  float* tap_hidden_ = nullptr;
+  std::vector<std::int32_t*> tap_sel_;
+  std::vector<bool> tap_has_sel_;
+  std::uint32_t tap_sel_count_ = 0;
+  std::uint32_t tap_row_ = 0;
+  std::uint32_t tap_rows_ = 0;  // rows the last pass left
+  bool tap_ready_ = false;
+  // The last Verify: its first position and logits [n][n_vocab].
+  std::uint32_t pass_pos0_ = 0;
+  std::vector<float> pass_logits_;
   // Attention selection mask [kMaxChunk][max_context].
   float* mask_ = nullptr;
   std::vector<void*> allocations_;

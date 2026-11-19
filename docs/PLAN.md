@@ -231,6 +231,45 @@ These are judgment calls made without the maintainer; revisit any of them.
     schema check. Fixing this needs a Gufo API change (schema-aware
     interpretation for registered dialects, as the host does for Qwen).
 
+15. **DFly2 runs from the safetensors file, quantized at load.** No GGUF
+    converter: the loader reads the BF16 `model.dfly_layers.*` tensors of the
+    Tencent shard (a file or the checkpoint directory, `--dfly-model`) and
+    uploads Q8_0 matrices and F32 norms (0.9 GB). The draft only decides how
+    many target tokens one pass checks, so its rounding costs acceptance,
+    never output. The design, from AngelSpec's `dfly2` code (public, read
+    only): a block of 8 slots at positions a .. a + 7, the anchor a (sampled
+    from the target's frontier logits) then mask tokens (120009), through the
+    target's embedding; the anchor slot adds `gate * eh_proj(enorm(E(anchor))
+    :: hnorm(h))`, h the target's final hidden after the output norm at a - 1
+    (only that one state: the open question below is settled). Five MLA layers
+    with the sink, the sigmoid output gate and the post-projection norm; layer
+    i attends to the block (bidirectional) and to the target's latent rows of
+    sparse layer 25 + 4i at the positions that layer's indexer selected for
+    a - 1 (every earlier position below 2,048), filtered to <= a - 1. RoPE in
+    the target's pair layout at the sparse base (1e7). Slot k >= 1 predicts
+    a + k: its final-normed hidden plus the hidden correction on the previous
+    token's embedding (the anchor, then slot k - 1's draft), through the
+    target's LM head. The confidence head is not used yet.
+16. **Speculative steps inside the runner.** `DecodeStep` samples the anchor,
+    drafts `--dfly-draft-tokens` (default 3) tokens, verifies anchor and drafts
+    in one pass (`Session::Verify`), and walks the rows with the request's own
+    sampler: a draw equal to the draft keeps it; the first that differs is
+    deferred (`SamplerState::DeferSample`) to the next step, which samples it
+    from the same logits. Sampling, penalties and grammars therefore stay
+    exact, and every emitted token is in the KV (`Session::Keep` drops the
+    rejected rows; rings and pools are rewritten by position, and their stale
+    rows are never read). The session taps the frontier's hidden and the five
+    layers' selections on every pass; a restored state has none, so its first
+    step is a plain one. `--speculative` is not used: Gufo's serve knows no
+    `dfly` backend, so the drafter is a provider option.
+17. **The DFly2 gate is the verify pass's KL, not identical text.** A verify
+    pass of n > 1 tokens runs the vendored matvecs with n columns, whose
+    summation order differs from the 1-column decode. Against one-token steps
+    over the same tokens it gives KL 0.0018 (0.0021 for a 16-token batched
+    pass), 40 times under the llama.cpp noise floor; greedy replies then match
+    until a near tie and may differ after it. Bit-identical replies would need
+    column-count-independent matvecs, which is not worth their cost.
+
 ## Phases
 
 0. **Repository.** Skeleton after `gemma4-gufo-extension`/`ds41-gufo-extension`:
@@ -249,10 +288,9 @@ These are judgment calls made without the maintainer; revisit any of them.
    `conversation`, `tools`, `long-context` and `cache` suites.
 5. **Prefill.** Batched prefill: SWA, kpool pooling over groups, Engram batch
    reads.
-6. **DFly2.** Convert the safetensors shard to a GGUF drafter with a tool in
-   `tools/`. Build the PyTorch reference, then the drafter path, reusing the
-   DS4.1 speculative cycle and width policy. Gate: identical greedy replies
-   with and without the drafter.
+6. **DFly2.** Load the drafter from the safetensors shard (decision 15), run it
+   in the runner's decode step (16). Gate: verify-pass KL (17), acceptance and
+   decode speed against the plain decode.
 7. **Vision.** Encoder, projector, MRoPE positions. `image-inputs` and
    `tool-images` suites.
 8. **Measurement and documentation.** Benchmark card, `EXPERIMENTS.md`,
@@ -272,6 +310,22 @@ development build:
   assumption to raise upstream, not a runner defect.
 
 Greedy decode through the server runs at 16.5 tok/s.
+
+DFly2 (three greedy chat prompts, 166 to 237 tokens each, decode tok/s and
+drafts accepted; plain decode 16.4, 16.4 and 15.7):
+
+| drafts/step | code | prose | list |
+| --- | --- | --- | --- |
+| 1 | 23.4 (94%) | 19.0 (57%) | 21.8 (82%) |
+| 2 | 27.1 (86%) | 18.5 (42%) | 22.6 (65%) |
+| 3 | 28.6 (80%) | 17.6 (35%) | 22.4 (55%) |
+| 4 | 27.0 (68%) | 15.5 (28%) | 20.7 (46%) |
+| 5 | 26.6 (62%) | 13.7 (22%) | 18.4 (37%) |
+| 7 | 24.8 (52%) | 11.1 (15%) | 14.2 (24%) |
+
+At three drafts a step costs 16.5 ms of drafting and 101 ms to verify four
+tokens (a plain step: 61 ms). Two and three drafts tie (geometric mean 22.4);
+three is the default. The confidence head could pick the length per step.
 
 ## Read from the Tencent files
 
@@ -319,7 +373,4 @@ Greedy decode through the server runs at 16.5 tok/s.
 
 ## Open questions
 
-- Does the DFly2 draft need the target's final hidden state at all 5 positions,
-  or only the anchor's (`dfly_mtp_fusion` "slot0")? Transformers 5.23's
-  `hy_v4_flash` code should say; the Tencent repo ships no modeling code.
 - What does `reasoning_effort` `max` render? It is in the Xylolabs template only.
