@@ -228,9 +228,13 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::st
     }
   }
   const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
-  ok = ok && DeviceAlloc(&s->mask_, std::size_t{kMaxChunk} * max_context, &s->allocations_) &&
-       DeviceAlloc(&s->score_, std::size_t{kMaxChunk} * pools, &s->allocations_) &&
-       DeviceAlloc(&s->sel_, std::size_t{kMaxChunk} * (top_pools + 1) * c.kpool, &s->allocations_);
+  ok = ok &&
+       DeviceAlloc(&s->mask_, std::size_t{kVecMax} * max_context,
+                   &s->allocations_) &&
+       DeviceAlloc(&s->score_, std::size_t{kMaxChunk} * pools,
+                   &s->allocations_) &&
+       DeviceAlloc(&s->sel_, std::size_t{kMaxChunk} * (top_pools + 1) * c.kpool,
+                   &s->allocations_);
   if (!ok) {
     Fail(error, "hy4: session allocation failed");
     return nullptr;

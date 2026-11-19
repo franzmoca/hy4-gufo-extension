@@ -16,3 +16,8 @@
 - Prefill 23% faster (206 → 253 tok/s on 3,712 tokens) with fused
   matrix-core attention, and closer to llama.cpp (KL 0.096 → 0.081)
   ([E7](docs/EXPERIMENTS.md#e7-fused-matrix-core-prefill-attention-2026-11-19)).
+- Prefill in 2,048-token passes: 360 tok/s on 3,712 tokens, and the first
+  token of a 2048² image in 17.6 s instead of 25.3 s. Prompt-cache snapshots
+  keep only the ring rows a continuation reads (about 35 MB instead of 56 MB);
+  older disk caches are not reused
+  ([E8](docs/EXPERIMENTS.md#e8-wider-prefill-passes-snapshots-of-live-ring-rows-2026-11-19)).

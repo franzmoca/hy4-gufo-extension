@@ -130,7 +130,7 @@ public:
 class Model {
 public:
   /// Most tokens one evaluation pass takes (longer spans run in passes).
-  static constexpr std::uint32_t kMaxChunk = 256;
+  static constexpr std::uint32_t kMaxChunk = 2048;
   /// Passes up to this many tokens use matvecs; longer ones use GEMMs.
   static constexpr std::uint32_t kVecMax = 8;
   /// Rows of each indexer layer's value and gate ring.
@@ -346,7 +346,7 @@ private:
   // The last Verify: its first position and logits [n][n_vocab].
   std::uint32_t pass_pos0_ = 0;
   std::vector<float> pass_logits_;
-  // Attention selection mask [kMaxChunk][max_context].
+  // Attention selection mask of the verify-pass path [kVecMax][max_context].
   float* mask_ = nullptr;
   std::vector<void*> allocations_;
   std::vector<float> last_logits_;

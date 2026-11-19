@@ -38,7 +38,7 @@ namespace {
 
 using namespace gufo::ext;
 
-constexpr std::string_view kStateAbi = "hy4-flash-gfx1151-state-v2";
+constexpr std::string_view kStateAbi = "hy4-flash-gfx1151-state-v3";
 // Without --context: the native context needs 7 GiB of latent rows per
 // session at 256K, so serving defaults to this.
 constexpr std::uint32_t kDefaultContext = 32768;

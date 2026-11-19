@@ -160,7 +160,9 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model, std::uint
   std::size_t ring_bytes = 0;
   for (std::uint32_t l = 0; l < c.n_layer; ++l) {
     if (c.is_swa[l]) {
-      ring_bytes += std::size_t{model_->KvRing(l, context)} * latent_bytes;
+      ring_bytes +=
+          std::size_t{std::min(c.swa_window, model_->KvRing(l, context))} *
+          latent_bytes;
     } else {
       add(ContinuationPart::kRows, l,
           {.id = {}, .kind = cache::ComponentKind::kAppendRows, .row_bytes = latent_bytes, .rows_per_chunk = kLatentChunkRows});
@@ -170,7 +172,7 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model, std::uint
           {.id = {}, .kind = cache::ComponentKind::kAppendRows, .row_bytes = std::size_t{c.idx_dim} * sizeof(float),
            .rows_per_chunk = kSmallChunkRows},
           c.kpool);
-      ring_bytes += std::size_t{Model::kIndexerRing} * 2 * c.idx_dim * sizeof(float);
+      ring_bytes += std::size_t{c.kpool} * 2 * c.idx_dim * sizeof(float);
     }
   }
   add(ContinuationPart::kRings, 0, {.id = {}, .kind = cache::ComponentKind::kPrivateState, .state_bytes = ring_bytes});
@@ -181,7 +183,7 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model, std::uint
   const auto put = [&](std::uint32_t value) {
     for (unsigned i = 0; i < 4; ++i) identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(1);  // Component layout version.
+  put(2);  // Component layout version.
   put(context);
 }
 
@@ -271,11 +273,36 @@ std::vector<ContinuationAdapter::Piece> ContinuationAdapter::PrivateRegion(State
   };
   switch (c.part) {
     case ContinuationPart::kRings: {
+      // Only the rows a continuation reads: each window layer's last `window`
+      // positions before the frontier, and the indexer rows of the open kpool
+      // group. Position p sits in ring row p % ring; a span wraps at most once.
+      // (Positions before 0, at the start of a short prompt, are rows no pass
+      // reads.)
+      const auto Tokens = static_cast<std::int64_t>(state.Tokens());
+      const auto span = [&](float* base, std::uint32_t ring, std::int64_t first,
+                            std::uint32_t count, std::size_t row_bytes) {
+        const auto start =
+            static_cast<std::uint32_t>(((first % ring) + ring) % ring);
+        const std::uint32_t run = std::min(count, ring - start);
+        add(reinterpret_cast<std::uint8_t*>(base) +
+                std::size_t{start} * row_bytes,
+            std::size_t{run} * row_bytes);
+        if (run < count)
+          add(base, std::size_t{count - run} * row_bytes);
+      };
       const std::size_t latent_bytes = std::size_t{cfg.kv_lora + cfg.n_rot} * sizeof(float);
+      const std::size_t index_bytes =
+          std::size_t{2} * cfg.idx_dim * sizeof(float);
       for (std::uint32_t l = 0; l < cfg.n_layer; ++l) {
-        if (cfg.is_swa[l]) add(state.session->KvRows(l), std::size_t{state.session->KvRing(l)} * latent_bytes);
+        if (cfg.is_swa[l]) {
+          const std::uint32_t ring = state.session->KvRing(l);
+          const std::uint32_t count = std::min(cfg.swa_window, ring);
+          span(state.session->KvRows(l), ring, Tokens - count, count,
+               latent_bytes);
+        }
         if (cfg.has_indexer[l]) {
-          add(state.session->IndexerRing(l), std::size_t{Model::kIndexerRing} * 2 * cfg.idx_dim * sizeof(float));
+          span(state.session->IndexerRing(l), Model::kIndexerRing,
+               Tokens - Tokens % cfg.kpool, cfg.kpool, index_bytes);
         }
       }
       break;

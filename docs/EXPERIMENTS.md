@@ -13,6 +13,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E5 | Binary16 GEMM operands in the vision tower | retained |
 | E6 | Prefill results against the pass split | measurement |
 | E7 | Fused matrix-core prefill attention | retained |
+| E8 | 2,048-token prefill passes, snapshots of live ring rows only | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -125,3 +126,32 @@ depends on the split (the first difference moves to layer 1), mean KL after
 the split 0.0063 → 0.0049. `kernels_test` checks the kernel against the
 double precision reference at Hy4's shape (causal, gathered window, indexer
 selections). Retained.
+
+## E8: Wider prefill passes, snapshots of live ring rows (2026-11-19)
+
+With attention per token (E7), a wider pass no longer costs attention work,
+and each pass reads the routed experts once. 3,712-token prefill
+(`hy4_eval_probe`, two runs each):
+
+| pass | prefill | tok/s |
+| --- | --- | --- |
+| 256 | 14.67 s, 14.66 s | 253 |
+| 512 | 12.61 s, 12.62 s | 294 |
+| 1,024 | 11.10 s, 11.09 s | 335 |
+| 2,048 | 10.32 s, 10.32 s | 360 |
+
+Retained at 2,048. Through `gufo serve` (DFly2 and vision loaded): the
+3,747-token document prefills at 352 tok/s (was 202) and the 2048² image's
+first token arrives in 17.6 s (was 25.3 s), with correct answers. GPU memory
+at load: 107,263 MiB, 3.1 GiB more than with 256-token passes (the window
+layers' rings hold `window + pass` rows); the verify-only selection mask now
+takes 8 rows instead of a pass.
+
+The prompt-cache snapshot used to copy each window layer's whole ring and the
+indexer ring, which would have grown with the pass (about 56 MB per snapshot
+at 256, 200 MB at 2,048). It now copies only what a continuation reads: each
+window layer's last `window` rows before the frontier and the open kpool
+group's indexer rows (about 35 MB, independent of the pass). State ABI v3.
+Gates: KL 0.086 ± 0.008 (same top 91.9%), `--passcheck 8` exact, `cache` and
+`long-context` suites pass apart from the case recorded in QUALITY.md, every
+disk and RAM restore included.

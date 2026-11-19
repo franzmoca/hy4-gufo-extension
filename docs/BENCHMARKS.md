@@ -25,6 +25,12 @@ The llama.cpp reference implementation decodes this GGUF at 14.4 tok/s
 
 ## Prefill and first token
 
+These rows predate the fused prefill attention and the 2,048-token passes
+([E7](EXPERIMENTS.md#e7-fused-matrix-core-prefill-attention-2026-11-19),
+[E8](EXPERIMENTS.md#e8-wider-prefill-passes-snapshots-of-live-ring-rows-2026-11-19)):
+the 3,747-token document now prefills at about 352 tok/s and the 2048² image's
+first token arrives in about 17.6 s (one run each). Decode is unchanged.
+
 | request | prompt tokens | prefill tok/s | first token |
 | --- | --- | --- | --- |
 | short chat | 35-42 | 84-105 | 0.38-0.50 s |

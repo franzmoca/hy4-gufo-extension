@@ -480,7 +480,8 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   DS4) so key tiles are read once per 32 heads. Then retry 1024-token passes,
   which the SGEMM attention made slower: now that attention scales with each
   token's own keys, fewer, wider passes should cut MMQ's re-reads of the
-  experts (8.9 s, the largest share now).
+  experts (8.9 s, the largest share now). Done as E8: 2,048-token passes,
+  14.7 → 10.3 s.
 
 - **Designs to borrow for the prefill attention.** ds41's
   `attention_f16_kernel` (`ds41_v41.hip.cpp`) is the same MLA shape: block

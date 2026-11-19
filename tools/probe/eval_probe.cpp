@@ -151,8 +151,12 @@ int main(int argc, char** argv) {
       r->layers.emplace_back(row, row + r->width);
     };
     const std::uint32_t split = chunkcheck;
-    Rows whole{split / hy4::Model::kMaxChunk, split % hy4::Model::kMaxChunk, width};
-    Rows cut{0, 0, width};
+    Rows whole{split / hy4::Model::kMaxChunk,
+               split % hy4::Model::kMaxChunk,
+               width,
+               -1,
+               {}};
+    Rows cut{0, 0, width, -1, {}};
     std::vector<float> whole_logits, cut_logits;
     {
       auto a = model->CreateSession(ctx, &error);
