@@ -320,6 +320,11 @@ These are judgment calls made without the maintainer; revisit any of them.
 
 ## Phases
 
+All phases are done (2026-11-19): the evidence is in [QUALITY.md](QUALITY.md),
+[BENCHMARKS.md](BENCHMARKS.md) and [EXPERIMENTS.md](EXPERIMENTS.md); kernel and
+template tests run under `ctest -R '^hy4flash\.'`. Open work is under "Next
+decode work".
+
 0. **Repository.** Skeleton after `gemma4-gufo-extension`/`ds41-gufo-extension`:
    `extension.json`, flake pinned to Gufo `main` `0a473ebf` (API 0.3.29),
    `AGENTS.md`, `.clang-format`, licenses. The provider takes key

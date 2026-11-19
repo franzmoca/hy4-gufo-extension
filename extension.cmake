@@ -132,6 +132,42 @@ if(BUILD_TESTING AND TARGET gufo_hy4flash_hip)
   endforeach()
 endif()
 
+# Tests. Host contracts need no GPU; kernel checks need gfx1151 but no model.
+# `hy4flash_tests` builds every test binary, so ctest never runs a stale one.
+if(BUILD_TESTING AND NOT TARGET hy4flash_tests)
+  add_custom_target(hy4flash_tests)
+endif()
+
+function(_hy4flash_test name labels)
+  cmake_parse_arguments(ARG "" "" "LINK_LIBRARIES" ${ARGN})
+  set(target hy4flash_${name}_test)
+  gufo_extension_target(
+    NAME ${target}
+    SOURCES tests/${name}_test.cpp
+    LINK_LIBRARIES ${ARG_LINK_LIBRARIES} gufo_ext_runtime
+  )
+  if(NOT TARGET ${target})
+    return()
+  endif()
+  target_compile_definitions(${target} PRIVATE
+    GUFO_HY4_CHAT_GOLDENS="${GUFO_EXTENSION_BUILD_ROOT}/tests/fixtures/chat_goldens.json")
+  add_test(NAME hy4flash.${name} COMMAND ${target})
+  set_tests_properties(hy4flash.${name} PROPERTIES
+    LABELS "hy4flash;${labels}" SKIP_RETURN_CODE 77)
+  add_dependencies(hy4flash_tests ${target})
+endfunction()
+
+_hy4flash_test(chat_template "cpu;tokenization;tools"
+  LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
+if(ENGINE_ENABLE_HIP)
+  _hy4flash_test(vision_prompt "cpu;vision"
+    LINK_LIBRARIES gufo_hy4flash_text gufo_hy4flash_hip gufo_hy4flash gufo_ext_hip)
+  foreach(name IN ITEMS kernels vision_kernels)
+    _hy4flash_test(${name} "hip;gpu;gfx1151"
+      LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip)
+  endforeach()
+endif()
+
 install(FILES
   "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"
   "${GUFO_EXTENSION_BUILD_ROOT}/LICENSES/gufo.txt"

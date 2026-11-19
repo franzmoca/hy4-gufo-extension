@@ -14,8 +14,22 @@ nix flake update gufo        # move the pinned upstream Gufo (flake.lock)
 
 The flake builds tracked files only; stage new files before `nix build`.
 Development builds and tests run from a Gufo checkout at the pinned revision,
-with this repository as an extension directory
-(`-DGUFO_EXTENSIONS='*' -DGUFO_EXTENSION_DIRS=/path/to/hy4-gufo-extension`).
+with this repository as an extension directory:
+
+```sh
+cd /path/to/gufo
+nix develop -c cmake --preset gpu-test -B build/hy4 \
+  -DGUFO_EXTENSIONS='*' -DGUFO_EXTENSION_DIRS=/path/to/hy4-gufo-extension
+nix develop -c cmake --build build/hy4 --target hy4flash_tests
+cd build/hy4 && nix develop /path/to/gufo -c ctest -R '^hy4flash\.' --output-on-failure
+```
+
+`hy4flash_tests` builds every test binary. The `cpu` tests need no GPU; the
+`hip` tests (`kernels`, `vision_kernels`) check each kernel against a double
+precision reference on `gfx1151` without a model. The chat template goldens
+come from the GGUF's own template: regenerate them with
+`tools/chat_goldens.py` when the template or the cases change. Checks against
+the model (KL, vision rows) are in [docs/QUALITY.md](docs/QUALITY.md).
 
 ## Extension API
 

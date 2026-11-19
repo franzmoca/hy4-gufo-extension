@@ -1,0 +1,499 @@
+{
+ "template_sha256": "63ddd5de294df36f10c8f2c8e5f7b2a9dc2011c8481335422f04554256aee4ad",
+ "cases": [
+  {
+   "name": "single user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hello!<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "system max",
+   "effort": "max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>You are terse.<｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "developer as system",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Answer in French."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>Answer in French.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "no_think drops history reasoning",
+   "effort": "no_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First"
+    },
+    {
+     "role": "assistant",
+     "content": "One",
+     "reasoning": "thinking one"
+    },
+    {
+     "role": "user",
+     "content": "Second"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>First<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>One<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Second<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+  },
+  {
+   "name": "reasoning kept only after the last user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First"
+    },
+    {
+     "role": "assistant",
+     "content": "One",
+     "reasoning": "old thought"
+    },
+    {
+     "role": "user",
+     "content": "Second"
+    },
+    {
+     "role": "assistant",
+     "content": "Two",
+     "reasoning": "new thought"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>First<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>One<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Second<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>new thought</think:opensource>Two<｜hy_end:opensource｜>"
+  },
+  {
+   "name": "tool loop reorders responses",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the <web> & return \"results\".",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Rome and Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Two cities.",
+     "tool_calls": [
+      {
+       "id": "a1",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Rome",
+         "is_string": true
+        },
+        {
+         "name": "days",
+         "value": "2",
+         "is_string": false
+        }
+       ]
+      },
+      {
+       "id": "b2",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Oslo",
+         "is_string": true
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "b2",
+     "content": "Oslo: 3"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "a1",
+     "content": "Rome: 18"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city, in °C.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the <web> & return \\\"results\\\".\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Rome and Oslo?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>Two cities.</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Rome</arg_value:opensource><arg_key:opensource>days</arg_key:opensource><arg_value:opensource>2</arg_value:opensource></tool_call:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>Rome: 18</tool_response:opensource><tool_response:opensource>Oslo: 3</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "tool responses without ids keep their order",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather?"
+    },
+    {
+     "role": "assistant",
+     "content": "Checking.",
+     "tool_calls": [
+      {
+       "id": "",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Rome",
+         "is_string": true
+        }
+       ]
+      },
+      {
+       "id": "c3",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Oslo",
+         "is_string": true
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c3",
+     "content": "second"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "",
+     "content": "first"
+    },
+    {
+     "role": "assistant",
+     "content": "Done.",
+     "reasoning": "kept: tools preserve thinking"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city, in °C.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Checking.<tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Rome</arg_value:opensource></tool_call:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>second</tool_response:opensource><tool_response:opensource>first</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>kept: tools preserve thinking</think:opensource>Done.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Thanks<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "tools with a system message and typed arguments",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the <web> & return \"results\".",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "later",
+      "description": "Loaded on demand.",
+      "parameters": {},
+      "defer_loading": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools."
+    },
+    {
+     "role": "user",
+     "content": "Find ünïcode"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "s1",
+       "name": "search",
+       "arguments": [
+        {
+         "name": "q",
+         "value": "ünïcode <tags>",
+         "is_string": true
+        },
+        {
+         "name": "limit",
+         "value": "5",
+         "is_string": false
+        },
+        {
+         "name": "exact",
+         "value": "true",
+         "is_string": false
+        },
+        {
+         "name": "filters",
+         "value": "{\"lang\": [\"en\", \"it\"], \"safe\": null}",
+         "is_string": false
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "s1",
+     "content": "{\"hits\": 0}"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"search\", \"description\": \"Search the <web> & return \\\"results\\\".\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}}}}\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city, in °C.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Find ünïcode<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>search<arg_key:opensource>q</arg_key:opensource><arg_value:opensource>ünïcode <tags></arg_value:opensource><arg_key:opensource>limit</arg_key:opensource><arg_value:opensource>5</arg_value:opensource><arg_key:opensource>exact</arg_key:opensource><arg_value:opensource>true</arg_value:opensource><arg_key:opensource>filters</arg_key:opensource><arg_value:opensource>{\"lang\": [\"en\", \"it\"], \"safe\": null}</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>{\"hits\": 0}</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "tool choice none hides tools",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    }
+   ],
+   "tool_choice": "none",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Just talk."
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Just talk.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "images in user content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Compare these two.",
+     "images": [
+      0,
+      7,
+      18
+     ]
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜><｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜>Compare<｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜> these two.<｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "image in a tool response",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the <web> & return \"results\".",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Look"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "i1",
+       "name": "search",
+       "arguments": [
+        {
+         "name": "q",
+         "value": "cat",
+         "is_string": true
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "i1",
+     "content": "Here:",
+     "images": [
+      5
+     ]
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"search\", \"description\": \"Search the <web> & return \\\"results\\\".\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Look<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>search<arg_key:opensource>q</arg_key:opensource><arg_value:opensource>cat</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>Here:<｜hy_image▁start:opensource｜><｜hy_image▁pad:opensource｜><｜hy_image▁end:opensource｜></tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "system after the first message",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A"
+    },
+    {
+     "role": "system",
+     "content": "Mid system."
+    },
+    {
+     "role": "user",
+     "content": "B"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>A<｜hy_end:opensource｜><｜hy_start:opensource｜>system<｜hy_middle:opensource｜>Mid system.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>B<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+  },
+  {
+   "name": "assistant prefill stays open",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Count"
+    },
+    {
+     "role": "assistant",
+     "content": "1, 2,"
+    }
+   ],
+   "rendered": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Count<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>1, 2,<｜hy_end:opensource｜>"
+  }
+ ]
+}

@@ -86,6 +86,30 @@
         "testing"
       ],
       "role": "test"
+    },
+    "hy4flash_chat_template_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "hy4flash_vision_prompt_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "hy4flash_kernels_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
+    "hy4flash_vision_kernels_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
     }
   },
   "licenses": [

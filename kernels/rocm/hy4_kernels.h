@@ -128,7 +128,8 @@ int hy4_engram_apply(float* h, const float* kv, const float* gate_w, const float
                      const float* gamma, const float* any, uint32_t n, uint32_t hc, uint32_t dim,
                      float eps, hipStream_t stream);
 
-/* out[t, r, 0:dim] = x[t, r, 0:dim] + bias[r] for rows_per_token rows. */
+/* x[t, r, 0:dim] += bias[r, 0:dim] for rows_per_token rows per token (bias
+ * [rows_per_token][dim]). */
 int hy4_add_bias_rows(float* x, const float* bias, uint32_t n, uint32_t rows_per_token, uint32_t dim,
                       hipStream_t stream);
 
@@ -151,7 +152,8 @@ int hy4_indexer_score(const float* q, const float* w, const float* pooled, const
 /* Converts logits rows to the top-k selection of positions: for token t the
  * k highest finite scores' groups g expand to positions g*kpool + j, then
  * the token's own group positions (pos[t] - pos[t] % kpool .. pos[t]); the
- * rest of sel[t, 0:n_sel] is -1. n_sel = (k + 1) * kpool. */
+ * rest of sel[t, 0:n_sel] is -1. n_sel = (k + 1) * kpool. The picked scores
+ * are overwritten with -inf. */
 int hy4_kpool_select(const float* score, const int32_t* n_pool, uint32_t n_pool_max, const int32_t* pos,
                      uint32_t k, uint32_t kpool, int32_t* sel, uint32_t n, hipStream_t stream);
 

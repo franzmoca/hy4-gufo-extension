@@ -32,7 +32,8 @@ std::string_view RoleName(ChatRole role) {
 }
 
 // The template's tool_to_json: the function object's members except
-// `defer_loading` and `strict`, each as `"key": tojson(value)`.
+// `defer_loading` and `strict`, each as `"key": tojson(value)`. Empty for a
+// tool with a true `defer_loading`, which the tools prompt leaves out.
 std::string ToolJson(const ext::ChatTool& tool) {
   json::Value function;
   if (!tool.definition_json.empty()) {
@@ -44,6 +45,10 @@ std::string ToolJson(const ext::ChatTool& tool) {
     function["name"] = tool.name;
     if (!tool.description.empty()) function["description"] = tool.description;
     function["parameters"] = json::parse(tool.parameters_json.empty() ? "{}" : tool.parameters_json);
+  }
+  if (const json::Value* deferred = function.find("defer_loading");
+      deferred != nullptr && deferred->as_bool()) {
+    return {};
   }
   std::string out = "{";
   bool first = true;
@@ -64,9 +69,15 @@ std::string ToolsPrompt(const std::vector<ext::ChatTool>& tools) {
       "# Tools\n\nYou may call one or more functions to assist with the user query."
       "\n\nYou are provided with function signatures within <tools></tools> XML tags:"
       "\n<tools>\n";
-  for (std::size_t i = 0; i < tools.size(); ++i) {
-    if (i) out += "\n";
-    out += ToolJson(tools[i]);
+  bool first = true;
+  for (const auto& tool : tools) {
+    const std::string line = ToolJson(tool);
+    if (line.empty())
+      continue;
+    if (!first)
+      out += "\n";
+    first = false;
+    out += line;
   }
   out += "\n</tools>\n\n";
   out += "For function call returns, you should first print ";
