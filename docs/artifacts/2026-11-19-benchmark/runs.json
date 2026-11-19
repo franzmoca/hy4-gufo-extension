@@ -1,0 +1,258 @@
+{
+ "A1": {
+  "code": {
+   "seconds": 7.755174875259399,
+   "prompt_tokens": 42,
+   "completion_tokens": 162,
+   "decode_tps": 22.352490334369936,
+   "prefill_tps": 84.0194274761376,
+   "ttft_ms": 503.618224,
+   "draft_tokens": 189,
+   "draft_accepted": 115
+  },
+  "prose": {
+   "seconds": 13.828596830368042,
+   "prompt_tokens": 35,
+   "completion_tokens": 228,
+   "decode_tps": 16.967006887647578,
+   "prefill_tps": 90.74017371547744,
+   "ttft_ms": 388.160635,
+   "draft_tokens": 179,
+   "draft_accepted": 90
+  },
+  "list": {
+   "seconds": 9.053003787994385,
+   "prompt_tokens": 42,
+   "completion_tokens": 189,
+   "decode_tps": 21.86099024523995,
+   "prefill_tps": 104.37255447339052,
+   "ttft_ms": 404.994314,
+   "draft_tokens": 168,
+   "draft_accepted": 117
+  },
+  "prefill": {
+   "seconds": 18.893951654434204,
+   "prompt_tokens": 3747,
+   "completion_tokens": 1,
+   "decode_tps": 13.746335003710067,
+   "prefill_tps": 199.1941967018544,
+   "ttft_ms": 18817.744667,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "image_2048": {
+   "seconds": 30.151413440704346,
+   "prompt_tokens": 4193,
+   "completion_tokens": 69,
+   "decode_tps": 14.307933840449849,
+   "prefill_tps": 169.14531795388712,
+   "ttft_ms": 25314.286344,
+   "draft_tokens": 77,
+   "draft_accepted": 34
+  },
+  "image_low": {
+   "seconds": 6.217341899871826,
+   "prompt_tokens": 305,
+   "completion_tokens": 80,
+   "decode_tps": 17.059408078684726,
+   "prefill_tps": 201.45513967433396,
+   "ttft_ms": 1514.041901,
+   "draft_tokens": 91,
+   "draft_accepted": 41
+  }
+ },
+ "B1": {
+  "code": {
+   "seconds": 10.274845600128174,
+   "prompt_tokens": 42,
+   "completion_tokens": 162,
+   "decode_tps": 16.57928967548856,
+   "prefill_tps": 84.86393111260105,
+   "ttft_ms": 498.594589,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "prose": {
+   "seconds": 14.156929731369019,
+   "prompt_tokens": 35,
+   "completion_tokens": 228,
+   "decode_tps": 16.557200561529527,
+   "prefill_tps": 91.72385172731397,
+   "ttft_ms": 383.014553,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "list": {
+   "seconds": 11.813625812530518,
+   "prompt_tokens": 42,
+   "completion_tokens": 189,
+   "decode_tps": 16.566498550105266,
+   "prefill_tps": 104.98546922366843,
+   "ttft_ms": 402.621339,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "prefill": {
+   "seconds": 18.27199649810791,
+   "prompt_tokens": 3747,
+   "completion_tokens": 1,
+   "decode_tps": 60823.55087890031,
+   "prefill_tps": 205.20365361356062,
+   "ttft_ms": 18268.561596,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "image_2048": {
+   "seconds": 30.32908844947815,
+   "prompt_tokens": 4193,
+   "completion_tokens": 69,
+   "decode_tps": 13.71871873981793,
+   "prefill_tps": 169.3246510715467,
+   "ttft_ms": 25285.928366,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "image_low": {
+   "seconds": 6.340425729751587,
+   "prompt_tokens": 305,
+   "completion_tokens": 80,
+   "decode_tps": 16.619267843082792,
+   "prefill_tps": 201.65255264616968,
+   "ttft_ms": 1513.06902,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  }
+ },
+ "B2": {
+  "code": {
+   "seconds": 10.287495851516724,
+   "prompt_tokens": 42,
+   "completion_tokens": 162,
+   "decode_tps": 16.561561487171772,
+   "prefill_tps": 84.38555405227156,
+   "ttft_ms": 501.382545,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "prose": {
+   "seconds": 14.166030406951904,
+   "prompt_tokens": 35,
+   "completion_tokens": 228,
+   "decode_tps": 16.545319641079807,
+   "prefill_tps": 91.69482913969347,
+   "ttft_ms": 383.168941,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "list": {
+   "seconds": 11.811552047729492,
+   "prompt_tokens": 42,
+   "completion_tokens": 189,
+   "decode_tps": 16.571968348521093,
+   "prefill_tps": 104.88653296199271,
+   "ttft_ms": 402.950086,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "prefill": {
+   "seconds": 18.27629828453064,
+   "prompt_tokens": 3747,
+   "completion_tokens": 1,
+   "decode_tps": 57434.954913560396,
+   "prefill_tps": 205.13555960292416,
+   "ttft_ms": 18272.924466,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "image_2048": {
+   "seconds": 30.329595804214478,
+   "prompt_tokens": 4193,
+   "completion_tokens": 69,
+   "decode_tps": 13.769545579342616,
+   "prefill_tps": 169.20114355610986,
+   "ttft_ms": 25305.065926,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "image_low": {
+   "seconds": 6.339459419250488,
+   "prompt_tokens": 305,
+   "completion_tokens": 80,
+   "decode_tps": 16.62775757537564,
+   "prefill_tps": 201.44988903933046,
+   "ttft_ms": 1514.229821,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  }
+ },
+ "A2": {
+  "code": {
+   "seconds": 7.714703321456909,
+   "prompt_tokens": 42,
+   "completion_tokens": 162,
+   "decode_tps": 22.46491755853052,
+   "prefill_tps": 84.72616833230514,
+   "ttft_ms": 498.330365,
+   "draft_tokens": 189,
+   "draft_accepted": 115
+  },
+  "prose": {
+   "seconds": 13.722986698150635,
+   "prompt_tokens": 35,
+   "completion_tokens": 228,
+   "decode_tps": 17.097435983867552,
+   "prefill_tps": 91.73034025584907,
+   "ttft_ms": 384.001346,
+   "draft_tokens": 179,
+   "draft_accepted": 90
+  },
+  "list": {
+   "seconds": 8.985438823699951,
+   "prompt_tokens": 42,
+   "completion_tokens": 189,
+   "decode_tps": 22.024478121749212,
+   "prefill_tps": 104.99321481349268,
+   "ttft_ms": 401.550061,
+   "draft_tokens": 168,
+   "draft_accepted": 117
+  },
+  "prefill": {
+   "seconds": 18.320252180099487,
+   "prompt_tokens": 3747,
+   "completion_tokens": 1,
+   "decode_tps": 13.82841722038415,
+   "prefill_tps": 205.45828808445592,
+   "ttft_ms": 18244.185857,
+   "draft_tokens": 0,
+   "draft_accepted": 0
+  },
+  "image_2048": {
+   "seconds": 30.132328987121582,
+   "prompt_tokens": 4193,
+   "completion_tokens": 69,
+   "decode_tps": 14.30276374273022,
+   "prefill_tps": 169.27333713709805,
+   "ttft_ms": 25294.417161,
+   "draft_tokens": 77,
+   "draft_accepted": 34
+  },
+  "image_low": {
+   "seconds": 6.1929030418396,
+   "prompt_tokens": 305,
+   "completion_tokens": 80,
+   "decode_tps": 17.15166410460933,
+   "prefill_tps": 201.31924529500245,
+   "ttft_ms": 1514.351388,
+   "draft_tokens": 91,
+   "draft_accepted": 41
+  }
+ },
+ "replies": {
+  "code": "```\ndef fibonacci(n):\n    \"\"\"\n    Return the n-th Fibonacci number using an iterative approach.\n\n    Parameters:\n    n (int): A non-negative integer representing the position in the\n             Fibonacci sequence (0-indexed).\n\n    Returns:\n    int: The n-th Fibonacci number.\n\n    Raises:\n    ValueError: If n is negative.\n\n    Examples:\n    >>> fibonacci(0)\n    0\n    >>> fibonacci(1)\n    1\n    >>> fibonacci(10)\n    55\n    \"\"\"\n    if n < 0:\n        raise ValueError(\"n must be a non-negative integer\")\n\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n```",
+  "prose": "Sunlight looks white, but it\u2019s actually a mix of all the colors of the rainbow, each with its own wavelength. Blue light travels in shorter, tighter waves, while red light moves in longer, lazier ones. When this sunlight enters Earth\u2019s atmosphere, it hits gas molecules and tiny particles that are much smaller than the light waves themselves.\n\nThese molecules scatter the shorter blue wavelengths far more strongly than the longer red ones\u2014a rule called Rayleigh scattering. As sunlight passes through the air, the blue gets bounced around in every direction, so no matter where you look, your eyes catch that scattered blue glow. The other colors mostly pass straight through, which is why the Sun itself still looks yellowish-white.\n\nAt sunrise and sunset, the light takes a much longer path through the atmosphere. By then, almost all the blue has been scattered away before it reaches you, leaving the reds and oranges to dominate. That\u2019s the same trick, just seen from a longer angle\u2014so the everyday blue sky is really a matter of how far the light has to travel and which waves get tossed aside along the way.",
+  "list": "2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71\n\nI found them by checking each whole number starting from 2 and keeping only those with exactly two positive divisors: 1 and the number itself. For each candidate \\(n\\), I tested whether any prime \\(p \\le \\sqrt{n}\\) divides it evenly. If none does, \\(n\\) is prime. For example, 49 is skipped because \\(7 \\times 7 = 49\\), while 53 is kept because it is not divisible by 2, 3, 5, or 7 (and \\(\\sqrt{53} < 8\\)). Continuing this process until I had 20 qualifying numbers gives the list above.",
+  "prefill": "G",
+  "image_2048": "This is a pixel-art style illustration centered on a front-facing owl with prominent ear tufts, intricate brown and tan feather patterns, striking bright orange eyes with black pupils, and a small gray beak. The owl is set against a dark green background with subtle, pixelated foliage-like textures, giving the piece a retro, blocky aesthetic.",
+  "image_low": "This is a pixel-art style illustration centered on a front-facing owl's head, set against a dark green gradient background with subtle speckled texture. The owl has striking bright orange eyes with black pupils, a small gray-blue beak, and intricate layered feather details in warm brown, tan, and cream tones, including prominent ear tufts and a symmetrical, ornate pattern across its chest feathers."
+ }
+}

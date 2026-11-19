@@ -1,0 +1,78 @@
+# Experiments
+
+One section per experiment, retained or rejected. Measurements are on Strix
+Halo `gfx1151` with the Xylolabs Q4_K_M GGUF, through `gufo serve` unless
+noted. Design decisions are numbered in [PLAN.md](PLAN.md).
+
+| id | experiment | outcome |
+| --- | --- | --- |
+| E1 | DFly2 at fixed draft lengths | superseded by E2 |
+| E2 | Draft length from DFly2's confidence head | retained (threshold 0.45) |
+| E3 | Verify passes equal to one-token decoding | retained |
+| E4 | Fused binary16 attention in the vision tower | retained |
+| E5 | Binary16 GEMM operands in the vision tower | retained |
+
+## E1: DFly2 at fixed draft lengths (2026-11-19)
+
+Greedy decode tok/s and acceptance on three chat prompts (code, prose, list;
+166 to 237 tokens each). Plain decode: 16.4, 16.4 and 15.7.
+
+| drafts/step | code | prose | list |
+| --- | --- | --- | --- |
+| 1 | 23.4 (94%) | 19.0 (57%) | 21.8 (82%) |
+| 2 | 27.1 (86%) | 18.5 (42%) | 22.6 (65%) |
+| 3 | 28.6 (80%) | 17.6 (35%) | 22.4 (55%) |
+| 4 | 27.0 (68%) | 15.5 (28%) | 20.7 (46%) |
+| 5 | 26.6 (62%) | 13.7 (22%) | 18.4 (37%) |
+| 7 | 24.8 (52%) | 11.1 (15%) | 14.2 (24%) |
+
+At three drafts a step costs 16.5 ms of drafting and 101 ms to verify four
+tokens (a plain step: 61 ms). Long fixed blocks lose on prose, where
+acceptance falls fastest.
+
+## E2: Draft length from the confidence head (2026-11-19)
+
+DFly2's head predicts each slot's accept rate; drafting stops once the
+product over the slots falls under a threshold (cap 7). Same prompts:
+
+| threshold | code | prose | list | geo mean | drafted/step |
+| --- | --- | --- | --- | --- | --- |
+| 0.15 | 27.1 | 17.1 | 20.3 | 21.1 | 3.9 |
+| 0.30 | 26.5 | 18.2 | 22.6 | 22.2 | 3.1 |
+| 0.45 | 28.5 | 19.0 | 22.9 | 23.2 | 2.4 |
+| 0.60 | 30.8 | 17.8 | 21.7 | 22.8 | 1.6 |
+
+Retained at 0.45 (decision 18). One run per arm: its 4% over fixed three
+drafts (geometric mean 22.4) is inside run-to-run noise, but it avoids the
+prose losses of long blocks without a per-workload setting.
+
+## E3: Exact verify passes (2026-11-19)
+
+A verify pass (anchor plus drafts, up to 8 tokens) differed from one-token
+decoding by mean KL 0.0018, so greedy requests could diverge after a near tie
+depending on how their tokens were grouped, which Gufo's `reasoning-budget`
+suite caught. Bisection by layer found two sources: the vendored multi-token
+MoE kernel sums in another order than the one-token kernel, and hipBLAS picks
+attention kernels by shape. Passes up to 8 tokens now launch the routed gate
+and up projections per token and run each token's attention GEMMs over
+exactly its own keys. `hy4_eval_probe --passcheck N`: 0 difference at N = 2
+to 8. Verify cost 101 → 96 ms at 2.08 drafts per step; replies are identical
+with and without the drafter. Retained (decision 17).
+
+## E4: Fused binary16 attention in the vision tower (2026-11-19)
+
+The first tower ran attention as strided SGEMMs over the 72-wide heads, with
+a materialized score matrix and a separate softmax: at 2048² (16,384
+patches) the encode took 37.5 s, of which the attention GEMMs were 31.7 s and
+the softmax 5.8 s. Gemma 4's fused WMMA attention (the same head width, an
+online softmax, binary16 operands with FP32 accumulation) with the scale
+folded into Q: 7.4 s, 6e-4 relative RMS from the float64 reference.
+Retained.
+
+## E5: Binary16 GEMM operands in the vision tower (2026-11-19)
+
+After E4 the FP32 projections took 5.0 s (about 2.7 TFLOPS). BF16 weights
+converted to binary16 at load and activations converted per GEMM, through
+hipBLAS `GemmEx` with FP32 accumulation: 7.4 → 4.8 s, 1.1e-3 relative RMS from
+the FP32 rows, and the 2048² request's first token 58 → 25 s with the same
+answers. hipBLAS still picks a non-WMMA kernel (2.4 s of the 4.8 s). Retained.

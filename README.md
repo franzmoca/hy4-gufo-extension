@@ -4,9 +4,12 @@ An experimental Gufo source extension for Tencent's
 [Hy4 Flash](https://huggingface.co/tencent/Hy4-flash) (`hy_v4_flash`) on
 Linux x86-64 / Strix Halo `gfx1151`.
 
-**Status:** experimental. `gufo serve llm` serves chat, tool calls, reasoning
+**Status:** experimental. `gufo serve llm` serves chat, tool calls, reasoning,
 image input and the prompt cache (RAM and disk) from one resident session, and
-drafts with Tencent's DFly2. See [docs/PLAN.md](docs/PLAN.md).
+drafts with Tencent's DFly2: 16.6 tok/s greedy decode, 17 to 22 tok/s with
+DFly2, with identical replies. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
+[docs/QUALITY.md](docs/QUALITY.md), [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)
+and the design in [docs/PLAN.md](docs/PLAN.md).
 
 Maintainer: Francesco Moca ([@franzmoca](https://github.com/franzmoca)).
 
@@ -43,8 +46,9 @@ gufo serve llm -m Hy4-flash-Q4_K_M-00001-of-00002.gguf \
 
 The second GGUF shard (the Engram table) must sit beside the first. Without
 `--context` a session holds 32,768 tokens. `--dfly-model` takes the drafter's
-safetensors file or the directory holding it; `--dfly-draft-tokens` (1 to 7)
-sets how many tokens it drafts per step. Without `--mmproj`, a single
+safetensors file or the directory holding it. By default it drafts until its
+confidence head predicts acceptance below 0.45, up to 7 tokens;
+`--dfly-draft-tokens` (1 to 7) fixes the count instead. Without `--mmproj`, a single
 `mmproj*.gguf` beside the model enables image input. An image takes
 (h/32)·(w/32 + 1) tokens after resizing to 4K to 4M pixels (`detail: low`: at
 most 512²), so a 2048² image takes 4,160.

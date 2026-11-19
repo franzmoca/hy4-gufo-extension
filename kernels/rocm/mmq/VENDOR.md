@@ -17,7 +17,7 @@ Unused NVIDIA/MUSA preprocessing paths, ggml graph support and full ggml
 tensor entry points are removed; the V4.1 decoder owns its HIP graph
 execution.
 
-When importing upstream changes, retain the HIP implementation and rerun
-`hy4flash.mmq_typed`, which checks every quantized type the V4.1 builds use
-against a matvec reference. Current measurements belong in the model's
-[BENCHMARKS.md](../../../../../../docs/models/deepseek-v4.1-flash/BENCHMARKS.md).
+This copy comes from `ds41-gufo-extension` at `eb8ece9`
+([UPSTREAM.md](../../../UPSTREAM.md)). When importing upstream changes,
+retain the HIP implementation and check the result with the KL gate in
+[QUALITY.md](../../../docs/QUALITY.md).

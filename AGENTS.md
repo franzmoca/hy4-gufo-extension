@@ -28,8 +28,7 @@ upstream Gufo first: one small PR with its `ext-api` change record under
 
 Hy4 Flash shares much of its design with DeepSeek V4.1 Flash (hyper-connections,
 gated MLA with sinks, Engram). Code taken from `ds41-gufo-extension` is copied
-and adapted here, not shared; record its origin in `UPSTREAM.md` when the first
-file arrives.
+and adapted here, not shared; record its origin in [UPSTREAM.md](UPSTREAM.md).
 
 ## Correctness
 
