@@ -47,6 +47,17 @@ End to end, the 2048² owl logo is described correctly at full size and at
 exactly, axis labels included. The image positions (M-RoPE) and Engram
 treatment follow decision 19; their only check is these answers.
 
+## Reproducibility
+
+Greedy replies are reproducible for the same request history, and the release
+(`nix build`) and development builds give byte-identical replies. They are
+not invariant to the history: a prompt-cache restore moves the prefill pass
+boundaries, and the pass width changes results from the first layer on (KL
+0.006, 2% of greedy tokens flip;
+[E6](EXPERIMENTS.md#e6-prefill-results-against-the-pass-split-2026-11-19)).
+An image prompt served cold and after other requests can therefore word its
+answer differently.
+
 ## Functional suites
 
 Gufo's suites at the pin (`0a473ebf`) against `gufo serve` of this build,

@@ -11,6 +11,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E3 | Verify passes equal to one-token decoding | retained |
 | E4 | Fused binary16 attention in the vision tower | retained |
 | E5 | Binary16 GEMM operands in the vision tower | retained |
+| E6 | Prefill results against the pass split | measurement |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -76,3 +77,26 @@ converted to binary16 at load and activations converted per GEMM, through
 hipBLAS `GemmEx` with FP32 accumulation: 7.4 → 4.8 s, 1.1e-3 relative RMS from
 the FP32 rows, and the 2048² request's first token 58 → 25 s with the same
 answers. hipBLAS still picks a non-WMMA kernel (2.4 s of the 4.8 s). Retained.
+
+## E6: Prefill results against the pass split (2026-11-19)
+
+`hy4_eval_probe --chunkcheck S` prefills a prompt whole (256-token passes
+from token 0) and split at token S, as after a prompt-cache restore of S
+tokens, and compares the two. First 1,000 tokens of the 3,712-token
+document:
+
+| split | token S differs from | same top after S | mean KL |
+| --- | --- | --- | --- |
+| 12 | layer 0 (7.6e-8) | 969 / 988 | 0.0063 |
+| 200 | layer 0 (7.5e-8) | 782 / 800 | 0.0061 |
+| 300 | layer 0 (1.4e-6) | 684 / 700 | 0.0060 |
+
+The split changes results from the first layer on, so attention (whose GEMMs
+hipBLAS picks by shape) is not the only source: layer 0's projections and
+experts also see a different pass width. About 2% of the following greedy
+tokens flip. This is why an image request served cold can word its reply
+differently from the same request after unrelated text requests (whose
+cached system prefix moves the pass boundaries): both replies describe the
+image correctly, and every reply is reproducible for the same request
+history. The release build gives byte-identical replies to the development
+build for the same history.

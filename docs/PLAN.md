@@ -487,12 +487,35 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   and a kernels_test case against MlaReference. Rows depending only on their
   own keys also serves batch invariance below.
 
+- **Designs to borrow for the prefill attention.** ds41's
+  `attention_f16_kernel` (`ds41_v41.hip.cpp`) is the same MLA shape: block
+  (token, 32 heads), 512-wide latent rows, window and selected rows as 16-row
+  tiles, the next tile loaded into registers one tile ahead, Q fragments in
+  registers, four waves splitting the score dimensions and meeting in LDS for
+  an FP32 online softmax with sinks, output dimensions split by wave. Hy4
+  needs its window cap raised to 512 and its selection cap to 2,048 + kpool
+  rows, the 64-dimension rope tail added to the scores, and 64-head SWA layers
+  as two blocks. Upstream DS4's `attention_mixed_heads32_wmma_kernel` adds
+  two measured details: stage Q transposed so the score product is
+  `KV . Q^T` with both operands row-major (21-31% of the kernel), and build
+  the row tables in parallel rather than on lane 0. Qwen's
+  `attention_wmma.hip` (causal prefill) adds: cover 64 query rows per block,
+  since requests rather than bytes dominate; stage V transposed with one key
+  per lane (1.8x, conflict-free LDS); prefetch K/V a tile ahead (1.14x).
+  Gemma 4's `FusedAttention` (in the vision tower, E4) is the simplest
+  wave-per-16-queries form.
+
 - **Prefill batch invariance.** A token's result depends on the passes its
   span was cut into (GEMMs over different row counts, the vec path at 8 or
   fewer), so a restore that re-prefills a gap with other chunk shapes can
   flip a greedy near tie. Gufo's `cache` suite expects invariance. Making the
   batched kernels row-independent (MMQ tiles without stream-K, attention per
   row block over its own keys) is the likely route; measure the prefill cost.
+  E6 measures it with `hy4_eval_probe --chunkcheck`: token S differs from
+  layer 0 on, KL 0.006 and 2% flipped greedy tokens after the split. Layer 0
+  differing means the dense projections and experts vary with the pass width
+  too, not only attention: bisect layer 0's operations with the probe before
+  choosing which kernels to make row-independent.
 
 - Sparse layers score every earlier key and mask all but the 2,048 selected
   (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per
