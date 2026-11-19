@@ -66,6 +66,7 @@ gufo_extension_target(
     gufo_ext_runtime
     gufo_ext_core
     gufo_ext_hip
+    roc::hipblas
     Threads::Threads
 )
 

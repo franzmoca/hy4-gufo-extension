@@ -1731,6 +1731,7 @@ extern "C" int hy4_mmq_moe_vec_typed(int type, const void* W, const float* X,
 // for types outside the V4 set are instantiated in hy4_mmq_v41_types.hip.cpp.
 #define HY4_MMQ_BATCH_CASES(X) \
   X(GGML_TYPE_Q8_0)             \
+  X(GGML_TYPE_Q4_K)             \
   X(GGML_TYPE_Q5_K)             \
   X(GGML_TYPE_Q6_K)             \
   X(GGML_TYPE_IQ1_S)            \

@@ -149,6 +149,21 @@ int hy4_kpool_select(const float* score, const int32_t* n_pool, uint32_t n_pool_
                      uint32_t k, uint32_t kpool, int32_t* sel, uint32_t n, hipStream_t stream);
 
 /* Argmax over n rows of `dim` floats. */
+/* Batched attention support (the scores come from a GEMM over every key).
+ * Rows r = t * heads + h of `scores` [rows][n_keys] hold scaled q.k for the
+ * keys at positions key_pos0 + j. In place: row softmax over the keys token t
+ * sees (key position <= pos[t], within `window` when non-zero, and, with a
+ * mask [n][n_keys], where it is 0), with the head's sink in the denominator.
+ * Masked keys get probability 0. */
+int hy4_attn_softmax(float* scores, uint32_t n, uint32_t heads, uint32_t n_keys, int32_t key_pos0,
+                     const int32_t* pos, uint32_t window, const float* mask, const float* sinks,
+                     hipStream_t stream);
+/* mask [n][n_keys] = 0 at the selected positions sel [n][n_sel] (-1 unused), -inf elsewhere. */
+int hy4_selection_mask(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t n, uint32_t n_keys,
+                       hipStream_t stream);
+/* dst [count][dim] = rows of the positions first .. first + count - 1 of a ring. */
+int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t count, uint32_t dim, float* dst,
+                    hipStream_t stream);
 int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream);
 
 #ifdef __cplusplus

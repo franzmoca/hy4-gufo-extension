@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include <hipblas/hipblas.h>
+
 #include "kernels/rocm/hy4_kernels.h"
 #include "kernels/rocm/mmq/hy4_mmq.h"
 #include "runtime/hy4_internal.hpp"
@@ -23,8 +25,10 @@ namespace {
 
 // The reference Engram norms leave eps unset: the FP32 machine epsilon.
 constexpr float kEngramEps = 1.1920929e-07f;
-// Indexer value | gate rows kept per layer: a pool's members plus a chunk.
-constexpr std::uint32_t kIdxRing = 16;
+// Indexer value | gate rows kept per layer: a pass plus a pool on each side.
+constexpr std::uint32_t kIdxRing = Model::kMaxChunk + 8;
+// Attention scores per batched pass ([query rows][keys] floats).
+constexpr std::size_t kScoreFloats = std::size_t{64} << 20;
 
 bool Fail(std::string* error, const std::string& what) {
   if (error) *error = what;
@@ -60,12 +64,26 @@ bool HostAlloc(T** p, std::size_t count, std::vector<void*>* owned) {
 }  // namespace
 
 bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uint32_t k, std::uint32_t n,
-            hipStream_t stream, std::string* error) {
+            const Exec& ex, std::string* error) {
   if (w.dims.size() < 2 || w.dims[0] != k || w.dims[1] != m) {
     return Fail(error, "hy4: matvec shape mismatch (" + std::to_string(m) + "x" + std::to_string(k) + ")");
   }
+  hipStream_t stream = ex.stream;
+  const bool batched = n > Model::kVecMax;
   switch (w.type) {
     case HY4_TYPE_F32:
+      if (batched) {
+        // Row-major y[n][m] = x[n][k] W^T, as column-major y^T = W^T x^T.
+        const float one = 1.0f;
+        const float zero = 0.0f;
+        if (hipblasSgemm(static_cast<hipblasHandle_t>(ex.blas_handle), HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(m), static_cast<int>(n),
+                         static_cast<int>(k), &one, w.f32(), static_cast<int>(k), x, static_cast<int>(k), &zero, y,
+                         static_cast<int>(m)) != HIPBLAS_STATUS_SUCCESS) {
+          return Fail(error, "hy4: sgemm failed");
+        }
+        return true;
+      }
+      [[fallthrough]];
     case HY4_TYPE_F16:
       HY4_CHECK(hy4_gemv_float(w.type, w.data, x, y, m, k, n, stream));
       return true;
@@ -73,12 +91,13 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uin
     case HY4_TYPE_Q4_K:
     case HY4_TYPE_Q6_K:
       if (k % 256 == 0) {
-        for (std::uint32_t t0 = 0; t0 < n; t0 += 8) {
-          const std::uint32_t nt = std::min<std::uint32_t>(8, n - t0);
-          HY4_CHECK(hy4_mmq_dense_vec_typed(w.type, w.data, x + std::uint64_t{t0} * k, y + std::uint64_t{t0} * m,
-                                            static_cast<int>(m), static_cast<int>(nt), static_cast<int>(k),
-                                            stream));
+        if (batched) {
+          HY4_CHECK(hy4_mmq_dense_typed(w.type, w.data, x, y, static_cast<int>(m), static_cast<int>(n),
+                                        static_cast<int>(k), stream));
+          return true;
         }
+        HY4_CHECK(hy4_mmq_dense_vec_typed(w.type, w.data, x, y, static_cast<int>(m), static_cast<int>(n),
+                                          static_cast<int>(k), stream));
         return true;
       }
       if (w.type == HY4_TYPE_Q8_0) {
@@ -136,7 +155,14 @@ bool Model::AllocScratch(std::string* error) {
       DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) && DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
       DeviceAlloc(&s.logits, std::size_t{n} * c.n_vocab, owned) &&
       HostAlloc(&s.host_h, std::size_t{n} * c.hc * c.n_embd, owned);
-  if (!ok) return Fail(error, "hy4: scratch allocation failed");
+  const bool ok2 = ok && DeviceAlloc(&s.keys, std::size_t{c.swa_window + n} * dk, owned) &&
+                   DeviceAlloc(&s.scores, kScoreFloats, owned);
+  if (!ok2) return Fail(error, "hy4: scratch allocation failed");
+  hipblasHandle_t blas = nullptr;
+  if (hipblasCreate(&blas) != HIPBLAS_STATUS_SUCCESS || hipblasSetStream(blas, stream_) != HIPBLAS_STATUS_SUCCESS) {
+    return Fail(error, "hy4: hipblas init failed");
+  }
+  blas_ = blas;
   return true;
 }
 
@@ -161,7 +187,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::st
     }
   }
   const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
-  ok = ok && DeviceAlloc(&s->score_, std::size_t{kMaxChunk} * pools, &s->allocations_) &&
+  ok = ok && DeviceAlloc(&s->mask_, std::size_t{kMaxChunk} * max_context, &s->allocations_) &&
+       DeviceAlloc(&s->score_, std::size_t{kMaxChunk} * pools, &s->allocations_) &&
        DeviceAlloc(&s->sel_, std::size_t{kMaxChunk} * (top_pools + 1) * c.kpool, &s->allocations_);
   if (!ok) {
     Fail(error, "hy4: session allocation failed");
@@ -195,6 +222,7 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   const Weights& w = m.weights_;
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
+  const Exec ex{st, m.blas_};
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t pos0 = Position();
   if (n == 0) return true;
@@ -238,7 +266,7 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
       const std::uint32_t width = cols * c.engram_dim;
       HY4_CHECK(hy4_engram_rows(s.engram_rows + std::size_t(e) * n * width, s.engram_valid + std::size_t(e) * n * cols,
                                 l.engram_lookup_norm.f32(), s.engram_normed, n, cols, c.engram_dim, kEngramEps, st));
-      if (!MatVec(l.engram_kv, s.engram_normed, s.engram_kv, (c.hc + 1) * c.n_embd, width, n, st, error)) {
+      if (!MatVec(l.engram_kv, s.engram_normed, s.engram_kv, (c.hc + 1) * c.n_embd, width, n, ex, error)) {
         return false;
       }
       HY4_CHECK(hy4_add_bias_rows(s.engram_kv, l.engram_kv_b.f32(), n, c.hc + 1, c.n_embd, st));
@@ -275,7 +303,7 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   if (logits) {
     const std::uint32_t first = all_logits ? 0 : n - 1;
     const std::uint32_t rows = n - first;
-    if (!MatVec(w.output, s.cur + std::size_t{first} * c.n_embd, s.logits, c.n_vocab, c.n_embd, rows, st, error)) {
+    if (!MatVec(w.output, s.cur + std::size_t{first} * c.n_embd, s.logits, c.n_vocab, c.n_embd, rows, ex, error)) {
       return false;
     }
     logits->resize(std::size_t{rows} * c.n_vocab);
@@ -292,15 +320,17 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
+  const Exec ex{st, m.blas_};
+  auto* blas = static_cast<hipblasHandle_t>(m.blas_);
   const std::uint32_t heads = c.n_head[il];
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::uint32_t nope = c.head_k - c.n_rot;
   const float base = c.is_swa[il] ? c.rope_base_swa : c.rope_base;
 
-  if (!MatVec(l.wq_a, s.cur, s.qr, c.q_lora, c.n_embd, n, st, error)) return false;
+  if (!MatVec(l.wq_a, s.cur, s.qr, c.q_lora, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_rms_norm(s.qr, l.q_a_norm.f32(), s.qr, n, c.q_lora, c.q_lora, c.rms_eps, st));
-  if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, st, error)) return false;
-  if (!MatVec(l.wkv_a, s.cur, s.kva, dk, c.n_embd, n, st, error)) return false;
+  if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error)) return false;
+  if (!MatVec(l.wkv_a, s.cur, s.kva, dk, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_rms_norm(s.kva, l.kv_a_norm.f32(), s.kva, n, c.kv_lora, dk, c.rms_eps, st));
   HY4_CHECK(hy4_rope(s.kva, s.pos, n, 1, dk, 0, c.kv_lora, c.n_rot, base, st));
   HY4_CHECK(hy4_rope(s.q, s.pos, n, heads, std::uint64_t{heads} * c.head_k, c.head_k, nope, c.n_rot, base, st));
@@ -317,15 +347,50 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   std::uint32_t n_sel = 0;
   if (c.has_indexer[il] && !Indexer(il, n, Position(), &sel, &n_sel, error)) return false;
 
+  // Scores over every key the pass can see, as GEMMs over (token, head)
+  // rows: MLA here is MQA over one latent row per key, so each key row is
+  // read once per pass rather than once per head.
   const std::uint32_t window = c.is_swa[il] ? c.swa_window : 0;
-  HY4_CHECK(hy4_mla_attention(s.qfull, cache_[il], ring_[il], s.pos, window, sel, n_sel, l.attn_sinks.f32(),
-                              1.0f / std::sqrt(static_cast<float>(c.head_k)), s.att, n, heads, dk, c.kv_lora, st));
+  const std::int32_t last = static_cast<std::int32_t>(Position() + n - 1);
+  std::int32_t lo = 0;
+  const float* keys = cache_[il];
+  if (window) {
+    lo = std::max<std::int32_t>(0, static_cast<std::int32_t>(Position()) - static_cast<std::int32_t>(window) + 1);
+    HY4_CHECK(hy4_gather_rows(cache_[il], ring_[il], lo, static_cast<std::uint32_t>(last - lo + 1), dk, s.keys, st));
+    keys = s.keys;
+  }
+  const std::uint32_t n_keys = static_cast<std::uint32_t>(last - lo + 1);
+  if (sel) HY4_CHECK(hy4_selection_mask(sel, n_sel, mask_, n, n_keys, st));
+  const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_k));
+  const float zero = 0.0f;
+  const float one = 1.0f;
+  const std::uint32_t per = static_cast<std::uint32_t>(
+      std::max<std::size_t>(1, kScoreFloats / (std::size_t{heads} * n_keys)));
+  for (std::uint32_t t0 = 0; t0 < n; t0 += per) {
+    const std::uint32_t nt = std::min(per, n - t0);
+    const int rows = static_cast<int>(nt * heads);
+    const float* q = s.qfull + std::size_t{t0} * heads * dk;
+    // S (row-major [rows][n_keys]) = scale Q K^T.
+    if (hipblasSgemm(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(n_keys), rows, static_cast<int>(dk), &scale,
+                     keys, static_cast<int>(dk), q, static_cast<int>(dk), &zero, s.scores,
+                     static_cast<int>(n_keys)) != HIPBLAS_STATUS_SUCCESS) {
+      return Fail(error, "hy4: attention score gemm failed");
+    }
+    HY4_CHECK(hy4_attn_softmax(s.scores, nt, heads, n_keys, lo, s.pos + t0, window,
+                               sel ? mask_ + std::size_t{t0} * n_keys : nullptr, l.attn_sinks.f32(), st));
+    // O (row-major [rows][kv_lora]) = P V, V the first kv_lora columns of the key rows.
+    if (hipblasSgemm(blas, HIPBLAS_OP_N, HIPBLAS_OP_N, static_cast<int>(c.kv_lora), rows, static_cast<int>(n_keys),
+                     &one, keys, static_cast<int>(dk), s.scores, static_cast<int>(n_keys), &zero,
+                     s.att + std::size_t{t0} * heads * c.kv_lora, static_cast<int>(c.kv_lora)) != HIPBLAS_STATUS_SUCCESS) {
+      return Fail(error, "hy4: attention value gemm failed");
+    }
+  }
   HY4_CHECK(hy4_gemv_q8_0_grouped(l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
                                   std::uint64_t{heads} * c.kv_lora, c.kv_lora, std::uint64_t{heads} * c.head_v,
                                   c.head_v, st));
-  if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, st, error)) return false;
+  if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_sigmoid_mul(s.attv, s.gate, std::uint64_t{n} * heads * c.head_v, st));
-  if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, st, error)) return false;
+  if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, ex, error)) return false;
   HY4_CHECK(hy4_rms_norm(s.y, l.attn_post_norm.f32(), s.y, n, c.n_embd, c.n_embd, c.rms_eps, st));
   return true;
 }
@@ -337,14 +402,15 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
+  const Exec ex{st, m.blas_};
   const std::uint32_t d = c.idx_dim;
   const float base = c.rope_base;  // indexer layers are the sparse ones
 
   // Key side: normed key, then its value and gate projections.
-  if (!MatVec(l.idx_k, s.cur, s.ik, d, c.n_embd, n, st, error)) return false;
+  if (!MatVec(l.idx_k, s.cur, s.ik, d, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_rms_norm(s.ik, l.idx_k_norm.f32(), s.ik, n, d, d, c.rms_eps, st));
-  HY4_CHECK(hy4_gemv_float(l.idx_value.type, l.idx_value.data, s.ik, s.ffn_a, d, d, n, st));
-  HY4_CHECK(hy4_gemv_float(l.idx_gate.type, l.idx_gate.data, s.ik, s.ffn_b, d, d, n, st));
+  if (!MatVec(l.idx_value, s.ik, s.ffn_a, d, d, n, ex, error)) return false;
+  if (!MatVec(l.idx_gate, s.ik, s.ffn_b, d, d, n, ex, error)) return false;
   HY4_CHECK(hipMemcpy2DAsync(s.ivg, 2 * d * sizeof(float), s.ffn_a, d * sizeof(float), d * sizeof(float), n,
                              hipMemcpyDeviceToDevice, st));
   HY4_CHECK(hipMemcpy2DAsync(s.ivg + d, 2 * d * sizeof(float), s.ffn_b, d * sizeof(float), d * sizeof(float), n,
@@ -380,10 +446,10 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   std::vector<std::int32_t> n_pool(n);
   for (std::uint32_t i = 0; i < n; ++i) n_pool[i] = static_cast<std::int32_t>((pos0 + i) / c.kpool);
   HY4_CHECK(hipMemcpyAsync(s.n_pool, n_pool.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-  if (!MatVec(l.idx_q_b, s.qr, s.iq, c.idx_heads * d, c.q_lora, n, st, error)) return false;
+  if (!MatVec(l.idx_q_b, s.qr, s.iq, c.idx_heads * d, c.q_lora, n, ex, error)) return false;
   HY4_CHECK(hy4_rope(s.iq, s.pos, n, c.idx_heads, std::uint64_t{c.idx_heads} * d, d, d - c.n_rot, c.n_rot, base, st));
   // The 1 / sqrt(d heads) weight scale does not change the selection.
-  HY4_CHECK(hy4_gemv_float(l.idx_proj.type, l.idx_proj.data, s.cur, s.iw, c.idx_heads, c.n_embd, n, st));
+  if (!MatVec(l.idx_proj, s.cur, s.iw, c.idx_heads, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_indexer_score(s.iq, s.iw, idx_pooled_[il], s.n_pool, n_pool_max, score_, n, c.idx_heads, d, st));
   HY4_CHECK(hy4_kpool_select(score_, s.n_pool, n_pool_max, s.pos, top, c.kpool, sel_, n, st));
   *sel = sel_;
@@ -397,28 +463,43 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
+  const Exec ex{st, m.blas_};
 
   if (il < c.n_dense_lead) {
     const std::uint32_t f = c.n_ff_dense;
-    if (!MatVec(l.ffn_gate, s.cur, s.ffn_a, f, c.n_embd, n, st, error)) return false;
-    if (!MatVec(l.ffn_up, s.cur, s.ffn_b, f, c.n_embd, n, st, error)) return false;
+    if (!MatVec(l.ffn_gate, s.cur, s.ffn_a, f, c.n_embd, n, ex, error)) return false;
+    if (!MatVec(l.ffn_up, s.cur, s.ffn_b, f, c.n_embd, n, ex, error)) return false;
     HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
-    return MatVec(l.ffn_down, s.ffn_c, s.y, c.n_embd, f, n, st, error);
+    return MatVec(l.ffn_down, s.ffn_c, s.y, c.n_embd, f, n, ex, error);
   }
 
   const std::uint32_t f = c.n_ff_exp;
   const std::uint32_t used = c.n_expert_used;
   // Shared expert first, into its own buffer.
-  if (!MatVec(l.gate_shexp, s.cur, s.ffn_a, f, c.n_embd, n, st, error)) return false;
-  if (!MatVec(l.up_shexp, s.cur, s.ffn_b, f, c.n_embd, n, st, error)) return false;
+  if (!MatVec(l.gate_shexp, s.cur, s.ffn_a, f, c.n_embd, n, ex, error)) return false;
+  if (!MatVec(l.up_shexp, s.cur, s.ffn_b, f, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
-  if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, st, error)) return false;
+  if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, ex, error)) return false;
 
   // Router on the full-width input; experts in the latent space.
-  HY4_CHECK(hy4_gemv_float(l.gate_inp.type, l.gate_inp.data, s.cur, s.logits_r, c.n_expert, c.n_embd, n, st));
+  if (!MatVec(l.gate_inp, s.cur, s.logits_r, c.n_expert, c.n_embd, n, ex, error)) return false;
   HY4_CHECK(hy4_route(s.logits_r, l.exp_bias ? l.exp_bias.f32() : nullptr, s.ids, s.route_w, n, c.n_expert, used,
                       c.expert_norm ? 1 : 0, c.expert_scale, st));
-  if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, st, error)) return false;
+  if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex, error)) return false;
+  if (n > Model::kVecMax) {
+    if (l.gate_exps.type != l.up_exps.type) return Fail(error, "hy4: gate and up experts differ in type");
+    HY4_CHECK(hy4_mmq_moe_swiglu_typed(l.gate_exps.type, l.gate_exps.data, l.up_exps.data, s.latent, s.ids,
+                                       s.route_w, s.ffn_a, s.ffn_c, static_cast<int>(f),
+                                       static_cast<int>(c.n_latent), static_cast<int>(n),
+                                       static_cast<int>(c.n_expert), static_cast<int>(used), c.swiglu_clamp[il], st));
+    HY4_CHECK(hy4_mmq_moe_typed(l.down_exps.type, l.down_exps.data, s.ffn_c, s.ids, s.ffn_a,
+                                static_cast<int>(c.n_latent), static_cast<int>(f), static_cast<int>(n * used),
+                                static_cast<int>(c.n_expert), 1, st));
+    HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
+    if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
+    HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
+    return true;
+  }
   HY4_CHECK(hy4_mmq_moe_vec_typed(l.gate_exps.type, l.gate_exps.data, s.latent, s.ids, s.ffn_a,
                                   static_cast<int>(f), static_cast<int>(c.n_latent), static_cast<int>(n),
                                   static_cast<int>(c.n_expert), static_cast<int>(used), st));
@@ -431,7 +512,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
                                   static_cast<int>(c.n_latent), static_cast<int>(f), static_cast<int>(n * used),
                                   static_cast<int>(c.n_expert), 1, st));
   HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
-  if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, st, error)) return false;
+  if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
   HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
   return true;
 }

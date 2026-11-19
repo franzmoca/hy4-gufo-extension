@@ -10,6 +10,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <climits>
 
 namespace {
 
@@ -624,6 +625,60 @@ __global__ void KpoolSelect(float* score, const int32_t* n_pool, uint32_t n_pool
   }
 }
 
+// One block per row (t, h).
+__global__ void AttnSoftmax(float* scores, uint32_t heads, uint32_t n_keys, int32_t key_pos0, const int32_t* pos,
+                            uint32_t window, const float* mask, const float* sinks) {
+  __shared__ float scratch[32];
+  const uint32_t r = blockIdx.x;
+  const uint32_t t = r / heads;
+  const uint32_t h = r % heads;
+  float* row = scores + (uint64_t)r * n_keys;
+  const float* mrow = mask ? mask + (uint64_t)t * n_keys : nullptr;
+  const int32_t p = pos[t];
+  const int32_t lo = window ? p - (int32_t)window + 1 : INT32_MIN;
+  auto visible = [&](uint32_t j) {
+    const int32_t kp = key_pos0 + (int32_t)j;
+    return kp <= p && kp >= lo && (!mrow || mrow[j] == 0.0f);
+  };
+  float mx = sinks ? sinks[h] : -INFINITY;
+  for (uint32_t j = threadIdx.x; j < n_keys; j += blockDim.x) {
+    if (visible(j)) mx = fmaxf(mx, row[j]);
+  }
+  mx = BlockMax(mx, scratch);
+  float den = 0.0f;
+  for (uint32_t j = threadIdx.x; j < n_keys; j += blockDim.x) {
+    const float e = visible(j) ? expf(row[j] - mx) : 0.0f;
+    row[j] = e;
+    den += e;
+  }
+  den = BlockSum(den, scratch);
+  if (sinks) den += expf(sinks[h] - mx);
+  const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+  for (uint32_t j = threadIdx.x; j < n_keys; j += blockDim.x) row[j] *= inv;
+}
+
+__global__ void SelectionFill(float* mask, uint32_t n_keys) {
+  const uint32_t t = blockIdx.y;
+  float* row = mask + (uint64_t)t * n_keys;
+  for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < n_keys; j += gridDim.x * blockDim.x) row[j] = -INFINITY;
+}
+
+__global__ void SelectionMaskSet(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t n_keys) {
+  const uint32_t t = blockIdx.y;
+  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_sel; i += gridDim.x * blockDim.x) {
+    const int32_t s = sel[(uint64_t)t * n_sel + i];
+    if (s >= 0 && (uint32_t)s < n_keys) mask[(uint64_t)t * n_keys + s] = 0.0f;
+  }
+}
+
+__global__ void GatherRows(const float* src, uint32_t ring, int32_t first, uint32_t dim, float* dst) {
+  const uint32_t r = blockIdx.y;
+  const uint64_t from = (uint64_t)((uint32_t)(first + (int32_t)r) % ring) * dim;
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
+    dst[(uint64_t)r * dim + c] = src[from + c];
+  }
+}
+
 __global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
   __shared__ float scratch[32];
   __shared__ int32_t picked;
@@ -851,6 +906,29 @@ int hy4_kpool_select(const float* score, const int32_t* n_pool, uint32_t n_pool_
                      uint32_t kpool, int32_t* sel, uint32_t n, hipStream_t stream) {
   if (n == 0) return 0;
   KpoolSelect<<<n, kBlock, 0, stream>>>((float*)score, n_pool, n_pool_max, pos, k, kpool, sel, (k + 1) * kpool);
+  return Status();
+}
+
+int hy4_attn_softmax(float* scores, uint32_t n, uint32_t heads, uint32_t n_keys, int32_t key_pos0,
+                     const int32_t* pos, uint32_t window, const float* mask, const float* sinks,
+                     hipStream_t stream) {
+  if (n == 0 || n_keys == 0) return 0;
+  AttnSoftmax<<<n * heads, kBlock, 0, stream>>>(scores, heads, n_keys, key_pos0, pos, window, mask, sinks);
+  return Status();
+}
+
+int hy4_selection_mask(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t n, uint32_t n_keys,
+                       hipStream_t stream) {
+  if (n == 0) return 0;
+  SelectionFill<<<dim3(Blocks(n_keys, 64), n), kBlock, 0, stream>>>(mask, n_keys);
+  SelectionMaskSet<<<dim3(Blocks(n_sel, 16), n), kBlock, 0, stream>>>(sel, n_sel, mask, n_keys);
+  return Status();
+}
+
+int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t count, uint32_t dim, float* dst,
+                    hipStream_t stream) {
+  if (count == 0) return 0;
+  GatherRows<<<dim3(Blocks(dim, 16), count), kBlock, 0, stream>>>(src, ring, first, dim, dst);
   return Status();
 }
 

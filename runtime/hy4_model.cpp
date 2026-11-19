@@ -6,6 +6,7 @@
 #include <gufo/ext/gguf_reader.hpp>
 
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -172,6 +173,7 @@ struct Model::Shards {
 };
 
 Model::~Model() {
+  if (blas_) (void)hipblasDestroy(static_cast<hipblasHandle_t>(blas_));
   scratch_.reset();
   for (void* p : allocations_) (void)hipFree(p);
   if (stream_) (void)hipStreamDestroy(stream_);

@@ -39,6 +39,8 @@ struct Model::Scratch {
   float* att = nullptr;   // [chunk][heads][kv_lora]
   float* attv = nullptr;  // [chunk][heads][head_v]
   float* gate = nullptr;  // [chunk][heads][head_v]
+  float* keys = nullptr;    // [swa_window + chunk][kv_lora + n_rot], SWA keys in order
+  float* scores = nullptr;  // attention scores, kScoreFloats
   // Indexer.
   float* ik = nullptr;     // [chunk][idx_dim]
   float* ivg = nullptr;    // [chunk][2 idx_dim]
@@ -59,9 +61,16 @@ struct Model::Scratch {
   float* host_h = nullptr;  // pinned [chunk][hc][n_embd], layer probe
 };
 
-/// y[t] = W x[t] for any weight type the model uses (n tokens, W [m][k]).
+/// Where device work runs: the stream and a hipBLAS handle bound to it.
+struct Exec {
+  hipStream_t stream;
+  void* blas_handle;
+};
+
+/// y[t] = W x[t] for any weight type the model uses (n tokens, W [m][k]):
+/// matvecs up to Model::kVecMax tokens, GEMMs beyond.
 bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uint32_t k, std::uint32_t n,
-            hipStream_t stream, std::string* error);
+            const Exec& ex, std::string* error);
 
 }  // namespace gufo::models::hy4_flash
 

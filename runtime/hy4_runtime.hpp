@@ -105,8 +105,10 @@ class Session;
 /// The loaded model. One evaluation runs at a time (scratch is shared).
 class Model {
 public:
-  /// Most tokens one evaluation takes.
-  static constexpr std::uint32_t kMaxChunk = 8;
+  /// Most tokens one evaluation pass takes (longer spans run in passes).
+  static constexpr std::uint32_t kMaxChunk = 256;
+  /// Passes up to this many tokens use matvecs; longer ones use GEMMs.
+  static constexpr std::uint32_t kVecMax = 8;
 
   ~Model();
   Model(const Model&) = delete;
@@ -143,6 +145,7 @@ private:
   std::vector<void*> allocations_;
   std::uint64_t resident_bytes_ = 0;
   hipStream_t stream_ = nullptr;
+  void* blas_ = nullptr;  // hipblasHandle_t
   const std::uint8_t* engram_table_ = nullptr;  // host mapping, FP8 rows
   std::uint64_t engram_bytes_ = 0;
 
@@ -205,6 +208,8 @@ private:
   // [kMaxChunk][(top pools + 1) kpool].
   float* score_ = nullptr;
   std::int32_t* sel_ = nullptr;
+  // Attention selection mask [kMaxChunk][max_context].
+  float* mask_ = nullptr;
   std::vector<void*> allocations_;
   LayerProbe probe_ = nullptr;
   void* probe_user_ = nullptr;
