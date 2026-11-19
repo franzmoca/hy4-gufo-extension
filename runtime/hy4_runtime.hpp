@@ -88,8 +88,9 @@ struct Layer {
   // MoE.
   Tensor gate_inp, exp_bias, routed_down, routed_up, gate_exps, up_exps, down_exps, gate_shexp,
       up_shexp, down_shexp;
-  // wk_b dequantized to F32 [heads][kv_lora][nope], for batched passes.
-  const float* wk_b_f32 = nullptr;
+  // wk_b split for prefill passes: values as binary16 bits, block scales.
+  const std::uint16_t* wk_b_q = nullptr;
+  const float* wk_b_d = nullptr;
   // Indexer.
   Tensor idx_k, idx_k_norm, idx_value, idx_gate, idx_ape, idx_comp_norm, idx_q_b, idx_proj;
   // Engram.

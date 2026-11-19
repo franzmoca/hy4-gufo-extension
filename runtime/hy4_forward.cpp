@@ -184,16 +184,21 @@ bool Model::AllocScratch(std::string* error) {
     return Fail(error, "hy4: hipblas init failed");
   }
   blas_ = blas;
-  // wk_b (K = 192, outside the MMQ tiles) as F32 for strided-batched GEMMs.
   for (Layer& l : weights_.layers) {
-    const std::uint64_t count = l.wk_b.dims[0] * l.wk_b.dims[1] * l.wk_b.dims[2];
-    float* f = nullptr;
-    if (!DeviceAlloc(&f, count, owned) || hy4_dequant_q8_0(l.wk_b.data, count / 32, f, stream_) != 0) {
-      return Fail(error, "hy4: wk_b dequantization failed");
+    const std::uint64_t blocks =
+        l.wk_b.dims[0] * l.wk_b.dims[1] * l.wk_b.dims[2] / 32;
+    std::uint16_t* q = nullptr;
+    float* d = nullptr;
+    if (!DeviceAlloc(&q, blocks * 32, owned) ||
+        !DeviceAlloc(&d, blocks, owned) ||
+        hy4_q8_0_split(l.wk_b.data, blocks, q, d, stream_) != 0) {
+      return Fail(error, "hy4: wk_b split failed");
     }
-    l.wk_b_f32 = f;
+    l.wk_b_q = q;
+    l.wk_b_d = d;
   }
-  if (hipStreamSynchronize(stream_) != hipSuccess) return Fail(error, "hy4: wk_b dequantization failed");
+  if (hipStreamSynchronize(stream_) != hipSuccess)
+    return Fail(error, "hy4: wk_b split failed");
   return true;
 }
 
@@ -543,23 +548,19 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
 
   // Absorb wk_b into the query: q_abs[h] = wk_b[h] (512 x 192) q_nope[h].
   if (l.wk_b.type != HY4_TYPE_Q8_0 || l.wv_b.type != HY4_TYPE_Q8_0) return Fail(error, "hy4: wk_b/wv_b must be Q8_0");
+  // Prefill passes hand MlaPrefill binary16 queries in qfull's storage.
+  auto* qh = reinterpret_cast<std::uint16_t*>(s.qfull);
   if (n > Model::kVecMax) {
-    // Per head: qfull[t][h][0:kv_lora] = wk_b[h] q[t][h][0:nope], column-major.
-    const float one = 1.0f;
-    const float zero = 0.0f;
-    if (hipblasSgemmStridedBatched(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(c.kv_lora), static_cast<int>(n),
-                                   static_cast<int>(nope), &one, l.wk_b_f32, static_cast<int>(nope),
-                                   static_cast<hipblasStride>(c.kv_lora) * nope, s.q,
-                                   static_cast<int>(heads * c.head_k), c.head_k, &zero, s.qfull,
-                                   static_cast<int>(heads * dk), dk, static_cast<int>(heads)) != HIPBLAS_STATUS_SUCCESS) {
-      return Fail(error, "hy4: wk_b gemm failed");
-    }
+    HY4_CHECK(hy4_mla_absorb(l.wk_b_q, l.wk_b_d, s.q, qh, n, heads, nope,
+                             c.n_rot, c.kv_lora, st));
   } else {
     HY4_CHECK(hy4_gemv_q8_0_grouped(l.wk_b.data, s.q, s.qfull, c.kv_lora, nope, heads, n,
                                     std::uint64_t{heads} * c.head_k, c.head_k, std::uint64_t{heads} * dk, dk, st));
+    HY4_CHECK(hipMemcpy2DAsync(s.qfull + c.kv_lora, dk * sizeof(float),
+                               s.q + nope, c.head_k * sizeof(float),
+                               c.n_rot * sizeof(float), std::size_t{n} * heads,
+                               hipMemcpyDeviceToDevice, st));
   }
-  HY4_CHECK(hipMemcpy2DAsync(s.qfull + c.kv_lora, dk * sizeof(float), s.q + nope, c.head_k * sizeof(float),
-                             c.n_rot * sizeof(float), std::size_t{n} * heads, hipMemcpyDeviceToDevice, st));
   HY4_CHECK(hy4_store_rows(s.kva, dk, cache_[il], ring_[il], s.pos, n, dk, st));
 
   const std::int32_t* sel = nullptr;
@@ -622,7 +623,7 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (n > Model::kVecMax) {
     // Prefill: each token over exactly its own keys on the matrix cores, so a
     // token's result does not depend on how its span was cut into passes.
-    HY4_CHECK(hy4_mla_prefill(s.qfull, keys, lo, s.pos, window, sel, n_sel,
+    HY4_CHECK(hy4_mla_prefill(qh, keys, lo, s.pos, window, sel, n_sel,
                               l.attn_sinks.f32(), scale, s.att, n, heads, dk,
                               c.kv_lora, st));
   }

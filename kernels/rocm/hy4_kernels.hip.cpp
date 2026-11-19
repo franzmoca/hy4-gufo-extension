@@ -792,7 +792,7 @@ __device__ __forceinline__ int32_t MlaKey(const int32_t* sel_t, int32_t first,
 }
 
 __global__ void __launch_bounds__(32 * kMlaWaves)
-    MlaPrefill(const float* q, const float* keys, int32_t lo,
+    MlaPrefill(const _Float16* q, const float* keys, int32_t lo,
                const int32_t* pos, uint32_t window, const int32_t* sel,
                uint32_t n_sel, const float* sinks, float scale, float* out,
                uint32_t heads) {
@@ -822,13 +822,11 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
   // This wave's slice of the 16 heads' queries, binary16.
   MlaHalf16 qa[kMlaQkSteps];
   {
-    const float* qr = q + ((uint64_t)t * heads + h0 + hg + row) * kMlaDk +
-                      sub * (kMlaDk / kMlaSplit);
+    const _Float16* qr = q + ((uint64_t)t * heads + h0 + hg + row) * kMlaDk +
+                         sub * (kMlaDk / kMlaSplit);
 #pragma unroll
     for (uint32_t s = 0; s < kMlaQkSteps; ++s)
-#pragma unroll
-      for (uint32_t e = 0; e < 16; ++e)
-        qa[s][e] = (_Float16)qr[s * 16 + e];
+      qa[s] = MlaLoad16(qr + s * 16);
   }
   if (tid < kMlaHeads) {
     m_s[tid] = sinks ? sinks[h0 + tid] : -INFINITY;
@@ -934,6 +932,153 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
 #pragma unroll
     for (uint32_t c = 0; c < kMlaPvTiles; ++c)
       orow[c * 16] = acc[c][i] * inv;
+  }
+}
+
+// Splits Q8_0 blocks into their values as binary16 (exact for int8) and
+// their scales as FP32.
+__global__ void Q8_0Split(const uint8_t* src, uint64_t blocks, _Float16* q,
+                          float* d) {
+  const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= blocks * 32)
+    return;
+  const uint8_t* blk = src + (i / 32) * 34;
+  q[i] = (_Float16)(int8_t)blk[2 + i % 32];
+  if (i % 32 == 0)
+    d[i / 32] = (float)*reinterpret_cast<const _Float16*>(blk);
+}
+
+// MLA query absorption for prefill passes: out[t, h] = [wk_b[h] . q_nope,
+// q_rope] in binary16, the operand layout MlaPrefill reads. wk_b is split by
+// Q8_0Split. Block (head h, 64 tokens), sixteen waves; wave w owns outputs
+// 32 w .. 32 w + 31 of the four 16-token tiles, so each weight fragment feeds
+// four products. Heads vary fastest across the grid, so the blocks in flight
+// read and write neighbouring rows (token-major order ran at half the
+// bandwidth). q_nope is staged once in LDS as binary16, and the next step's
+// weight fragments load during this step's products. A 16-wide k step lies
+// inside one 32-value block, so each block's two steps accumulate apart and
+// are scaled by the output row's block scale; every output sums in the same
+// order whatever the token count. Results leave through LDS as whole rows.
+constexpr uint32_t kAbsTok = 64;
+constexpr uint32_t kAbsTiles = kAbsTok / 16;
+constexpr uint32_t kAbsOut = 512;
+constexpr uint32_t kAbsMaxK = 256;
+constexpr uint32_t kAbsOutPitch = kAbsOut + 8;
+
+__global__ void __launch_bounds__(512)
+    MlaAbsorb(const _Float16* wq, const float* wd, const float* q,
+              _Float16* out, uint32_t n, uint32_t heads, uint32_t nope,
+              uint32_t n_rot) {
+  __shared__ __align__(16) _Float16 xs[kAbsTok * (kAbsMaxK + 8)];
+  __shared__ __align__(16) _Float16 os[16 * kAbsOutPitch];
+  const uint32_t tid = threadIdx.x;
+  const uint32_t pitch = nope + 8;
+  const uint32_t lane = tid % 32;
+  const uint32_t wave = tid / 32;
+  const uint32_t row = lane % 16;
+  const uint32_t half = lane / 16;
+  const uint32_t g = blockIdx.x;
+  const uint32_t t0 = blockIdx.y * kAbsTok;
+  const uint32_t o0 = wave * 32;
+  const uint32_t steps = nope / 16;
+  const uint32_t head_k = nope + n_rot;
+  const uint32_t row_out = kAbsOut + n_rot;
+
+  // Stage q_nope: thread column c4 of 64 float4 columns, rows 8 apart.
+  for (uint32_t c = tid % 64 * 4; c < nope; c += 256)
+    for (uint32_t r = tid / 64; r < kAbsTok; r += 8) {
+      const uint32_t t = min(t0 + r, n - 1);
+      const float4 v = *reinterpret_cast<const float4*>(
+          q + ((uint64_t)t * heads + g) * head_k + c);
+      _Float16* d = xs + r * pitch + c;
+      d[0] = (_Float16)v.x;
+      d[1] = (_Float16)v.y;
+      d[2] = (_Float16)v.z;
+      d[3] = (_Float16)v.w;
+    }
+
+  const _Float16* wr[2];
+  float dv[2][kAbsMaxK / 32];
+#pragma unroll
+  for (uint32_t c = 0; c < 2; ++c) {
+    const uint64_t o = (uint64_t)g * kAbsOut + o0 + c * 16 + row;
+    wr[c] = wq + o * nope;
+#pragma unroll
+    for (uint32_t b = 0; b < kAbsMaxK / 32; ++b)
+      dv[c][b] = b < nope / 32 ? wd[o * (nope / 32) + b] : 0.0f;
+  }
+  MlaHalf16 bv[2] = {MlaLoad16(wr[0]), MlaLoad16(wr[1])};
+  __syncthreads();
+
+  MlaFloat8 acc[kAbsTiles][2] = {};
+  MlaFloat8 part[kAbsTiles][2] = {};
+  for (uint32_t s = 0; s < steps; ++s) {
+    const uint32_t kk = s * 16;
+    MlaHalf16 nb[2] = {bv[0], bv[1]};
+    if (s + 1 < steps) {
+      nb[0] = MlaLoad16(wr[0] + kk + 16);
+      nb[1] = MlaLoad16(wr[1] + kk + 16);
+    }
+#pragma unroll
+    for (uint32_t r = 0; r < kAbsTiles; ++r) {
+      const MlaHalf16 a = MlaLoad16(xs + (r * 16 + row) * pitch + kk);
+#pragma unroll
+      for (uint32_t c = 0; c < 2; ++c)
+        part[r][c] = MlaWmma(a, bv[c], part[r][c]);
+    }
+    if (s % 2 == 1) {
+#pragma unroll
+      for (uint32_t c = 0; c < 2; ++c) {
+        float d = 0.0f;
+#pragma unroll
+        for (uint32_t b = 0; b < kAbsMaxK / 32; ++b)
+          d = b == s / 2 ? dv[c][b] : d;
+#pragma unroll
+        for (uint32_t r = 0; r < kAbsTiles; ++r) {
+#pragma unroll
+          for (uint32_t i = 0; i < 8; ++i)
+            acc[r][c][i] += d * part[r][c][i];
+          part[r][c] = MlaFloat8{};
+        }
+      }
+    }
+    bv[0] = nb[0];
+    bv[1] = nb[1];
+  }
+
+  // One 16-token tile at a time: fragments to LDS, then whole rows out, the
+  // rope tail converted from q.
+#pragma unroll
+  for (uint32_t r = 0; r < kAbsTiles; ++r) {
+#pragma unroll
+    for (uint32_t c = 0; c < 2; ++c)
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i)
+        os[(2 * i + half) * kAbsOutPitch + o0 + c * 16 + row] =
+            (_Float16)acc[r][c][i];
+    __syncthreads();
+    for (uint32_t i = tid; i < 16 * (kAbsOut / 8); i += blockDim.x) {
+      const uint32_t rr = i / (kAbsOut / 8), c = i % (kAbsOut / 8) * 8;
+      const uint32_t t = t0 + r * 16 + rr;
+      if (t < n)
+        *reinterpret_cast<uint4*>(out + ((uint64_t)t * heads + g) * row_out +
+                                  c) =
+            *reinterpret_cast<const uint4*>(os + rr * kAbsOutPitch + c);
+    }
+    for (uint32_t i = tid; i < 16 * (n_rot / 4); i += blockDim.x) {
+      const uint32_t rr = i / (n_rot / 4), c = i % (n_rot / 4) * 4;
+      const uint32_t t = t0 + r * 16 + rr;
+      if (t >= n)
+        continue;
+      const float4 v = *reinterpret_cast<const float4*>(
+          q + ((uint64_t)t * heads + g) * head_k + nope + c);
+      _Float16* d = out + ((uint64_t)t * heads + g) * row_out + kAbsOut + c;
+      d[0] = (_Float16)v.x;
+      d[1] = (_Float16)v.y;
+      d[2] = (_Float16)v.z;
+      d[3] = (_Float16)v.w;
+    }
+    __syncthreads();
   }
 }
 
@@ -1205,7 +1350,32 @@ int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t s
   return Status();
 }
 
-int hy4_mla_prefill(const float* q, const float* keys, int32_t lo,
+int hy4_q8_0_split(const void* src, uint64_t blocks, uint16_t* q, float* d,
+                   hipStream_t stream) {
+  if (blocks == 0)
+    return 0;
+  const uint64_t count = blocks * 32;
+  Q8_0Split<<<(unsigned)((count + 255) / 256), 256, 0, stream>>>(
+      static_cast<const uint8_t*>(src), blocks, reinterpret_cast<_Float16*>(q),
+      d);
+  return Status();
+}
+
+int hy4_mla_absorb(const uint16_t* wq, const float* wd, const float* q,
+                   uint16_t* out, uint32_t n, uint32_t heads, uint32_t nope,
+                   uint32_t n_rot, uint32_t kv_lora, hipStream_t stream) {
+  if (kv_lora != kAbsOut || nope % 32 != 0 || nope == 0 || nope > kAbsMaxK ||
+      n_rot % 8 != 0 || n_rot > 128)
+    return 1;
+  if (n == 0 || heads == 0)
+    return 0;
+  MlaAbsorb<<<dim3(heads, (n + kAbsTok - 1) / kAbsTok), 512, 0, stream>>>(
+      reinterpret_cast<const _Float16*>(wq), wd, q,
+      reinterpret_cast<_Float16*>(out), n, heads, nope, n_rot);
+  return Status();
+}
+
+int hy4_mla_prefill(const uint16_t* q, const float* keys, int32_t lo,
                     const int32_t* pos, uint32_t window, const int32_t* sel,
                     uint32_t n_sel, const float* sinks, float scale, float* out,
                     uint32_t n, uint32_t heads, uint32_t dk, uint32_t dv,
@@ -1215,7 +1385,8 @@ int hy4_mla_prefill(const float* q, const float* keys, int32_t lo,
   if (dk != kMlaDk || dv != kMlaDv || heads % kMlaHeads != 0)
     return 1;
   MlaPrefill<<<dim3(n, heads / kMlaHeads), 32 * kMlaWaves, 0, stream>>>(
-      q, keys, lo, pos, window, sel, n_sel, sinks, scale, out, heads);
+      reinterpret_cast<const _Float16*>(q), keys, lo, pos, window, sel, n_sel,
+      sinks, scale, out, heads);
   return Status();
 }
 

@@ -99,16 +99,17 @@ double Sigmoid(double x) {
   return 1.0 / (1.0 + std::exp(-x));
 }
 
-// Binary16 bits of v (round to nearest even; normal range only, which the
-// test values keep to) and back.
+// Binary16 bits of v (round to nearest even; up to the normal range's top,
+// which the test values keep to) and back.
 uint16_t HalfBits(float v) {
   uint32_t x;
   std::memcpy(&x, &v, 4);
   const uint32_t sign = (x >> 16) & 0x8000u;
   const int32_t exp = (int32_t)((x >> 23) & 0xff) - 127 + 15;
   const uint32_t mant = x & 0x7fffffu;
-  if (v == 0.0f)
-    return (uint16_t)sign;
+  if (exp <= 0)  // subnormal or zero: a multiple of 2^-24
+    return (uint16_t)(sign |
+                      (uint32_t)std::nearbyint(std::fabs(v) * 16777216.0f));
   uint32_t half = ((uint32_t)exp << 10) | (mant >> 13);
   const uint32_t rest = mant & 0x1fffu;
   if (rest > 0x1000u || (rest == 0x1000u && (half & 1)))
@@ -329,6 +330,58 @@ void TestGemv() {
         want[t * y_tok + g * y_grp + r] = acc;
       }
   Near(Host(y, n * y_tok), want, 1e-5, "gemv_q8_0_grouped");
+
+  // The prefill absorption at Hy4's shape (wk_b 512 x 192, rope 64), with a
+  // partial token tile: [W . q_nope, q_rope] as binary16, q rounded to
+  // binary16 first.
+  {
+    const uint32_t m = 512, nope = 192, n_rot = 64, hk = nope + n_rot,
+                   heads = 2, nt = 77, row = m + n_rot;
+    const auto aw = RandomQ8_0(heads * m * nope / 32);
+    const auto aq = Random(nt * heads * hk);
+    uint16_t* wq = Device(std::vector<uint16_t>(aw.size() * 32));
+    float* wd = Device(std::vector<float>(aw.size()));
+    Expect(hy4_q8_0_split(Device(aw), aw.size(), wq, wd, nullptr) == 0,
+           "q8_0_split status");
+    std::vector<double> split(aw.size() * 32);
+    {
+      const auto bits = Host(wq, aw.size() * 32);
+      const auto hd = Host(wd, aw.size());
+      for (std::size_t i = 0; i < split.size(); ++i) {
+        split[i] = HalfValue(bits[i]);
+        Expect(split[i] == aw[i / 32].qs[i % 32], "q8_0_split values");
+      }
+      for (std::size_t b = 0; b < aw.size(); ++b)
+        Expect(hd[b] == HalfValue(aw[b].d), "q8_0_split scales");
+    }
+    uint16_t* out = Device(std::vector<uint16_t>(nt * heads * row));
+    Expect(hy4_mla_absorb(wq, wd, Device(aq), out, nt, heads, nope, n_rot, m,
+                          nullptr) == 0,
+           "mla_absorb status");
+    const auto got_bits = Host(out, nt * heads * row);
+    std::vector<float> got(nt * heads * row);
+    std::vector<double> want(nt * heads * row);
+    for (uint32_t t = 0; t < nt; ++t)
+      for (uint32_t h = 0; h < heads; ++h) {
+        const float* qr = &aq[(t * heads + h) * hk];
+        const std::size_t o = ((std::size_t)t * heads + h) * row;
+        for (uint32_t r = 0; r < m; ++r) {
+          double acc = 0;
+          for (uint32_t i = 0; i < nope; ++i)
+            acc += Q8Value(aw, ((std::size_t)h * m + r) * nope + i) *
+                   HalfValue(HalfBits(qr[i]));
+          want[o + r] = acc;
+        }
+        for (uint32_t i = 0; i < n_rot; ++i)
+          want[o + m + i] = HalfValue(HalfBits(qr[nope + i]));
+        for (uint32_t i = 0; i < row; ++i)
+          got[o + i] = (float)HalfValue(got_bits[o + i]);
+      }
+    Near(got, want, 1e-3, "mla_absorb");
+    Expect(hy4_mla_absorb(nullptr, nullptr, nullptr, nullptr, 1, 1, nope, n_rot,
+                          256, nullptr) != 0,
+           "mla_absorb rejects kv_lora 256");
+  }
 }
 
 void TestRope() {
@@ -476,8 +529,13 @@ void TestMlaPrefill() {
   const auto sinks = Random(heads, -1, 1);
   const std::vector<int32_t> pos{0, 31, 32, 150, 299};
   const uint32_t n = (uint32_t)pos.size();
-  const auto q = Random(n * heads * dk, -1, 1);
-  auto* dq = Device(q);
+  auto q = Random(n * heads * dk, -1, 1);
+  std::vector<uint16_t> qbits(q.size());
+  for (std::size_t i = 0; i < q.size(); ++i) {
+    qbits[i] = HalfBits(q[i]);
+    q[i] = (float)HalfValue(qbits[i]);
+  }
+  auto* dq = Device(qbits);
   auto* dc = Device(cache);
   auto* dp = Device(pos);
   auto* ds = Device(sinks);

@@ -16,6 +16,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E8 | 2,048-token prefill passes, snapshots of live ring rows only | retained |
 | E9 | Prefill attention: 16-key tiles with transposed values | rejected |
 | E10 | Prefill attention: 32 heads per block | retained |
+| E11 | Matrix-core query absorption writing binary16 queries | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -175,3 +176,35 @@ the staged tile; 56 KB LDS) halve that. Each head's arithmetic is unchanged.
 3,712-token prefill (`hy4_eval_probe`): 10.32 → 9.00 s and 9.02 s
 (360 → 412 tok/s). KL against llama.cpp 0.0855 ± 0.008, same top 91.89%, as
 in E8; `kernels_test` passes. Retained.
+
+## E11: Matrix-core query absorption (2026-11-19)
+
+Prefill passes absorbed `wk_b` into the queries with a hipBLAS FP32 strided
+batched GEMM on a dequantized FP32 copy (0.76 s of a 9.0 s prefill), wrote
+FP32 queries, then copied their rope tails; the attention rounded them to
+binary16 on load. `hy4_mla_absorb` does it in one kernel on the matrix cores
+and writes the binary16 [576] rows the attention reads. `wk_b` is split at
+load into its int8 values as binary16 (exact) and its block scales; a 16-wide
+k step lies inside one Q8_0 block, so each block's two steps accumulate apart
+and take the row's scale, and the weights stay exact. Each output sums in an
+order independent of the pass width.
+
+Per call at the largest shape (2,048 tokens, 64 heads), in a standalone
+benchmark (a device copy of the same bytes takes 1.3 ms):
+
+| variant | ms |
+| --- | --- |
+| hipBLAS FP32 (from the profile) | 5.5 |
+| 16 tokens per block, Q8_0 blocks read in place, FP32 out | 6.0 |
+| split weights, 64 tokens per block, binary16 rows through LDS | 4.9 |
+| same, heads fastest across the grid | 1.8 |
+
+Without the matrix products the first kernels took as long, so they were
+bound by memory access, not arithmetic: the blocks in flight walked one
+head's rows 64 KB apart. Ordering the grid by head first halved the time.
+3,712-token prefill: 9.00 → 8.24 s (412 → 451 tok/s). KL against llama.cpp
+0.081 ± 0.008, same top 91.3% (E10: 0.086, 91.9%; within the interval).
+`--passcheck 8` exact. The FP32 `wk_b` copy is replaced by one about half its
+size. `--chunkcheck 200` on the first 1,000 tokens (whole is now one pass):
+first difference in layer 0 (6e-8), 789 / 800 same top, mean KL 0.0055, so
+the other batched kernels still depend on the pass width. Retained.

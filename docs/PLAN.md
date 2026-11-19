@@ -482,7 +482,9 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   token's own keys, fewer, wider passes should cut MMQ's re-reads of the
   experts (8.9 s, the largest share now). Done as E8: 2,048-token passes,
   14.7 → 10.3 s. V transposed in LDS was slower (E9); 32 heads per block:
-  10.3 → 9.0 s (E10).
+  10.3 → 9.0 s (E10). The wk_b absorption on the matrix cores, writing the
+  binary16 queries the attention reads: 9.0 → 8.24 s (E11). Lesson from E11:
+  order the grid so that the blocks in flight touch neighbouring rows.
 
 - **Designs to borrow for the prefill attention.** ds41's
   `attention_f16_kernel` (`ds41_v41.hip.cpp`) is the same MLA shape: block

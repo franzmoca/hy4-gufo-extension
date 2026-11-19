@@ -62,6 +62,22 @@ int hy4_gemv_q8_0_grouped(const void* w, const float* x, float* y, uint32_t m, u
                           uint32_t groups, uint32_t n, uint64_t x_tok, uint64_t x_grp, uint64_t y_tok,
                           uint64_t y_grp, hipStream_t stream);
 
+/* Splits Q8_0 blocks into their values as binary16 bits (q, 32 per block)
+ * and their scales (d, one per block), for hy4_mla_absorb. */
+int hy4_q8_0_split(const void* src, uint64_t blocks, uint16_t* q, float* d,
+                   hipStream_t stream);
+
+/* MLA query absorption for prefill passes, on the matrix cores: out[t, h] =
+ * [wk_b[h] . q[t, h, 0:nope], q[t, h, nope:nope + n_rot]] as binary16 bits,
+ * [n][heads][kv_lora + n_rot], with wk_b [heads][kv_lora][nope] split by
+ * hy4_q8_0_split and q [n][heads][nope + n_rot]. q is rounded to binary16,
+ * the weights are exact, and each output sums in an order independent of n.
+ * kv_lora must be 512, nope a multiple of 32 up to 256, n_rot a multiple of 8
+ * up to 128. */
+int hy4_mla_absorb(const uint16_t* wq, const float* wd, const float* q,
+                   uint16_t* out, uint32_t n, uint32_t heads, uint32_t nope,
+                   uint32_t n_rot, uint32_t kv_lora, hipStream_t stream);
+
 /* Rotates consecutive pairs (rope type NORM) of the last n_rot values of
  * each of `heads` rows per token: row (t, h) starts at x + t * tok_stride +
  * h * head_stride + offset; pair i at position pos[t] turns by pos *
@@ -90,13 +106,14 @@ int hy4_mla_attention(const float* q, const float* cache, uint32_t ring, const i
                       hipStream_t stream);
 
 /* hy4_mla_attention for prefill on the matrix cores (binary16 operands, FP32
- * softmax and accumulation), each token over exactly its own keys, so a
- * token's result does not depend on the pass it is in. Key position k is row
+ * softmax and accumulation; q as binary16 bits from hy4_mla_absorb), each
+ * token over exactly its own keys, so a token's result does not depend on the
+ * pass it is in. Key position k is row
  * k - lo of `keys` [rows][dk] (a gathered window or the whole cache from 0);
  * token t sees max(lo, pos[t] - window + 1) .. pos[t] (lo without a window),
  * or the positions of sel[t, 0:n_sel] in that range. dk must be 576, dv 512
  * and heads a multiple of 32. */
-int hy4_mla_prefill(const float* q, const float* keys, int32_t lo,
+int hy4_mla_prefill(const uint16_t* q, const float* keys, int32_t lo,
                     const int32_t* pos, uint32_t window, const int32_t* sel,
                     uint32_t n_sel, const float* sinks, float scale, float* out,
                     uint32_t n, uint32_t heads, uint32_t dk, uint32_t dv,
