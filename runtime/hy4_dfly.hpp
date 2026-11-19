@@ -39,9 +39,11 @@ public:
   [[nodiscard]] std::span<const std::uint32_t> TargetLayers() const { return target_layers_; }
   [[nodiscard]] std::uint64_t ResidentBytes() const { return resident_bytes_; }
 
-  /// Drafts `count` (< kBlock) tokens after `anchor`, the token that follows
-  /// the session's frontier. Needs the session's taps (TapsReady).
-  [[nodiscard]] bool Draft(const Session& session, std::int32_t anchor, std::uint32_t count,
+  /// Drafts up to `count` (< kBlock) tokens after `anchor`, the token that
+  /// follows the session's frontier, while the confidence head's estimate
+  /// that the target accepts every draft so far stays at least `min_accept`.
+  /// Needs the session's taps (TapsReady). May draft nothing.
+  [[nodiscard]] bool Draft(const Session& session, std::int32_t anchor, std::uint32_t count, float min_accept,
                            std::vector<std::int32_t>* drafts, std::string* error);
 
 private:
@@ -54,7 +56,8 @@ private:
   std::vector<LayerWeights> layers_;
   Tensor fuse_enorm_, fuse_hnorm_, fuse_eh_, fuse_gate_;
   Tensor corr_hnorm_, corr_enorm_, corr_gate_, corr_up_, corr_down_;
-  Tensor final_norm_;
+  Tensor final_norm_, confidence_w_;
+  float confidence_b_ = 0.0f;
   std::int32_t mask_token_ = 0;
   std::unique_ptr<Buffers> buf_;
   std::vector<void*> allocations_;

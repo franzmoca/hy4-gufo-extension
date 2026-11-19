@@ -164,6 +164,7 @@ struct Drafter::Buffers {
   std::int32_t* pos = nullptr;     // [kBlock]
   std::int32_t* iota = nullptr;    // [max selection] 0, 1, ...
   std::int32_t* best = nullptr;    // [1]
+  float* conf = nullptr;           // [1] confidence logit
   float* x = nullptr;              // [kBlock][hidden] residual
   float* xn = nullptr;             // [kBlock][hidden]
   float* y = nullptr;              // [kBlock][hidden]
@@ -307,15 +308,19 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
             matrix(top + "hidden_correction.gate_proj.weight", kHidden, 2 * kHidden, &d->corr_gate_) &&
             matrix(top + "hidden_correction.up_proj.weight", kHidden, 2 * kHidden, &d->corr_up_) &&
             matrix(top + "hidden_correction.down_proj.weight", kHidden, kHidden, &d->corr_down_) &&
-            vector(top + "final_norm.weight", kHidden, &d->final_norm_);
+            vector(top + "final_norm.weight", kHidden, &d->final_norm_) &&
+            st.Read(top + "confidence_head.proj.weight", {1, kHidden}, &host, error) &&
+            upload(1, kHidden, false, &d->confidence_w_) &&
+            st.Read(top + "confidence_head.proj.bias", {1}, &host, error);
   if (!ok) return nullptr;
+  d->confidence_b_ = host[0];
 
   Buffers& b = *d->buf_;
   b.max_sel = c.idx_top_k / c.kpool * c.kpool;
   const std::size_t n_keys = b.max_sel + kBlock;
   std::vector<void*>* own = &d->allocations_;
   ok = DeviceAlloc(&b.tokens, kBlock, own) && DeviceAlloc(&b.pos, kBlock, own) &&
-       DeviceAlloc(&b.iota, b.max_sel, own) && DeviceAlloc(&b.best, 1, own) &&
+       DeviceAlloc(&b.iota, b.max_sel, own) && DeviceAlloc(&b.best, 1, own) && DeviceAlloc(&b.conf, 1, own) &&
        DeviceAlloc(&b.x, std::size_t{kBlock} * kHidden, own) && DeviceAlloc(&b.xn, std::size_t{kBlock} * kHidden, own) &&
        DeviceAlloc(&b.y, std::size_t{kBlock} * kHidden, own) && DeviceAlloc(&b.cat, 2 * kHidden, own) &&
        DeviceAlloc(&b.f, kHidden, own) && DeviceAlloc(&b.qr, std::size_t{kBlock} * kQLora, own) &&
@@ -343,7 +348,7 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
   return d;
 }
 
-bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t count,
+bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t count, float min_accept,
                     std::vector<std::int32_t>* drafts, std::string* error) {
   drafts->clear();
   if (count == 0) return true;
@@ -444,6 +449,7 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
   // Slot k predicts the token at a + k from its hidden, corrected by the
   // token before it, through the target's LM head.
   std::int32_t prev = anchor;
+  float accept = 1.0f;
   for (std::uint32_t k = 1; k <= count; ++k) {
     const float* h = b.xn + std::size_t{k} * kHidden;
     HY4_CHECK(hipMemcpyAsync(b.tokens, &prev, sizeof prev, hipMemcpyHostToDevice, st));
@@ -457,8 +463,14 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
     HY4_CHECK(hy4_add(b.hk, h, b.hk, kHidden, st));
     if (!MatVec(tw.output, b.hk, b.logits, c.n_vocab, kHidden, 1, ex, error)) return false;
     HY4_CHECK(hy4_argmax(b.logits, 1, c.n_vocab, b.best, st));
+    // The confidence head: the chance the target accepts this slot's draft.
+    if (!MatVec(confidence_w_, b.hk, b.conf, 1, kHidden, 1, ex, error)) return false;
+    float logit = 0.0f;
     HY4_CHECK(hipMemcpyAsync(&prev, b.best, sizeof prev, hipMemcpyDeviceToHost, st));
+    HY4_CHECK(hipMemcpyAsync(&logit, b.conf, sizeof logit, hipMemcpyDeviceToHost, st));
     HY4_CHECK(hipStreamSynchronize(st));
+    accept *= 1.0f / (1.0f + std::exp(-(logit + confidence_b_)));
+    if (accept < min_accept) break;
     drafts->push_back(prev);
   }
   return true;

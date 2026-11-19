@@ -52,7 +52,7 @@
       "providers": [
         "hy4flash"
       ],
-      "help": "Tokens DFly2 drafts per step, 1 to 7 (default 3)"
+      "help": "Most tokens DFly2 drafts per step, 1 to 7 (default 7)"
     }
   ],
   "targets": {

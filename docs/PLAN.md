@@ -249,7 +249,7 @@ These are judgment calls made without the maintainer; revisit any of them.
     the target's pair layout at the sparse base (1e7). Slot k >= 1 predicts
     a + k: its final-normed hidden plus the hidden correction on the previous
     token's embedding (the anchor, then slot k - 1's draft), through the
-    target's LM head. The confidence head is not used yet.
+    target's LM head. The confidence head sets the draft length (decision 18).
 16. **Speculative steps inside the runner.** `DecodeStep` samples the anchor,
     drafts `--dfly-draft-tokens` (default 3) tokens, verifies anchor and drafts
     in one pass (`Session::Verify`), and walks the rows with the request's own
@@ -269,6 +269,12 @@ These are judgment calls made without the maintainer; revisit any of them.
     pass), 40 times under the llama.cpp noise floor; greedy replies then match
     until a near tie and may differ after it. Bit-identical replies would need
     column-count-independent matvecs, which is not worth their cost.
+
+18. **The confidence head sets the draft length.** `sigmoid(head(h'))` was
+    trained to predict each slot's accept rate; the drafter stops once the
+    product over its slots falls under 0.45 (`HY4_DFLY_MIN_ACCEPT` overrides),
+    capped by `--dfly-draft-tokens` (default 7). On prose this avoids the long
+    blocks that made fixed lengths slower than plain decoding.
 
 ## Phases
 
@@ -325,7 +331,20 @@ drafts accepted; plain decode 16.4, 16.4 and 15.7):
 
 At three drafts a step costs 16.5 ms of drafting and 101 ms to verify four
 tokens (a plain step: 61 ms). Two and three drafts tie (geometric mean 22.4);
-three is the default. The confidence head could pick the length per step.
+fixed lengths are superseded by the confidence head below.
+
+With the confidence head choosing the length (up to 7; keep drafting while
+the product of its accept chances stays at least the threshold), same prompts:
+
+| threshold | code | prose | list | geo mean | drafted/step |
+| --- | --- | --- | --- | --- | --- |
+| 0.15 | 27.1 | 17.1 | 20.3 | 21.1 | 3.9 |
+| 0.30 | 26.5 | 18.2 | 22.6 | 22.2 | 3.1 |
+| 0.45 | 28.5 | 19.0 | 22.9 | 23.2 | 2.4 |
+| 0.60 | 30.8 | 17.8 | 21.7 | 22.8 | 1.6 |
+
+0.45 is the default (decision 18); one run per arm, so its 4% over fixed three
+drafts is inside run-to-run noise.
 
 ## Read from the Tencent files
 

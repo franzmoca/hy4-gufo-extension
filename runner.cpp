@@ -43,7 +43,9 @@ constexpr std::uint32_t kDefaultContext = 32768;
 // Prompt-cache transfer streams besides each session's own.
 constexpr std::size_t kBatchTransferStreams = 16;
 // DFly2 drafts per step without --dfly-draft-tokens.
-constexpr std::int64_t kDefaultDraftTokens = 3;
+constexpr std::int64_t kDefaultDraftTokens = 7;
+// See Hy4TextRunner::min_accept_.
+constexpr float kDefaultMinAccept = 0.45f;
 
 std::size_t CacheCeilingBytes() { return std::max(HostSnapshotCeilingBytes(), HostSnapshotBudgetBytes()); }
 
@@ -365,7 +367,7 @@ public:
     std::vector<std::int32_t> drafts;
     std::string error;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!drafter_->Draft(session, anchor_token, count, &drafts, &error)) {
+    if (!drafter_->Draft(session, anchor_token, count, min_accept_, &drafts, &error)) {
       throw std::runtime_error("Hy4 draft failed: " + error);
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -374,7 +376,7 @@ public:
     if (!session.Verify(tokens, &error)) throw std::runtime_error("Hy4 verify failed: " + error);
     const auto t2 = std::chrono::steady_clock::now();
     std::uint32_t kept = 1;
-    for (std::uint32_t i = 0; i < count; ++i) {
+    for (std::uint32_t i = 0; i < drafts.size(); ++i) {
       const auto logits = session.PassLogits(i);
       const auto token = static_cast<std::int32_t>(work.Sample(logits));
       if (token != drafts[i]) {
@@ -401,16 +403,18 @@ public:
       profile_->draft_s += std::chrono::duration<double>(t1 - t0).count();
       profile_->verify_s += std::chrono::duration<double>(t2 - t1).count();
       profile_->accepted += kept - 1;
+      profile_->drafted += drafts.size();
       if (profile_->rounds % 64 == 0) {
         server::Logger::Info("dfly", "event=hy4_dfly_profile rounds=" + std::to_string(profile_->rounds) +
                                          " draft_ms=" + std::to_string(1e3 * profile_->draft_s / profile_->rounds) +
                                          " verify_ms=" + std::to_string(1e3 * profile_->verify_s / profile_->rounds) +
+                                         " drafted=" + std::to_string(double(profile_->drafted) / profile_->rounds) +
                                          " accepted=" + std::to_string(double(profile_->accepted) / profile_->rounds));
       }
     }
     sampler.CopyDrawStateFrom(work);
     step.draft_rounds = 1;
-    step.draft_tokens = count;
+    step.draft_tokens = drafts.size();
     step.draft_accepted_tokens = kept - 1;
     return step;
   }
@@ -444,9 +448,13 @@ private:
   std::shared_ptr<Model> model_;
   std::shared_ptr<Drafter> drafter_;
   std::uint32_t draft_tokens_{0};
+  // Draft while the confidence head's chance that every draft so far is
+  // accepted stays at least this (HY4_DFLY_MIN_ACCEPT overrides).
+  float min_accept_{std::getenv("HY4_DFLY_MIN_ACCEPT") ? std::strtof(std::getenv("HY4_DFLY_MIN_ACCEPT"), nullptr)
+                                                       : kDefaultMinAccept};
   // HY4_DFLY_PROFILE=1: mean draft and verify times, logged every 64 steps.
   struct Profile {
-    std::uint64_t rounds{0}, accepted{0};
+    std::uint64_t rounds{0}, accepted{0}, drafted{0};
     double draft_s{0}, verify_s{0};
   };
   std::unique_ptr<Profile> profile_{std::getenv("HY4_DFLY_PROFILE") ? std::make_unique<Profile>() : nullptr};
