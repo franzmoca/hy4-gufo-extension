@@ -18,6 +18,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E10 | Prefill attention: 32 heads per block | retained |
 | E11 | Matrix-core query absorption writing binary16 queries | retained |
 | E12 | Hyper-connection mixing for 8 tokens per block | retained |
+| E13 | One input quantization for paired projections | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -220,3 +221,12 @@ with the same per-token thread partition, products and reduction order, so
 the results are bit-identical (checked in `kernels_test`; KL and PPL against
 llama.cpp unchanged to the last digit). Smaller passes keep one token per
 block. 3,712-token prefill: 8.24 → 7.95 s (451 → 467 tok/s). Retained.
+
+## E13: One input quantization for paired projections (2026-11-19)
+
+Batched projections of one input and one weight type now go through the MMQ
+pair entry, which quantizes the input once: `wq_a` with `wkv_a`, the dense
+layer's gate with its up, and the shared expert's gate with its up. Same
+kernels on the same quantized input, so results are bit-identical (KL and
+PPL unchanged to the last digit). 3,712-token prefill: 7.95 → 7.90 s (both
+runs). Retained as a small measured gain.

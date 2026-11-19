@@ -117,6 +117,24 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uin
   return Fail(error, "hy4: unsupported matvec type " + std::to_string(w.type));
 }
 
+bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
+                float* y2, std::uint32_t m2, const float* x, std::uint32_t k,
+                std::uint32_t n, const Exec& ex, std::string* error) {
+  const bool quantized = w1.type == HY4_TYPE_Q8_0 || w1.type == HY4_TYPE_Q4_K ||
+                         w1.type == HY4_TYPE_Q6_K;
+  if (n > Model::kVecMax && quantized && w2.type == w1.type && k % 256 == 0 &&
+      w1.dims.size() >= 2 && w1.dims[0] == k && w1.dims[1] == m1 &&
+      w2.dims.size() >= 2 && w2.dims[0] == k && w2.dims[1] == m2) {
+    HY4_CHECK(hy4_mmq_dense_pair_typed(
+        w1.type, w1.data, y1, static_cast<int>(m1), w2.data, y2,
+        static_cast<int>(m2), x, static_cast<int>(n), static_cast<int>(k),
+        ex.stream));
+    return true;
+  }
+  return MatVec(w1, x, y1, m1, k, n, ex, error) &&
+         MatVec(w2, x, y2, m2, k, n, ex, error);
+}
+
 bool Model::AllocScratch(std::string* error) {
   if (hy4_mmq_init(0) != 0) return Fail(error, "hy4: mmq init failed");
   const Config& c = config_;
@@ -534,10 +552,12 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   const std::uint32_t nope = c.head_k - c.n_rot;
   const float base = c.is_swa[il] ? c.rope_base_swa : c.rope_base;
 
-  if (!MatVec(l.wq_a, s.cur, s.qr, c.q_lora, c.n_embd, n, ex, error)) return false;
+  if (!MatVecPair(l.wq_a, s.qr, c.q_lora, l.wkv_a, s.kva, dk, s.cur, c.n_embd,
+                  n, ex, error))
+    return false;
   HY4_CHECK(hy4_rms_norm(s.qr, l.q_a_norm.f32(), s.qr, n, c.q_lora, c.q_lora, c.rms_eps, st));
-  if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error)) return false;
-  if (!MatVec(l.wkv_a, s.cur, s.kva, dk, c.n_embd, n, ex, error)) return false;
+  if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error))
+    return false;
   HY4_CHECK(hy4_rms_norm(s.kva, l.kv_a_norm.f32(), s.kva, n, c.kv_lora, dk, c.rms_eps, st));
   const std::int32_t* hw = s.rope_3d ? s.rope_hw : nullptr;
   HY4_CHECK(hy4_rope_3d(s.kva, s.rope, hw, n, 1, dk, 0, c.kv_lora, c.n_rot,
@@ -728,8 +748,9 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
 
   if (il < c.n_dense_lead) {
     const std::uint32_t f = c.n_ff_dense;
-    if (!MatVec(l.ffn_gate, s.cur, s.ffn_a, f, c.n_embd, n, ex, error)) return false;
-    if (!MatVec(l.ffn_up, s.cur, s.ffn_b, f, c.n_embd, n, ex, error)) return false;
+    if (!MatVecPair(l.ffn_gate, s.ffn_a, f, l.ffn_up, s.ffn_b, f, s.cur,
+                    c.n_embd, n, ex, error))
+      return false;
     HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
     return MatVec(l.ffn_down, s.ffn_c, s.y, c.n_embd, f, n, ex, error);
   }
@@ -737,8 +758,9 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   const std::uint32_t f = c.n_ff_exp;
   const std::uint32_t used = c.n_expert_used;
   // Shared expert first, into its own buffer.
-  if (!MatVec(l.gate_shexp, s.cur, s.ffn_a, f, c.n_embd, n, ex, error)) return false;
-  if (!MatVec(l.up_shexp, s.cur, s.ffn_b, f, c.n_embd, n, ex, error)) return false;
+  if (!MatVecPair(l.gate_shexp, s.ffn_a, f, l.up_shexp, s.ffn_b, f, s.cur,
+                  c.n_embd, n, ex, error))
+    return false;
   HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
   if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, ex, error)) return false;
 

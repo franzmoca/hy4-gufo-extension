@@ -81,6 +81,12 @@ struct Exec {
 bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uint32_t k, std::uint32_t n,
             const Exec& ex, std::string* error);
 
+/// Two MatVecs over the same x; a batched pass of two weights of one quantized
+/// type quantizes x once. Results equal two MatVec calls.
+bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
+                float* y2, std::uint32_t m2, const float* x, std::uint32_t k,
+                std::uint32_t n, const Exec& ex, std::string* error);
+
 }  // namespace gufo::models::hy4_flash
 
 #endif  // HY4FLASH_RUNTIME_HY4_INTERNAL_HPP_
