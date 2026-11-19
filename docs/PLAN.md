@@ -396,7 +396,29 @@ drafts is inside run-to-run noise.
   also accepts `reasoning_effort` `max`. Every special token carries the
   `:opensource` suffix (`<think:opensource>`, `<｜hy_start:opensource｜>`).
 
+With the drafter (`--dfly-model`, exact verify), the same suites: every case
+of `conversation`, `long-context` and `reasoning-budget` passed; `tools` as
+above. Gufo's runner marks each report failed with "AR request executed
+speculative drafts", since it learns about speculation only from serve's
+`--speculative`, which has no extension backend (an upstream gap, with the
+manifest's `speculative`/`draft_options` fields unread by serve). `cache`
+passed but for one case, `legacy-tool-cancel-disk`
+`content-preserve1-sampled0`: after the disk restart the greedy reply ended
+after one token where the live one ran 12. The restore prefilled 28 + 5
+tokens where the live request prefilled 23 + 5, and batched passes are not
+invariant to how a span is cut into passes; a cold replay of the request
+gives the restored answer too. The test requires greedy replies to survive any
+re-chunking; the runs without the drafter pass only because their cancel
+point, and so their prompts, differ. See "Prefill batch invariance" below.
+
 ## Next decode work
+
+- **Prefill batch invariance.** A token's result depends on the passes its
+  span was cut into (GEMMs over different row counts, the vec path at 8 or
+  fewer), so a restore that re-prefills a gap with other chunk shapes can
+  flip a greedy near tie. Gufo's `cache` suite expects invariance. Making the
+  batched kernels row-independent (MMQ tiles without stream-K, attention per
+  row block over its own keys) is the likely route; measure the prefill cost.
 
 - Sparse layers score every earlier key and mask all but the 2,048 selected
   (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per
