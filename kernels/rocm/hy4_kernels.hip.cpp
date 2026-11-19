@@ -109,39 +109,64 @@ __global__ void RmsNorm(const float* x, const float* weight, float* out, uint32_
 
 // ------------------------------------------------------------- hyper-conn.
 
-// One block per token. hc <= 8 (2 hc mixes at most 16).
-__global__ void HcPre(const float* h, const float* fn, const float* scale, const float* base, float* out,
-                      float* post, uint32_t hc, uint32_t dim, float eps, float hc_eps, float magnitude) {
+// Hyper-connection mixes in two passes, so a single decoded token still
+// spreads over the GPU. The mixes are rs * sum(fn h) with rs the RMS scale of
+// h, so each block sums a slice of fn h and of h^2; HcApply reduces the
+// slices in a fixed order (deterministic) and mixes the streams.
+constexpr uint32_t kHcSlices = 48;
+constexpr uint32_t kHcMaxMix = 16;
+
+// Grid (kHcSlices, n). partial[t][slice][0..n_mix) dots, [n_mix] sum of squares.
+__global__ void HcMix(const float* h, const float* fn, float* partial, uint32_t flat, uint32_t n_mix) {
   __shared__ float scratch[32];
-  __shared__ float pre_s[8];
-  const uint32_t t = blockIdx.x;
-  const uint32_t flat = hc * dim;
+  const uint32_t t = blockIdx.y;
+  const uint32_t per = (flat + kHcSlices - 1) / kHcSlices;
+  const uint32_t lo = blockIdx.x * per;
+  const uint32_t hi = min(flat, lo + per);
   const float* ht = h + (uint64_t)t * flat;
-  const uint32_t n_mix = post ? 2 * hc : hc;
-
-  float ss = 0.0f;
-  for (uint32_t i = threadIdx.x; i < flat; i += blockDim.x) ss += ht[i] * ht[i];
-  ss = BlockSum(ss, scratch);
-  const float rs = rsqrtf(ss / (float)flat + eps);
-
-  float mix[16];
+  float mix[kHcMaxMix];
   for (uint32_t m = 0; m < n_mix; ++m) mix[m] = 0.0f;
-  for (uint32_t i = threadIdx.x; i < flat; i += blockDim.x) {
-    const float v = ht[i] * rs;
+  float ss = 0.0f;
+  for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+    const float v = ht[i];
+    ss += v * v;
     for (uint32_t m = 0; m < n_mix; ++m) mix[m] += fn[(uint64_t)m * flat + i] * v;
   }
-  for (uint32_t m = 0; m < n_mix; ++m) mix[m] = BlockSum(mix[m], scratch);
+  float* out = partial + ((uint64_t)t * kHcSlices + blockIdx.x) * (kHcMaxMix + 1);
+  for (uint32_t m = 0; m < n_mix; ++m) {
+    const float r = BlockSum(mix[m], scratch);
+    if (threadIdx.x == 0) out[m] = r;
+  }
+  const float r = BlockSum(ss, scratch);
+  if (threadIdx.x == 0) out[n_mix] = r;
+}
 
+// Grid (column blocks, n).
+__global__ void HcApply(const float* h, const float* partial, const float* scale, const float* base, float* out,
+                        float* post, uint32_t hc, uint32_t dim, float eps, float hc_eps, float magnitude) {
+  __shared__ float mix_s[kHcMaxMix + 1];
+  __shared__ float pre_s[8];
+  const uint32_t t = blockIdx.y;
+  const uint32_t n_mix = post ? 2 * hc : hc;
+  const float* part = partial + (uint64_t)t * kHcSlices * (kHcMaxMix + 1);
+  if (threadIdx.x <= n_mix) {
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < kHcSlices; ++b) acc += part[b * (kHcMaxMix + 1) + threadIdx.x];
+    mix_s[threadIdx.x] = acc;
+  }
+  __syncthreads();
   if (threadIdx.x == 0) {
+    const float rs = rsqrtf(mix_s[n_mix] / (float)(hc * dim) + eps);
     for (uint32_t i = 0; i < hc; ++i) {
-      pre_s[i] = Sigmoid(mix[i] * scale[0] + base[i]) + hc_eps;
-      if (post) {
-        post[(uint64_t)t * hc + i] = Sigmoid(mix[hc + i] * scale[1] + base[hc + i]) * magnitude + hc_eps;
+      pre_s[i] = Sigmoid(mix_s[i] * rs * scale[0] + base[i]) + hc_eps;
+      if (post && blockIdx.x == 0) {
+        post[(uint64_t)t * hc + i] = Sigmoid(mix_s[hc + i] * rs * scale[1] + base[hc + i]) * magnitude + hc_eps;
       }
     }
   }
   __syncthreads();
-  for (uint32_t c = threadIdx.x; c < dim; c += blockDim.x) {
+  const float* ht = h + (uint64_t)t * hc * dim;
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
     float acc = 0.0f;
     for (uint32_t i = 0; i < hc; ++i) acc += ht[(uint64_t)i * dim + c] * pre_s[i];
     out[(uint64_t)t * dim + c] = acc;
@@ -172,53 +197,87 @@ __global__ void HcInit(const float* x, float* h, uint32_t hc, uint32_t dim) {
 
 constexpr uint32_t kMaxTok = 8;
 
+// Eight consecutive weights as floats, from one 16-byte (F16) or two 16-byte
+// (F32) loads.
 template <typename W>
-__device__ __forceinline__ float LoadW(const W* w, uint64_t i);
+__device__ __forceinline__ void Load8(const W* w, float* out);
 template <>
-__device__ __forceinline__ float LoadW<float>(const float* w, uint64_t i) {
-  return w[i];
+__device__ __forceinline__ void Load8<float>(const float* w, float* out) {
+  const float4 a = *(const float4*)w;
+  const float4 b = *(const float4*)(w + 4);
+  out[0] = a.x; out[1] = a.y; out[2] = a.z; out[3] = a.w;
+  out[4] = b.x; out[5] = b.y; out[6] = b.z; out[7] = b.w;
 }
 template <>
-__device__ __forceinline__ float LoadW<__half>(const __half* w, uint64_t i) {
-  return __half2float(w[i]);
+__device__ __forceinline__ void Load8<__half>(const __half* w, float* out) {
+  const uint4 raw = *(const uint4*)w;
+  const __half2* h2 = (const __half2*)&raw;
+  for (int i = 0; i < 4; ++i) {
+    const float2 f = __half22float2(h2[i]);
+    out[2 * i] = f.x;
+    out[2 * i + 1] = f.y;
+  }
 }
 
-// One block per output row, all tokens (n <= kMaxTok) per weight read.
+
+// Warp per output row, all tokens (n <= kMaxTok) per weight read; k % 8 == 0
+// and rows 16-byte aligned.
 template <typename W>
 __global__ void GemvFloat(const W* w, const float* x, float* y, uint32_t m, uint32_t k, uint32_t n) {
-  __shared__ float scratch[32];
-  const uint32_t r = blockIdx.x;
+  const uint32_t lane = threadIdx.x % warpSize;
+  const uint32_t r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  if (r >= m) return;
   const W* wr = w + (uint64_t)r * k;
   float acc[kMaxTok];
-  for (uint32_t t = 0; t < n; ++t) acc[t] = 0.0f;
-  for (uint32_t i = threadIdx.x; i < k; i += blockDim.x) {
-    const float wv = LoadW<W>(wr, i);
-    for (uint32_t t = 0; t < n; ++t) acc[t] += wv * x[(uint64_t)t * k + i];
+  for (uint32_t t = 0; t < kMaxTok; ++t) acc[t] = 0.0f;
+  for (uint32_t i = lane * 8; i < k; i += warpSize * 8) {
+    float wv[8];
+    Load8<W>(wr + i, wv);
+    for (uint32_t t = 0; t < n; ++t) {
+      const float4 xa = *(const float4*)(x + (uint64_t)t * k + i);
+      const float4 xb = *(const float4*)(x + (uint64_t)t * k + i + 4);
+      acc[t] += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w + wv[4] * xb.x + wv[5] * xb.y +
+                wv[6] * xb.z + wv[7] * xb.w;
+    }
   }
   for (uint32_t t = 0; t < n; ++t) {
-    const float s = BlockSum(acc[t], scratch);
-    if (threadIdx.x == 0) y[(uint64_t)t * m + r] = s;
+    const float s = WarpSum(acc[t]);
+    if (lane == 0) y[(uint64_t)t * m + r] = s;
   }
 }
 
-// One block per (row, group), all tokens per weight read.
+// Warp per (row, group): each lane reads 4 quants (two 16-bit loads, the
+// quants sit at an even offset) so 8 lanes cover a Q8_0 block.
 __global__ void GemvQ8_0Grouped(const BlockQ8_0* w, const float* x, float* y, uint32_t m, uint32_t k,
                                 uint32_t n, uint64_t x_tok, uint64_t x_grp, uint64_t y_tok, uint64_t y_grp) {
-  __shared__ float scratch[32];
-  const uint32_t r = blockIdx.x;
+  const uint32_t lane = threadIdx.x % warpSize;
+  const uint32_t r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
   const uint32_t g = blockIdx.y;
+  if (r >= m) return;
   const uint32_t nb = k / 32;
   const BlockQ8_0* wr = w + ((uint64_t)g * m + r) * nb;
   float acc[kMaxTok];
-  for (uint32_t t = 0; t < n; ++t) acc[t] = 0.0f;
-  for (uint32_t i = threadIdx.x; i < k; i += blockDim.x) {
-    const BlockQ8_0& b = wr[i / 32];
-    const float wv = __half2float(b.d) * (float)b.qs[i % 32];
-    for (uint32_t t = 0; t < n; ++t) acc[t] += wv * x[t * x_tok + g * x_grp + i];
+  for (uint32_t t = 0; t < kMaxTok; ++t) acc[t] = 0.0f;
+  const uint32_t sub = lane % 8;          // 4-quant slice within a block
+  for (uint32_t b = lane / 8; b < nb; b += warpSize / 8) {
+    const BlockQ8_0& blk = wr[b];
+    const float d = __half2float(blk.d);
+    const uint16_t* q16 = (const uint16_t*)blk.qs + sub * 2;
+    const uint16_t lo = q16[0];
+    const uint16_t hi = q16[1];
+    const float w0 = d * (float)(int8_t)(lo & 0xff);
+    const float w1 = d * (float)(int8_t)(lo >> 8);
+    const float w2 = d * (float)(int8_t)(hi & 0xff);
+    const float w3 = d * (float)(int8_t)(hi >> 8);
+    const uint32_t i = b * 32 + sub * 4;
+    for (uint32_t t = 0; t < n; ++t) {
+      const float* xt = x + t * x_tok + g * x_grp + i;
+      acc[t] += w0 * xt[0] + w1 * xt[1] + w2 * xt[2] + w3 * xt[3];
+    }
   }
   for (uint32_t t = 0; t < n; ++t) {
-    const float s = BlockSum(acc[t], scratch);
-    if (threadIdx.x == 0) y[t * y_tok + g * y_grp + r] = s;
+    const float s = WarpSum(acc[t]);
+    if (lane == 0) y[t * y_tok + g * y_grp + r] = s;
   }
 }
 
@@ -581,6 +640,21 @@ __global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
   if (threadIdx.x == 0) out[blockIdx.x] = picked == (int32_t)dim ? 0 : picked;
 }
 
+// Device warp size (32 on gfx1151), for grids of one warp per row.
+uint32_t WarpSize() {
+  static const uint32_t ws = [] {
+    int dev = 0;
+    int v = 32;
+    (void)hipGetDevice(&dev);
+    (void)hipDeviceGetAttribute(&v, hipDeviceAttributeWarpSize, dev);
+    return (uint32_t)v;
+  }();
+  return ws;
+}
+
+// Rows per kBlock-thread block when each row takes one warp.
+uint32_t RowsPerBlock() { return kBlock / WarpSize(); }
+
 uint32_t Blocks(uint64_t count, uint32_t cap = 4096) {
   const uint64_t b = (count + kBlock - 1) / kBlock;
   return (uint32_t)(b < 1 ? 1 : (b > cap ? cap : b));
@@ -609,7 +683,18 @@ int hy4_hc_pre(const float* h, const float* fn, const float* scale, const float*
                uint32_t n, uint32_t hc, uint32_t dim, float eps, float hc_eps, float magnitude, hipStream_t stream) {
   if (n == 0) return 0;
   if (hc > 8) return 1;
-  HcPre<<<n, kBlock, 0, stream>>>(h, fn, scale, base, out, post, hc, dim, eps, hc_eps, magnitude);
+  static thread_local float* partial = nullptr;
+  static thread_local uint32_t partial_tokens = 0;
+  if (n > partial_tokens) {
+    if (partial) (void)hipFree(partial);
+    partial = nullptr;
+    if (hipMalloc(&partial, (size_t)n * kHcSlices * (kHcMaxMix + 1) * sizeof(float)) != hipSuccess) return 1;
+    partial_tokens = n;
+  }
+  const uint32_t n_mix = post ? 2 * hc : hc;
+  HcMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(h, fn, partial, hc * dim, n_mix);
+  HcApply<<<dim3(Blocks(dim, 64), n), kBlock, 0, stream>>>(h, partial, scale, base, out, post, hc, dim, eps, hc_eps,
+                                                         magnitude);
   return Status();
 }
 
@@ -628,14 +713,16 @@ int hy4_hc_init(const float* x, float* h, uint32_t n, uint32_t hc, uint32_t dim,
 
 int hy4_gemv_float(int type, const void* w, const float* x, float* y, uint32_t m, uint32_t k, uint32_t n,
                    hipStream_t stream) {
+  if (k % 8) return 1;
+  const uint32_t blocks = (m + RowsPerBlock() - 1) / RowsPerBlock();
   for (uint32_t t0 = 0; t0 < n; t0 += kMaxTok) {
     const uint32_t nt = n - t0 < kMaxTok ? n - t0 : kMaxTok;
     if (type == HY4_TYPE_F32) {
-      GemvFloat<float><<<m, kBlock, 0, stream>>>((const float*)w, x + (uint64_t)t0 * k, y + (uint64_t)t0 * m, m,
-                                                 k, nt);
+      GemvFloat<float><<<blocks, kBlock, 0, stream>>>((const float*)w, x + (uint64_t)t0 * k,
+                                                                  y + (uint64_t)t0 * m, m, k, nt);
     } else if (type == HY4_TYPE_F16) {
-      GemvFloat<__half><<<m, kBlock, 0, stream>>>((const __half*)w, x + (uint64_t)t0 * k, y + (uint64_t)t0 * m,
-                                                  m, k, nt);
+      GemvFloat<__half><<<blocks, kBlock, 0, stream>>>((const __half*)w, x + (uint64_t)t0 * k,
+                                                                   y + (uint64_t)t0 * m, m, k, nt);
     } else {
       return 1;
     }
@@ -647,10 +734,11 @@ int hy4_gemv_q8_0_grouped(const void* w, const float* x, float* y, uint32_t m, u
                           uint32_t n, uint64_t x_tok, uint64_t x_grp, uint64_t y_tok, uint64_t y_grp,
                           hipStream_t stream) {
   if (k % 32) return 1;
+  const uint32_t blocks = (m + RowsPerBlock() - 1) / RowsPerBlock();
   for (uint32_t t0 = 0; t0 < n; t0 += kMaxTok) {
     const uint32_t nt = n - t0 < kMaxTok ? n - t0 : kMaxTok;
-    GemvQ8_0Grouped<<<dim3(m, groups), 128, 0, stream>>>((const BlockQ8_0*)w, x + t0 * x_tok, y + t0 * y_tok, m,
-                                                         k, nt, x_tok, x_grp, y_tok, y_grp);
+    GemvQ8_0Grouped<<<dim3(blocks, groups), kBlock, 0, stream>>>(
+        (const BlockQ8_0*)w, x + t0 * x_tok, y + t0 * y_tok, m, k, nt, x_tok, x_grp, y_tok, y_grp);
   }
   return Status();
 }
@@ -752,11 +840,7 @@ int hy4_indexer_score(const float* q, const float* w, const float* pooled, const
                       uint32_t n_pool_max, float* score, uint32_t n, uint32_t heads, uint32_t dim,
                       hipStream_t stream) {
   if (n == 0 || n_pool_max == 0) return 0;
-  int dev = 0;
-  int ws = 32;
-  (void)hipGetDevice(&dev);
-  (void)hipDeviceGetAttribute(&ws, hipDeviceAttributeWarpSize, dev);
-  const uint32_t per_block = kBlock / (uint32_t)ws;
+  const uint32_t per_block = RowsPerBlock();
   IndexerScore<<<dim3((n_pool_max + per_block - 1) / per_block, n), kBlock, 0, stream>>>(q, w, pooled, n_pool,
                                                                                          n_pool_max, score, heads,
                                                                                          dim);
