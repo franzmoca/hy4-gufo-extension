@@ -19,6 +19,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E11 | Matrix-core query absorption writing binary16 queries | retained |
 | E12 | Hyper-connection mixing for 8 tokens per block | retained |
 | E13 | One input quantization for paired projections | retained |
+| E14 | Prefill attention softmax on every thread | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -230,3 +231,13 @@ layer's gate with its up, and the shared expert's gate with its up. Same
 kernels on the same quantized input, so results are bit-identical (KL and
 PPL unchanged to the last digit). 3,712-token prefill: 7.95 → 7.90 s (both
 runs). Retained as a small measured gain.
+
+## E14: Prefill attention softmax on every thread (2026-11-19)
+
+In `hy4_mla_prefill` the online softmax of each 32-key tile ran on 32 of the
+block's 256 threads, one per head walking all 32 keys, while the other
+threads waited at the barrier. Eight lanes per head now take four keys each
+and combine their maximum and sum with shuffles. 3,712-token prefill:
+7.90 → 7.49 s (both runs; 470 → 495 tok/s). The denominators sum in another
+order: KL against llama.cpp 0.084 ± 0.008, same top 91.5% (E13: 0.081,
+91.3%). Retained.

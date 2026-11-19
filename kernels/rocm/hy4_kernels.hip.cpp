@@ -797,13 +797,13 @@ __global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
 // 16 heads, so each staged key tile serves 32 heads. Keys come in 32-row
 // tiles staged in LDS as binary16 [key][576]. Scores: wave w of a group
 // multiplies its heads' Q (binary16 in registers) by K over dimensions
-// 144 w .. 144 w + 143; the four partials meet in LDS. Thread h < 32 runs head
-// h's FP32 online softmax, the sink seeding its maximum and denominator, and
-// writes binary16 probabilities. Values: wave w of a group accumulates output
-// dimensions 128 w .. 128 w + 127 in FP32.
-// Fragment layout (wave32 v_wmma_f32_16x16x16_f16): A holds row L%16 and 16
-// contiguous k, B column L%16 and 16 contiguous k; accumulator element i is
-// row 2i + L/16, column L%16.
+// 144 w .. 144 w + 143; the four partials meet in LDS. Threads 8 h .. 8 h + 7
+// run head h's FP32 online softmax, four keys each, the sink seeding its
+// maximum and denominator, and write binary16 probabilities. Values: wave w of
+// a group accumulates output dimensions 128 w .. 128 w + 127 in FP32. Fragment
+// layout (wave32 v_wmma_f32_16x16x16_f16): A holds row L%16 and 16 contiguous
+// k, B column L%16 and 16 contiguous k; accumulator element i is row 2i + L/16,
+// column L%16.
 constexpr uint32_t kMlaDk = 576;
 constexpr uint32_t kMlaDv = 512;
 constexpr uint32_t kMlaHeads = 32;  // two groups of 16, one per 4 waves
@@ -925,31 +925,44 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
     }
     __syncthreads();
 
-    // Online softmax, one thread per head.
-    if (tid < kMlaHeads) {
-      const uint32_t h = tid;
-      float x[kMlaTile];
-      float mx = m_s[h];
+    // Online softmax: eight lanes per head, four keys per lane.
+    {
+      constexpr uint32_t kLanes = 8, kKeys = kMlaTile / kLanes;
+      static_assert(kMlaHeads * kLanes == 32 * kMlaWaves);
+      const uint32_t h = tid / kLanes;
+      const uint32_t k0 = tid % kLanes * kKeys;
+      const float m_old = m_s[h];
+      float x[kKeys];
+      float mx = m_old;
 #pragma unroll
-      for (uint32_t k = 0; k < kMlaTile; ++k) {
+      for (uint32_t k = 0; k < kKeys; ++k) {
         float v = -INFINITY;
-        if (rows[k] >= 0)
-          v = (part[0][h][k] + part[1][h][k] + part[2][h][k] + part[3][h][k]) *
+        if (rows[k0 + k] >= 0)
+          v = (part[0][h][k0 + k] + part[1][h][k0 + k] + part[2][h][k0 + k] +
+               part[3][h][k0 + k]) *
               scale;
         x[k] = v;
         mx = fmaxf(mx, v);
       }
-      const float alpha = mx == -INFINITY ? 1.0f : __expf(m_s[h] - mx);
+#pragma unroll
+      for (uint32_t o = 1; o < kLanes; o <<= 1)
+        mx = fmaxf(mx, __shfl_xor(mx, o));
       float sum = 0.0f;
 #pragma unroll
-      for (uint32_t k = 0; k < kMlaTile; ++k) {
+      for (uint32_t k = 0; k < kKeys; ++k) {
         const float e = x[k] == -INFINITY ? 0.0f : __expf(x[k] - mx);
         sum += e;
-        probs[h * kMlaProbPitch + k] = (_Float16)e;
+        probs[h * kMlaProbPitch + k0 + k] = (_Float16)e;
       }
-      l_s[h] = l_s[h] * alpha + sum;
-      m_s[h] = mx;
-      alpha_s[h] = alpha;
+#pragma unroll
+      for (uint32_t o = 1; o < kLanes; o <<= 1)
+        sum += __shfl_xor(sum, o);
+      if (tid % kLanes == 0) {
+        const float alpha = mx == -INFINITY ? 1.0f : __expf(m_old - mx);
+        l_s[h] = l_s[h] * alpha + sum;
+        m_s[h] = mx;
+        alpha_s[h] = alpha;
+      }
     }
     __syncthreads();
 
