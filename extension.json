@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "name": "hy4flash",
+  "version": "0.1.0",
+  "api_version": ">= 0.3.29",
+  "entry": "hy4flash_register",
+  "registration_target": "gufo_hy4flash",
+  "depends": [],
+  "platforms": ["linux"],
+  "providers": [
+    {
+      "id": "hy4flash",
+      "capability": "text_generation",
+      "keys": ["gguf:hy_v4_flash"],
+      "model_ids": ["Hy4 Flash"],
+      "speculative": ["dfly"],
+      "target": "gufo_hy4flash",
+      "entry": "hy4flash_provider_register",
+      "serving": {"draft_options": {"dfly": "--dfly-model"}}
+    }
+  ],
+  "options": [
+    {
+      "name": "--dfly-model",
+      "type": "path",
+      "commands": ["serve", "bench", "prompt"],
+      "providers": ["hy4flash"],
+      "help": "DFly2 drafter GGUF for --speculative dfly"
+    }
+  ],
+  "targets": {
+    "gufo_hy4flash": {"requires": []}
+  },
+  "licenses": ["LICENSE", "LICENSES/gufo.txt"]
+}
