@@ -21,3 +21,6 @@
   keep only the ring rows a continuation reads (about 35 MB instead of 56 MB);
   older disk caches are not reused
   ([E8](docs/EXPERIMENTS.md#e8-wider-prefill-passes-snapshots-of-live-ring-rows-2026-11-19)).
+- Prefill 14% faster again (360 → 412 tok/s on 3,712 tokens): the prefill
+  attention stages each key tile once for 32 heads
+  ([E10](docs/EXPERIMENTS.md#e10-prefill-attention-32-heads-per-block-2026-11-19)).

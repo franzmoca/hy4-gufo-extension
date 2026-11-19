@@ -14,6 +14,8 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E6 | Prefill results against the pass split | measurement |
 | E7 | Fused matrix-core prefill attention | retained |
 | E8 | 2,048-token prefill passes, snapshots of live ring rows only | retained |
+| E9 | Prefill attention: 16-key tiles with transposed values | rejected |
+| E10 | Prefill attention: 32 heads per block | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -155,3 +157,21 @@ group's indexer rows (about 35 MB, independent of the pass). State ABI v3.
 Gates: KL 0.086 ± 0.008 (same top 91.9%), `--passcheck 8` exact, `cache` and
 `long-context` suites pass apart from the case recorded in QUALITY.md, every
 disk and RAM restore included.
+
+## E9: Prefill attention with transposed values (2026-11-19)
+
+E7's P.V gathers each value fragment strided from the key tile. Staging the
+tile a second time transposed (`[512][16 + 8]` binary16, 16-key tiles to fit
+LDS) makes the fragments contiguous loads, but doubles the barriers per key
+and the transposed stores conflict: 3,712-token prefill 10.32 → 10.95 s and
+11.00 s. Rejected.
+
+## E10: Prefill attention, 32 heads per block (2026-11-19)
+
+With 16 heads per block, every key tile was read from memory and converted
+to binary16 twice for the 32-head layers and four times for the 64-head
+window layers. Blocks of 32 heads (eight waves, two groups of four sharing
+the staged tile; 56 KB LDS) halve that. Each head's arithmetic is unchanged.
+3,712-token prefill (`hy4_eval_probe`): 10.32 → 9.00 s and 9.02 s
+(360 → 412 tok/s). KL against llama.cpp 0.0855 ± 0.008, same top 91.89%, as
+in E8; `kernels_test` passes. Retained.

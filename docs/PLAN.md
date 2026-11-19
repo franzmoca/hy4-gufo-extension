@@ -481,7 +481,8 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   which the SGEMM attention made slower: now that attention scales with each
   token's own keys, fewer, wider passes should cut MMQ's re-reads of the
   experts (8.9 s, the largest share now). Done as E8: 2,048-token passes,
-  14.7 → 10.3 s.
+  14.7 → 10.3 s. V transposed in LDS was slower (E9); 32 heads per block:
+  10.3 → 9.0 s (E10).
 
 - **Designs to borrow for the prefill attention.** ds41's
   `attention_f16_kernel` (`ds41_v41.hip.cpp`) is the same MLA shape: block

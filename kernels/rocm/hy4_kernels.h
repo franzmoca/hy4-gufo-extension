@@ -95,7 +95,7 @@ int hy4_mla_attention(const float* q, const float* cache, uint32_t ring, const i
  * k - lo of `keys` [rows][dk] (a gathered window or the whole cache from 0);
  * token t sees max(lo, pos[t] - window + 1) .. pos[t] (lo without a window),
  * or the positions of sel[t, 0:n_sel] in that range. dk must be 576, dv 512
- * and heads a multiple of 16. */
+ * and heads a multiple of 32. */
 int hy4_mla_prefill(const float* q, const float* keys, int32_t lo,
                     const int32_t* pos, uint32_t window, const int32_t* sel,
                     uint32_t n_sel, const float* sinks, float scale, float* out,

@@ -737,24 +737,27 @@ __global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
 
 // MLA prefill attention on the matrix cores, each token over exactly its own
 // keys, so its result does not depend on the pass it is evaluated in.
-// Block (token, 16 heads), four waves. Keys come in 32-row tiles staged in LDS
-// as binary16 [key][576]. Scores: wave w multiplies the heads' Q (binary16 in
-// registers) by K over dimensions 144 w .. 144 w + 143; the four partials
-// meet in LDS. Thread h < 16 runs head h's FP32 online softmax, the sink
-// seeding its maximum and denominator, and writes binary16 probabilities.
-// Values: wave w accumulates output dimensions 128 w .. 128 w + 127 in FP32.
+// Block (token, 32 heads), eight waves in two groups of four, one group per
+// 16 heads, so each staged key tile serves 32 heads. Keys come in 32-row
+// tiles staged in LDS as binary16 [key][576]. Scores: wave w of a group
+// multiplies its heads' Q (binary16 in registers) by K over dimensions
+// 144 w .. 144 w + 143; the four partials meet in LDS. Thread h < 32 runs head
+// h's FP32 online softmax, the sink seeding its maximum and denominator, and
+// writes binary16 probabilities. Values: wave w of a group accumulates output
+// dimensions 128 w .. 128 w + 127 in FP32.
 // Fragment layout (wave32 v_wmma_f32_16x16x16_f16): A holds row L%16 and 16
 // contiguous k, B column L%16 and 16 contiguous k; accumulator element i is
 // row 2i + L/16, column L%16.
 constexpr uint32_t kMlaDk = 576;
 constexpr uint32_t kMlaDv = 512;
-constexpr uint32_t kMlaHeads = 16;
-constexpr uint32_t kMlaWaves = 4;
+constexpr uint32_t kMlaHeads = 32;  // two groups of 16, one per 4 waves
+constexpr uint32_t kMlaWaves = 8;
+constexpr uint32_t kMlaSplit = 4;  // waves per head group
 constexpr uint32_t kMlaTile = 32;
 constexpr uint32_t kMlaKtPitch = kMlaDk + 8;      // halves; 16-byte rows
 constexpr uint32_t kMlaProbPitch = kMlaTile + 8;  // halves
-constexpr uint32_t kMlaQkSteps = kMlaDk / kMlaWaves / 16;  // 9
-constexpr uint32_t kMlaPvTiles = kMlaDv / kMlaWaves / 16;  // 8
+constexpr uint32_t kMlaQkSteps = kMlaDk / kMlaSplit / 16;  // 9
+constexpr uint32_t kMlaPvTiles = kMlaDv / kMlaSplit / 16;  // 8
 
 using MlaHalf16 =
     __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
@@ -795,7 +798,7 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
                uint32_t heads) {
   __shared__ __align__(16) _Float16 kt[kMlaTile * kMlaKtPitch];
   __shared__ __align__(16) _Float16 probs[kMlaHeads * kMlaProbPitch];
-  __shared__ float part[kMlaWaves][kMlaHeads][kMlaTile];
+  __shared__ float part[kMlaSplit][kMlaHeads][kMlaTile];
   __shared__ int32_t rows[kMlaTile];
   __shared__ float m_s[kMlaHeads], l_s[kMlaHeads], alpha_s[kMlaHeads];
 
@@ -806,6 +809,8 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
   const uint32_t wave = tid / 32;
   const uint32_t row = lane % 16;
   const uint32_t half = lane / 16;
+  const uint32_t hg = (wave / kMlaSplit) * 16;  // this wave's head group
+  const uint32_t sub = wave % kMlaSplit;        // its slice of dimensions
 
   const int32_t p = pos[t];
   const int32_t lo_t = window ? max(lo, p - (int32_t)window + 1) : lo;
@@ -817,8 +822,8 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
   // This wave's slice of the 16 heads' queries, binary16.
   MlaHalf16 qa[kMlaQkSteps];
   {
-    const float* qr = q + ((uint64_t)t * heads + h0 + row) * kMlaDk +
-                      wave * (kMlaDk / kMlaWaves);
+    const float* qr = q + ((uint64_t)t * heads + h0 + hg + row) * kMlaDk +
+                      sub * (kMlaDk / kMlaSplit);
 #pragma unroll
     for (uint32_t s = 0; s < kMlaQkSteps; ++s)
 #pragma unroll
@@ -856,13 +861,13 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
     for (uint32_t b = 0; b < kMlaTile / 16; ++b) {
       MlaFloat8 sc = {};
       const _Float16* kr =
-          kt + (b * 16 + row) * kMlaKtPitch + wave * (kMlaDk / kMlaWaves);
+          kt + (b * 16 + row) * kMlaKtPitch + sub * (kMlaDk / kMlaSplit);
 #pragma unroll
       for (uint32_t s = 0; s < kMlaQkSteps; ++s)
         sc = MlaWmma(qa[s], MlaLoad16(kr + s * 16), sc);
 #pragma unroll
       for (uint32_t i = 0; i < 8; ++i)
-        part[wave][2 * i + half][b * 16 + row] = sc[i];
+        part[sub][hg + 2 * i + half][b * 16 + row] = sc[i];
     }
     __syncthreads();
 
@@ -897,17 +902,18 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
     // Rescale and accumulate this wave's output dimensions.
 #pragma unroll
     for (uint32_t i = 0; i < 8; ++i) {
-      const float a = alpha_s[2 * i + half];
+      const float a = alpha_s[hg + 2 * i + half];
 #pragma unroll
       for (uint32_t c = 0; c < kMlaPvTiles; ++c)
         acc[c][i] *= a;
     }
 #pragma unroll
     for (uint32_t b = 0; b < kMlaTile / 16; ++b) {
-      const MlaHalf16 pa = MlaLoad16(probs + row * kMlaProbPitch + b * 16);
+      const MlaHalf16 pa =
+          MlaLoad16(probs + (hg + row) * kMlaProbPitch + b * 16);
 #pragma unroll
       for (uint32_t c = 0; c < kMlaPvTiles; ++c) {
-        const uint32_t d = wave * (kMlaDv / kMlaWaves) + c * 16 + row;
+        const uint32_t d = sub * (kMlaDv / kMlaSplit) + c * 16 + row;
         MlaHalf16 vb;
 #pragma unroll
         for (uint32_t k = 0; k < 16; ++k)
@@ -920,11 +926,11 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
 
 #pragma unroll
   for (uint32_t i = 0; i < 8; ++i) {
-    const uint32_t h = 2 * i + half;
+    const uint32_t h = hg + 2 * i + half;
     const float l = l_s[h];
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
     float* orow = out + ((uint64_t)t * heads + h0 + h) * kMlaDv +
-                  wave * (kMlaDv / kMlaWaves) + row;
+                  sub * (kMlaDv / kMlaSplit) + row;
 #pragma unroll
     for (uint32_t c = 0; c < kMlaPvTiles; ++c)
       orow[c * 16] = acc[c][i] * inv;
