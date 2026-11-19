@@ -59,8 +59,9 @@ public:
 private:
   struct Layer;
   VisionEncoder() = default;
-  bool Linear(const float* w, const float* x, float* y, std::uint32_t rows,
-              std::uint32_t out, std::uint32_t in, std::string* error);
+  bool Linear(const std::uint16_t* w, const float* x, float* y,
+              std::uint32_t rows, std::uint32_t out, std::uint32_t in,
+              std::string* error);
 
   std::string path_;
   mutable std::once_flag identity_once_;
@@ -69,16 +70,18 @@ private:
   hipStream_t stream_ = nullptr;
   void* blas_ = nullptr;  // hipblasHandle_t
   std::vector<Layer> layers_;
-  const float* patch_w_ = nullptr;  // [hidden][3 * kPatch * kPatch]
+  // Matrices are binary16 bits.
+  const std::uint16_t* patch_w_ = nullptr;  // [hidden][3 * kPatch * kPatch]
   const float* patch_b_ = nullptr;
   std::vector<float> positions_;  // [grid][grid][hidden], host
   std::uint32_t grid_ = 0;        // learned position grid side
   const float* merge_norm_ = nullptr;
-  const float* merge_w_ = nullptr;  // [4 hidden][4 hidden]
+  const std::uint16_t* merge_w_ = nullptr;  // [4 hidden][4 hidden]
   const float* merge_b_ = nullptr;
-  const float* proj_w_ = nullptr;  // [out_width][4 hidden]
+  const std::uint16_t* proj_w_ = nullptr;  // [out_width][4 hidden]
   const float* proj_b_ = nullptr;
   const float* newline_ = nullptr;  // [out_width]
+  std::uint16_t* xh_ = nullptr;     // Encode's binary16 GEMM input
   std::vector<void*> allocations_;
   std::uint64_t resident_bytes_ = 0;
 };

@@ -11,6 +11,7 @@
 #include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/sha256.hpp>
 #include <string_view>
+#include <type_traits>
 
 #include "kernels/rocm/hy4_kernels.h"
 #include "kernels/rocm/hy4_vision.h"
@@ -26,8 +27,38 @@ constexpr std::uint32_t kLayers = 27;
 constexpr std::uint32_t kPatchValues =
     3 * VisionEncoder::kPatch * VisionEncoder::kPatch;
 constexpr float kNormEps = 1e-5f;
-// Attention scores per query chunk, in floats (256 MiB).
-constexpr std::uint64_t kScoreFloats = std::uint64_t{64} << 20;
+
+// Binary16 bits of v, rounded to nearest even (the weights are well inside
+// the binary16 range).
+std::uint16_t ToHalfBits(float v) {
+  std::uint32_t x;
+  std::memcpy(&x, &v, sizeof x);
+  const std::uint32_t sign = (x >> 16) & 0x8000u;
+  const std::int32_t exp =
+      static_cast<std::int32_t>((x >> 23) & 0xff) - 127 + 15;
+  std::uint32_t mant = x & 0x7fffffu;
+  if (exp >= 31)
+    return static_cast<std::uint16_t>(sign | 0x7bffu);
+  if (exp <= 0) {
+    if (exp < -10)
+      return static_cast<std::uint16_t>(sign);
+    mant |= 0x800000u;
+    const std::uint32_t shift = static_cast<std::uint32_t>(14 - exp);
+    std::uint32_t half = mant >> shift;
+    const std::uint32_t rest = mant & ((1u << shift) - 1);
+    const std::uint32_t mid = 1u << (shift - 1);
+    if (rest > mid || (rest == mid && (half & 1)))
+      ++half;
+    return static_cast<std::uint16_t>(sign | half);
+  }
+  std::uint32_t half = (static_cast<std::uint32_t>(exp) << 10) | (mant >> 13);
+  const std::uint32_t rest = mant & 0x1fffu;
+  if (rest > 0x1000u || (rest == 0x1000u && (half & 1)))
+    ++half;
+  if (half >= 0x7c00u)
+    half = 0x7bffu;
+  return static_cast<std::uint16_t>(sign | half);
+}
 
 bool Fail(std::string* error, std::string message) {
   if (error)
@@ -64,9 +95,12 @@ struct Buffer {
 
 }  // namespace
 
+// Matrices are binary16 bits (BF16 weights converted on upload); norms and
+// biases FP32.
 struct VisionEncoder::Layer {
-  const float *ln1_w, *ln1_b, *q_w, *q_b, *k_w, *k_b, *v_w, *v_b, *o_w, *o_b;
-  const float *ln2_w, *ln2_b, *up_w, *up_b, *down_w, *down_b;
+  const float *ln1_w, *ln1_b, *q_b, *k_b, *v_b, *o_b, *ln2_w, *ln2_b, *up_b,
+      *down_b;
+  const std::uint16_t *q_w, *k_w, *v_w, *o_w, *up_w, *down_w;
 };
 
 DeviceRows::~DeviceRows() {
@@ -141,8 +175,12 @@ std::unique_ptr<VisionEncoder> VisionEncoder::Load(const std::string& path,
     }
     return true;
   };
+  std::vector<std::uint16_t> halves;
   const auto get = [&](const std::string& name, std::uint64_t count,
-                       const float** out) -> bool {
+                       auto** out) -> bool {
+    using T = std::remove_const_t<
+        std::remove_pointer_t<std::remove_pointer_t<decltype(out)>>>;
+    constexpr bool kHalf = std::is_same_v<T, std::uint16_t>;
     const auto* t = r.FindTensor(name);
     if (!t)
       return Fail(error, "hy4 vision: missing tensor " + name);
@@ -150,17 +188,25 @@ std::unique_ptr<VisionEncoder> VisionEncoder::Load(const std::string& path,
       return Fail(error, "hy4 vision: unexpected size of " + name);
     if (!to_f32(*t))
       return false;
+    const void* source = host.data();
+    std::uint64_t bytes = count * sizeof(float);
+    if constexpr (kHalf) {
+      halves.resize(count);
+      for (std::uint64_t i = 0; i < count; ++i)
+        halves[i] = ToHalfBits(host[i]);
+      source = halves.data();
+      bytes = count * sizeof(std::uint16_t);
+    }
     void* dev = nullptr;
-    const hipError_t status = hipMalloc(&dev, count * sizeof(float));
+    const hipError_t status = hipMalloc(&dev, bytes);
     if (status != hipSuccess)
       return Fail(error, HipError("weight allocation", status));
     e->allocations_.push_back(dev);
-    if (hipMemcpy(dev, host.data(), count * sizeof(float),
-                  hipMemcpyHostToDevice) != hipSuccess) {
+    if (hipMemcpy(dev, source, bytes, hipMemcpyHostToDevice) != hipSuccess) {
       return Fail(error, "hy4 vision: weight upload failed");
     }
-    e->resident_bytes_ += count * sizeof(float);
-    *out = static_cast<const float*>(dev);
+    e->resident_bytes_ += bytes;
+    *out = static_cast<const T*>(dev);
     return true;
   };
 
@@ -225,16 +271,22 @@ const std::string& VisionEncoder::Identity() const {
   return identity_;
 }
 
-bool VisionEncoder::Linear(const float* w, const float* x, float* y,
+bool VisionEncoder::Linear(const std::uint16_t* w, const float* x, float* y,
                            std::uint32_t rows, std::uint32_t out,
                            std::uint32_t in, std::string* error) {
+  // Binary16 operands, FP32 accumulation and output.
+  if (hy4_vis_to_half(x, xh_, std::uint64_t{rows} * in, stream_) != 0) {
+    return Fail(error, "hy4 vision: conversion failed");
+  }
   const float one = 1.0f;
   const float zero = 0.0f;
-  if (hipblasSgemm(static_cast<hipblasHandle_t>(blas_), HIPBLAS_OP_T,
-                   HIPBLAS_OP_N, static_cast<int>(out), static_cast<int>(rows),
-                   static_cast<int>(in), &one, w, static_cast<int>(in), x,
-                   static_cast<int>(in), &zero, y,
-                   static_cast<int>(out)) != HIPBLAS_STATUS_SUCCESS) {
+  if (hipblasGemmEx(static_cast<hipblasHandle_t>(blas_), HIPBLAS_OP_T,
+                    HIPBLAS_OP_N, static_cast<int>(out), static_cast<int>(rows),
+                    static_cast<int>(in), &one, w, HIP_R_16F,
+                    static_cast<int>(in), xh_, HIP_R_16F, static_cast<int>(in),
+                    &zero, y, HIP_R_32F, static_cast<int>(out),
+                    HIPBLAS_COMPUTE_32F,
+                    HIPBLAS_GEMM_DEFAULT) != HIPBLAS_STATUS_SUCCESS) {
     return Fail(error, "hy4 vision: GEMM failed");
   }
   return true;
@@ -256,7 +308,6 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
   const std::uint32_t ow = gw / kMerge;
   const std::uint32_t merged = oh * ow;
   hipStream_t st = stream_;
-  auto* blas = static_cast<hipblasHandle_t>(blas_);
 
   // Patches in raster order, each (channel, y, x), rescaled and normalized
   // with mean and std 0.5.
@@ -318,22 +369,25 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
     }
   }
 
-  const std::uint32_t chunk =
-      static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
-          kScoreFloats / (std::uint64_t{kHeads} * n), 1, n));
-  Buffer in, x, t, q, k, v, att, ffn, scores, m1, m2, out;
+  // Binary16 attention operands, in floats.
+  const std::uint64_t packed =
+      std::uint64_t{kHeads} * 80 * hy4_vis_attn_padded(n) / 2;
+  Buffer in, x, t, q, k, v, att, ffn, qh, kh, vt, m1, m2, out, xh;
   const std::uint64_t rows = std::uint64_t{n} * kHidden;
   if (!in.Allocate(std::uint64_t{n} * kPatchValues, error) ||
       !x.Allocate(rows, error) || !t.Allocate(rows, error) ||
       !q.Allocate(rows, error) || !k.Allocate(rows, error) ||
       !v.Allocate(rows, error) || !att.Allocate(rows, error) ||
       !ffn.Allocate(std::uint64_t{n} * kFfn, error) ||
-      !scores.Allocate(std::uint64_t{kHeads} * chunk * n, error) ||
+      !qh.Allocate(packed, error) || !kh.Allocate(packed, error) ||
+      !vt.Allocate(packed, error) ||
+      !xh.Allocate((std::uint64_t{n} * kFfn + 1) / 2, error) ||
       !m1.Allocate(std::uint64_t{merged} * 4 * kHidden, error) ||
       !m2.Allocate(std::uint64_t{merged} * out_width_, error) ||
       !out.Allocate(std::uint64_t{oh} * (ow + 1) * out_width_, error)) {
     return nullptr;
   }
+  xh_ = reinterpret_cast<std::uint16_t*>(xh.data);
   const auto run = [&]() -> bool {
     if (hipMemcpyAsync(in.data, patches.data(), patches.size() * sizeof(float),
                        hipMemcpyHostToDevice, st) != hipSuccess ||
@@ -346,8 +400,6 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
     HY4V_CHECK(hy4_vis_residual(x.data, t.data, patch_b_, n, kHidden, st));
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
-    const float one = 1.0f;
-    const float zero = 0.0f;
     for (const Layer& l : layers_) {
       HY4V_CHECK(hy4_vis_layer_norm(x.data, l.ln1_w, l.ln1_b, t.data, n,
                                     kHidden, kNormEps, st));
@@ -359,29 +411,10 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
       HY4V_CHECK(hy4_vis_bias(q.data, l.q_b, n, kHidden, 0, st));
       HY4V_CHECK(hy4_vis_bias(k.data, l.k_b, n, kHidden, 0, st));
       HY4V_CHECK(hy4_vis_bias(v.data, l.v_b, n, kHidden, 0, st));
-      // Per head h and query chunk: S [m][n] = scale Q_h K_h^T, softmax,
-      // O_h = S V_h (column-major: S^T = K_h Q_h^T, O_h^T = V_h^T S^T).
-      for (std::uint32_t q0 = 0; q0 < n; q0 += chunk) {
-        const std::uint32_t m = std::min(chunk, n - q0);
-        const auto per_head = static_cast<hipblasStride>(std::uint64_t{m} * n);
-        if (hipblasSgemmStridedBatched(
-                blas, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(n),
-                static_cast<int>(m), static_cast<int>(kHeadDim), &scale, k.data,
-                kHidden, kHeadDim, q.data + std::size_t{q0} * kHidden, kHidden,
-                kHeadDim, &zero, scores.data, static_cast<int>(n), per_head,
-                kHeads) != HIPBLAS_STATUS_SUCCESS) {
-          return Fail(error, "hy4 vision: score GEMM failed");
-        }
-        HY4V_CHECK(hy4_vis_softmax(scores.data, kHeads * m, n, st));
-        if (hipblasSgemmStridedBatched(
-                blas, HIPBLAS_OP_N, HIPBLAS_OP_N, static_cast<int>(kHeadDim),
-                static_cast<int>(m), static_cast<int>(n), &one, v.data, kHidden,
-                kHeadDim, scores.data, static_cast<int>(n), per_head, &zero,
-                att.data + std::size_t{q0} * kHidden, kHidden, kHeadDim,
-                kHeads) != HIPBLAS_STATUS_SUCCESS) {
-          return Fail(error, "hy4 vision: value GEMM failed");
-        }
-      }
+      HY4V_CHECK(hy4_vis_attention(
+          q.data, k.data, v.data, scale, reinterpret_cast<uint16_t*>(qh.data),
+          reinterpret_cast<uint16_t*>(kh.data),
+          reinterpret_cast<uint16_t*>(vt.data), att.data, n, st));
       if (!Linear(l.o_w, att.data, t.data, n, kHidden, kHidden, error))
         return false;
       HY4V_CHECK(hy4_vis_residual(x.data, t.data, l.o_b, n, kHidden, st));

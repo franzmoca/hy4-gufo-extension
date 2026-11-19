@@ -311,8 +311,12 @@ These are judgment calls made without the maintainer; revisit any of them.
       extends the cache identity. The metadata component carries the rope
       offset and the rope position of the open pool group's first member, so
       a restore continues the positions.
-    - The tower runs in FP32 (hipBLAS SGEMM) at first; attention is chunked
-      by queries.
+    - The tower keeps FP32 activations, norms and residuals. Projections
+      take binary16 operands with FP32 accumulation (hipBLAS `GemmEx`, BF16
+      weights converted at load), and attention runs fused on the matrix
+      cores (Gemma 4's kernel for the same 72-wide heads, scale folded into
+      Q). At 2048² this takes 4.8 s instead of 37.5 s in FP32, 1.1e-3 relative
+      RMS from the FP32 rows.
 
 ## Phases
 
@@ -397,8 +401,11 @@ Vision (decision 19), with DFly2 drafting:
   `red, blue`. With that comparison ignoring the space (a local copy of the
   test) the whole suite passed. Both runs are flagged only because the
   harness rejects extension speculative drafts (as before).
-- Cost: encoding a 2048² image takes 37.5 s in FP32 (16,384 patches; the
-  attention over all of them dominates), out of a 58 s first token.
+- Cost at 2048² (16,384 patches): the FP32 tower took 37.5 s, of a 58 s
+  first token; most of it was attention (strided SGEMMs over 72-wide heads,
+  31.7 s, plus 5.8 s of softmax). Fused binary16 attention and binary16 GEMM
+  operands bring it to 4.8 s (projections 2.4 s, attention 1.9 s) and the
+  first token to 25 s, with the same answers. Both suites passed again.
 
 ## Read from the Tencent files
 
@@ -473,9 +480,10 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   token, and a verify pass now reads it once per token. Gathering only the
   selected rows (as the drafter does) cuts both.
 
-- **Vision tower speed.** FP32 SGEMM and a materialized 16-head score
-  matrix: 37.5 s at 2048². Fused F16/WMMA attention and F16 weights are the
-  likely route; check against the numpy reference.
+- **Vision tower projections.** hipBLAS picks a non-WMMA kernel
+  (`MT64x32x8`, about 5.6 TFLOPS) for the binary16 projections: 2.4 s of a
+  4.8 s encode at 2048². A WMMA GEMM could halve the encode; the text prefill
+  of the same image (about 20 s for 4,193 tokens) is the larger cost.
 
 ## Open questions
 

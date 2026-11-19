@@ -20,10 +20,6 @@ int hy4_vis_bias(float* y, const float* bias, uint32_t rows, uint32_t dim,
 int hy4_vis_residual(float* x, const float* y, const float* bias, uint32_t rows,
                      uint32_t dim, hipStream_t stream);
 
-/* In-place softmax of each of `rows` rows of `cols` scores. */
-int hy4_vis_softmax(float* scores, uint32_t rows, uint32_t cols,
-                    hipStream_t stream);
-
 /* The 2x2 stride-2 convolution's input columns: x is the patch grid
  * [gh][gw][dim]; out row (i * gw/2 + j) holds, at ic * 4 + kh * 2 + kw, patch
  * (2i + kh, 2j + kw)'s channel ic (the GGUF kernel's [oc][ic][kh][kw] order).
@@ -35,5 +31,20 @@ int hy4_vis_merge_gather(const float* x, uint32_t gh, uint32_t gw, uint32_t dim,
  * followed by `newline`. */
 int hy4_vis_newline(const float* src, const float* newline, float* dst,
                     uint32_t oh, uint32_t ow, uint32_t dim, hipStream_t stream);
+
+/* y = binary16 bits of x, saturated to the finite range. */
+int hy4_vis_to_half(const float* x, uint16_t* y, uint64_t count,
+                    hipStream_t stream);
+
+/* Keys per padded attention operand: count rounded up to whole key tiles. */
+uint32_t hy4_vis_attn_padded(uint32_t count);
+
+/* Bidirectional attention of 16 heads of 72 over `count` FP32 rows q, k, v
+ * [count][1152] into out [count][1152], softmax(scale q k^T) v, on the matrix
+ * cores in binary16 with FP32 accumulation and softmax. qh, kh and vt are
+ * scratch of 16 * 80 * hy4_vis_attn_padded(count) binary16 values each. */
+int hy4_vis_attention(const float* q, const float* k, const float* v,
+                      float scale, uint16_t* qh, uint16_t* kh, uint16_t* vt,
+                      float* out, uint32_t count, hipStream_t stream);
 
 #endif /* HY4FLASH_KERNELS_ROCM_HY4_VISION_H_ */
