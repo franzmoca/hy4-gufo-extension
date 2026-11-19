@@ -520,6 +520,20 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   Gemma 4's `FusedAttention` (in the vision tower, E4) is the simplest
   wave-per-16-queries form.
 
+- **Decode profile** (2026-11-20, 400-token prompt, 64 tokens AR, 16.0
+  tok/s, 62.4 ms per token untraced): kernels 57.3 ms, of which the Q8_0
+  GEMVs 28.3 ms at about 237 GB/s, the F16 LM head 3.1 ms, the grouped
+  `wk_b`/`wv_b` GEMVs 3.5 ms, routed and latent GEMVs 14 ms: all at the
+  bandwidth their reads allow. The other ~5 ms is about 2,540 launches per
+  token (557 activation quantizations, 265 RMS norms, 434 Q8_0 GEMVs). DS41
+  measured graph replay on this device to save only ~0.13 µs per launch
+  (its E44), so only fewer launches help: quantize each GEMV input once
+  where several GEMVs share it (about 210 launches), fuse the norms into
+  their neighbours. Each is under 1% of a token, inside decode's run-to-run
+  noise, so measure them together. The larger decode lever stays a
+  lower-bit attention quant (half the bytes per token), a model-format
+  choice rather than a kernel one.
+
 - **Prefill batch invariance.** A token's result depends on the passes its
   span was cut into (GEMMs over different row counts, the vec path at 8 or
   fewer), so a restore that re-prefills a gap with other chunk shapes can
