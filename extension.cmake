@@ -113,24 +113,24 @@ if(TARGET gufo_hy4flash_text)
   target_compile_options(gufo_hy4flash_text PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-O3>)
 endif()
 
-# Probes against a model: built by `hy4flash_probes`, not by default.
-if(BUILD_TESTING AND TARGET gufo_hy4flash_hip)
-  if(NOT TARGET hy4flash_probes)
-    add_custom_target(hy4flash_probes)
-  endif()
-  foreach(name IN ITEMS eval_probe tokenize_probe vision_probe)
-    gufo_extension_target(
-      NAME hy4flash_${name}
-      SOURCES tools/probe/${name}.cpp
-      LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip gufo_ext_runtime
-    )
-    if(TARGET hy4flash_${name})
-      set_target_properties(hy4flash_${name} PROPERTIES
-        EXCLUDE_FROM_ALL TRUE OUTPUT_NAME hy4_${name})
-      add_dependencies(hy4flash_probes hy4flash_${name})
-    endif()
-  endforeach()
+# Probes against a model: built by `hy4flash_probes`, not by default. Every
+# declared target goes through gufo_extension_target, which disables it
+# without testing.
+if(BUILD_TESTING AND NOT TARGET hy4flash_probes)
+  add_custom_target(hy4flash_probes)
 endif()
+foreach(name IN ITEMS eval_probe tokenize_probe vision_probe)
+  gufo_extension_target(
+    NAME hy4flash_${name}
+    SOURCES tools/probe/${name}.cpp
+    LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip gufo_ext_runtime
+  )
+  if(TARGET hy4flash_${name})
+    set_target_properties(hy4flash_${name} PROPERTIES
+      EXCLUDE_FROM_ALL TRUE OUTPUT_NAME hy4_${name})
+    add_dependencies(hy4flash_probes hy4flash_${name})
+  endif()
+endforeach()
 
 # Tests. Host contracts need no GPU; kernel checks need gfx1151 but no model.
 # `hy4flash_tests` builds every test binary, so ctest never runs a stale one.
@@ -159,14 +159,12 @@ endfunction()
 
 _hy4flash_test(chat_template "cpu;tokenization;tools"
   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
-if(ENGINE_ENABLE_HIP)
-  _hy4flash_test(vision_prompt "cpu;vision"
-    LINK_LIBRARIES gufo_hy4flash_text gufo_hy4flash_hip gufo_hy4flash gufo_ext_hip)
-  foreach(name IN ITEMS kernels vision_kernels)
-    _hy4flash_test(${name} "hip;gpu;gfx1151"
-      LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip)
-  endforeach()
-endif()
+_hy4flash_test(vision_prompt "cpu;vision"
+  LINK_LIBRARIES gufo_hy4flash_text gufo_hy4flash_hip gufo_hy4flash gufo_ext_hip)
+foreach(name IN ITEMS kernels vision_kernels)
+  _hy4flash_test(${name} "hip;gpu;gfx1151"
+    LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip)
+endforeach()
 
 install(FILES
   "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"
