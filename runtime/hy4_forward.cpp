@@ -189,6 +189,8 @@ bool Model::AllocScratch(std::string* error) {
       DeviceAlloc(&s.logits_r, std::size_t{n} * c.n_expert, owned) &&
       DeviceAlloc(&s.ids, std::size_t{n} * c.n_expert_used, owned) &&
       HostAlloc(&s.ids_host, std::size_t{n} * c.n_expert_used, owned) &&
+      DeviceAlloc(&s.expert_class, c.n_expert, owned) &&
+      HostAlloc(&s.expert_class_host, c.n_expert, owned) &&
       DeviceAlloc(&s.route_w, std::size_t{n} * c.n_expert_used, owned) &&
       DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) &&
       DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
@@ -788,7 +790,14 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
     std::vector<unsigned int> counts(c.n_expert, 0);
     for (std::uint32_t i = 0; i < n * used; ++i) ++counts[static_cast<std::uint32_t>(s.ids_host[i]) % c.n_expert];
     hy4_mmq_set_routed_max_expert_rows(static_cast<int>(*std::max_element(counts.begin(), counts.end())));
-    hy4_mmq_set_routed_tile_cols(hy4_mmq_routed_tile_cols_for_counts(counts.data(), static_cast<int>(c.n_expert)));
+    // A column-tile width per expert, from its bucket size.
+    int widths[3], max_rows[3];
+    const int n_classes = hy4_mmq_routed_classes_for_counts(
+        counts.data(), static_cast<int>(c.n_expert), s.expert_class_host,
+        widths, max_rows);
+    HY4_CHECK(hipMemcpyAsync(s.expert_class, s.expert_class_host, c.n_expert,
+                             hipMemcpyHostToDevice, st));
+    hy4_mmq_set_routed_classes(s.expert_class, n_classes, widths, max_rows);
     HY4_CHECK(hy4_mmq_moe_swiglu_typed(l.gate_exps.type, l.gate_exps.data, l.up_exps.data, s.latent, s.ids,
                                        s.route_w, s.ffn_a, s.ffn_c, static_cast<int>(f),
                                        static_cast<int>(c.n_latent), static_cast<int>(n),
@@ -797,7 +806,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
                                 static_cast<int>(c.n_latent), static_cast<int>(f), static_cast<int>(n * used),
                                 static_cast<int>(c.n_expert), 1, st));
     hy4_mmq_set_routed_max_expert_rows(0);
-    hy4_mmq_set_routed_tile_cols(0);
+    hy4_mmq_set_routed_classes(nullptr, 0, nullptr, nullptr);
     HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
     if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
     HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));

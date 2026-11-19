@@ -21,14 +21,16 @@
   keep only the ring rows a continuation reads (about 35 MB instead of 56 MB);
   older disk caches are not reused
   ([E8](docs/EXPERIMENTS.md#e8-wider-prefill-passes-snapshots-of-live-ring-rows-2026-11-19)).
-- Prefill 42% faster again (360 → 509 tok/s on 3,712 tokens): the prefill
+- Prefill 44% faster again (360 → 517 tok/s on 3,712 tokens): the prefill
   attention stages each key tile once for 32 heads from keys converted to
   binary16 once per pass, and runs its softmax on every thread, the query absorption runs on the matrix cores with exact
-  weights, the hyper-connection mix reads its weights once per 8 tokens, and
-  paired projections quantize their input once
+  weights, the hyper-connection mix reads its weights once per 8 tokens,
+  paired projections quantize their input once, and each routed expert gets
+  a tile width for its bucket
   ([E10](docs/EXPERIMENTS.md#e10-prefill-attention-32-heads-per-block-2026-11-19),
   [E11](docs/EXPERIMENTS.md#e11-matrix-core-query-absorption-2026-11-19),
   [E12](docs/EXPERIMENTS.md#e12-hyper-connection-mixing-8-tokens-per-block-2026-11-19),
   [E13](docs/EXPERIMENTS.md#e13-one-input-quantization-for-paired-projections-2026-11-19),
   [E14](docs/EXPERIMENTS.md#e14-prefill-attention-softmax-on-every-thread-2026-11-19),
-  [E15](docs/EXPERIMENTS.md#e15-prefill-attention-keys-as-binary16-once-per-pass-2026-11-20)).
+  [E15](docs/EXPERIMENTS.md#e15-prefill-attention-keys-as-binary16-once-per-pass-2026-11-20),
+  [E16](docs/EXPERIMENTS.md#e16-routed-expert-tile-width-per-expert-2026-11-20)).

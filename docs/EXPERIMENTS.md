@@ -21,6 +21,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E13 | One input quantization for paired projections | retained |
 | E14 | Prefill attention softmax on every thread | retained |
 | E15 | Prefill attention keys converted to binary16 once per pass | retained |
+| E16 | Routed expert tile width per expert | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -274,3 +275,18 @@ Not retained, from the same benchmark:
   already hold 72 of the 256 registers, and every prefetch depth (2 to 5 of
   the 5 groups per thread) spilled and ran slower (8.4 to 8.9 ms, 22 to
   23 ms).
+
+## E16: Routed expert tile width per expert (2026-11-20)
+
+The routed experts (Q4_K and Q6_K MMQ, 2.6 s of the prefill) took one
+column-tile width per launch from a cost model fitted on DS41's experts.
+Forcing one width for every layer (3,712-token prefill): 16 → 7.79 s,
+32 → 7.25 s, 48 → 7.38 s, 64 → 7.41 s, 80 → 7.53 s, the model's choice
+7.29 s; wider tiles, which re-read an expert's weights less often, are
+slower, so these kernels are not bound by weight reloads. The vendored
+per-expert classes (16, 32 or 64 columns by bucket size, from DS41's fit),
+in ABAB order: 7.18, 7.22 s against 7.29, 7.28 s; as the default, 7.19 and
+7.18 s. Tile widths change the accumulation split: KL against llama.cpp
+0.084 ± 0.008, same top 91.5%. Rejected on the way: a register-held query
+variant of `IndexerScore` (bit-identical, but 0.21 s against 0.18 s: the
+warp sums, not the query reads, bound it). Retained.
