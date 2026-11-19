@@ -20,6 +20,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E12 | Hyper-connection mixing for 8 tokens per block | retained |
 | E13 | One input quantization for paired projections | retained |
 | E14 | Prefill attention softmax on every thread | retained |
+| E15 | Prefill attention keys converted to binary16 once per pass | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -241,3 +242,35 @@ and combine their maximum and sum with shuffles. 3,712-token prefill:
 7.90 → 7.49 s (both runs; 470 → 495 tok/s). The denominators sum in another
 order: KL against llama.cpp 0.084 ± 0.008, same top 91.5% (E13: 0.081,
 91.3%). Retained.
+
+## E15: Prefill attention keys as binary16, once per pass (2026-11-20)
+
+A standalone benchmark of `hy4_mla_prefill` at the largest shapes (2,048
+tokens; a window layer of 64 heads over 512 keys, a sparse layer of 32 heads
+over 2,048 selected keys), removing one phase at a time:
+
+| variant | window layer | sparse layer |
+| --- | --- | --- |
+| E14 | 10.07 ms | 23.95 ms |
+| no key staging | 5.25 ms | 11.21 ms |
+| no Q.K products | 8.47 ms | 21.23 ms |
+| no P.V products | 8.15 ms | 19.69 ms |
+
+Half the time went to staging: every block read FP32 key rows (2.3 KB each)
+and converted them. The pass's visible key rows are now converted to
+binary16 once (`hy4_gather_rows_half`, which also replaces the window
+gather) and the kernel stages them with 16-byte copies: 8.19 and 17.41 ms.
+The rounding is the one the kernel applied, so results are bit-identical to
+E14 (KL 0.08438, PPL 15.1116). 3,712-token prefill: 7.49 → 7.29 s (both
+runs). Each session holds a binary16 buffer of its context's key rows
+(37.7 MB at 32K); the FP32 window buffer shrinks to the verify passes' rows.
+
+Not retained, from the same benchmark:
+
+- 16-key tiles (half the LDS, so two blocks per CU): 7.60 and 16.28 ms, but
+  7.29 / 7.23 s end to end against 7.29 / 7.29 s, inconclusive, and the
+  softmax groups change the results.
+- Loading the next tile into registers during the products: the queries
+  already hold 72 of the 256 registers, and every prefetch depth (2 to 5 of
+  the 5 groups per thread) spilled and ran slower (8.4 to 8.9 ms, 22 to
+  23 ms).

@@ -108,12 +108,11 @@ int hy4_mla_attention(const float* q, const float* cache, uint32_t ring, const i
 /* hy4_mla_attention for prefill on the matrix cores (binary16 operands, FP32
  * softmax and accumulation; q as binary16 bits from hy4_mla_absorb), each
  * token over exactly its own keys, so a token's result does not depend on the
- * pass it is in. Key position k is row
- * k - lo of `keys` [rows][dk] (a gathered window or the whole cache from 0);
- * token t sees max(lo, pos[t] - window + 1) .. pos[t] (lo without a window),
- * or the positions of sel[t, 0:n_sel] in that range. dk must be 576, dv 512
- * and heads a multiple of 32. */
-int hy4_mla_prefill(const uint16_t* q, const float* keys, int32_t lo,
+ * pass it is in. Key position k is row k - lo of `keys` [rows][dk] (binary16
+ * bits, from hy4_gather_rows_half); token t sees max(lo, pos[t] - window + 1)
+ * .. pos[t] (lo without a window), or the positions of sel[t, 0:n_sel] in that
+ * range. dk must be 576, dv 512 and heads a multiple of 32. */
+int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, int32_t lo,
                     const int32_t* pos, uint32_t window, const int32_t* sel,
                     uint32_t n_sel, const float* sinks, float scale, float* out,
                     uint32_t n, uint32_t heads, uint32_t dk, uint32_t dv,
@@ -203,6 +202,12 @@ int hy4_selection_mask(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t
 /* dst [count][dim] = rows of the positions first .. first + count - 1 of a ring. */
 int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t count, uint32_t dim, float* dst,
                     hipStream_t stream);
+/* hy4_gather_rows into binary16 bits: dst [count][dim] = the rows of
+ * positions first .. first + count - 1 of a ring. dim must be a multiple of
+ * 4, src rows and dst 8-byte aligned. */
+int hy4_gather_rows_half(const float* src, uint32_t ring, int32_t first,
+                         uint32_t count, uint32_t dim, uint16_t* dst,
+                         hipStream_t stream);
 /* dst [count][dim] = rows of the positions idx[j] of a ring; a position < 0
  * or > limit is missing (a zero row). mask [rows][n_keys] = -inf at the
  * missing j, 0 at the other j < count and at every j >= count. */

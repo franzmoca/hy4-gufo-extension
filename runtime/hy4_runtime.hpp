@@ -349,6 +349,8 @@ private:
   std::vector<float> pass_logits_;
   // Attention selection mask of the verify-pass path [kVecMax][max_context].
   float* mask_ = nullptr;
+  // A prefill pass's visible key rows as binary16, for hy4_mla_prefill.
+  std::uint16_t* keys_half_ = nullptr;
   std::vector<void*> allocations_;
   std::vector<float> last_logits_;
   WriteHook write_hook_ = nullptr;

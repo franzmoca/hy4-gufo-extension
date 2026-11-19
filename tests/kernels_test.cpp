@@ -549,10 +549,32 @@ void TestMlaPrefill() {
     q[i] = (float)HalfValue(qbits[i]);
   }
   auto* dq = Device(qbits);
-  auto* dc = Device(cache);
+  // Keys as hy4_gather_rows_half writes them: binary16 rows from position 0.
+  auto* dcf = Device(cache);
+  auto* dc = Device(std::vector<uint16_t>(cache.size()));
+  Expect(hy4_gather_rows_half(dcf, ring, 0, ring, dk, dc, nullptr) == 0,
+         "gather_rows_half status");
+  {
+    std::vector<uint16_t> want(cache.size());
+    for (std::size_t i = 0; i < cache.size(); ++i)
+      want[i] = HalfBits(cache[i]);
+    Expect(Host(dc, cache.size()) == want, "gather_rows_half");
+    // Wrapping the ring: positions ring - 2 .. ring + 1.
+    auto* wrap = Device(std::vector<uint16_t>(4 * dk));
+    Expect(hy4_gather_rows_half(dcf, ring, (int32_t)ring - 2, 4, dk, wrap,
+                                nullptr) == 0,
+           "gather_rows_half wrap status");
+    const auto got = Host(wrap, 4 * dk);
+    bool same = true;
+    for (uint32_t r = 0; r < 4; ++r)
+      for (uint32_t i = 0; i < dk; ++i)
+        same =
+            same && got[r * dk + i] == want[((ring - 2 + r) % ring) * dk + i];
+    Expect(same, "gather_rows_half wrap");
+  }
   auto* dp = Device(pos);
   auto* ds = Device(sinks);
-  const auto run = [&](const float* keys, int32_t lo, uint32_t window,
+  const auto run = [&](const uint16_t* keys, int32_t lo, uint32_t window,
                        const std::vector<int32_t>* sel, uint32_t n_sel,
                        bool sink,
                        const std::vector<std::vector<int32_t>>& want_keys,
