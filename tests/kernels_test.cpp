@@ -211,7 +211,7 @@ void TestRmsNorm() {
 }
 
 void TestHyperConnections() {
-  const uint32_t n = 3, hc = 4, dim = 96, flat = hc * dim;
+  const uint32_t n = 11, hc = 4, dim = 96, flat = hc * dim;
   const float eps = 1e-6f, hc_eps = 1e-6f, magnitude = 2.0f;
   const auto x = Random(n * dim);
   float* dh = Device(std::vector<float>(n * flat));
@@ -259,6 +259,19 @@ void TestHyperConnections() {
     Near(Host(out, n * dim), want, 1e-5, layer ? "hc_pre" : "hc_pre head");
     if (layer)
       Near(Host(post, n * hc), want_post, 1e-5, "hc_pre post");
+    // Passes under 8 tokens mix one token per block: bit-identical results.
+    const uint32_t few = 3;
+    float* out_few = Device(std::vector<float>(few * dim));
+    float* post_few = layer ? Device(std::vector<float>(few * hc)) : nullptr;
+    Expect(hy4_hc_pre(Device(h), Device(fn), Device(scale), Device(base),
+                      out_few, post_few, few, hc, dim, eps, hc_eps, magnitude,
+                      nullptr) == 0,
+           "hc_pre few status");
+    const auto a = Host(out, few * dim), b = Host(out_few, few * dim);
+    Expect(a == b, "hc_pre identical for 3 and 11 tokens");
+    if (layer)
+      Expect(Host(post, few * hc) == Host(post_few, few * hc),
+             "hc_pre post identical for 3 and 11 tokens");
   }
 
   const auto y = Random(n * dim);

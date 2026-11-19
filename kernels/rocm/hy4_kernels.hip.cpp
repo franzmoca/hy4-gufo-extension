@@ -142,6 +142,62 @@ __global__ void HcMix(const float* h, const float* fn, float* partial, uint32_t 
   if (threadIdx.x == 0) out[n_mix] = r;
 }
 
+// HcMix for T tokens per block with NM mixes: each weight value loaded once
+// serves T tokens. Per token the same thread partition, products and
+// reduction order as HcMix (warp sums, then the warps' partials in order), so
+// the results are identical. Grid (kHcSlices, token groups).
+template<uint32_t T, uint32_t NM>
+__global__ void __launch_bounds__(kBlock)
+    HcMixTokens(const float* h, const float* fn, float* partial, uint32_t flat,
+                uint32_t n) {
+  constexpr uint32_t kValues = T * (NM + 1);
+  __shared__ float scratch[kValues][kBlock / 32];
+  const uint32_t t0 = blockIdx.y * T;
+  const uint32_t nt = min(T, n - t0);
+  const uint32_t per = (flat + kHcSlices - 1) / kHcSlices;
+  const uint32_t lo = blockIdx.x * per;
+  const uint32_t hi = min(flat, lo + per);
+  float mix[T][NM + 1] = {};  // [NM] is the sum of squares
+  for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+    float f[NM];
+#pragma unroll
+    for (uint32_t m = 0; m < NM; ++m)
+      f[m] = fn[(uint64_t)m * flat + i];
+#pragma unroll
+    for (uint32_t tt = 0; tt < T; ++tt) {
+      if (tt >= nt)
+        break;
+      const float v = h[(uint64_t)(t0 + tt) * flat + i];
+      mix[tt][NM] += v * v;
+#pragma unroll
+      for (uint32_t m = 0; m < NM; ++m)
+        mix[tt][m] += f[m] * v;
+    }
+  }
+  const uint32_t lane = threadIdx.x % warpSize;
+  const uint32_t warp = threadIdx.x / warpSize;
+  const uint32_t warps = (blockDim.x + warpSize - 1) / warpSize;
+#pragma unroll
+  for (uint32_t tt = 0; tt < T; ++tt)
+#pragma unroll
+    for (uint32_t m = 0; m <= NM; ++m) {
+      const float v = WarpSum(mix[tt][m]);
+      if (lane == 0)
+        scratch[tt * (NM + 1) + m][warp] = v;
+    }
+  __syncthreads();
+  for (uint32_t j = threadIdx.x; j < kValues; j += blockDim.x) {
+    const uint32_t tt = j / (NM + 1), m = j % (NM + 1);
+    if (tt >= nt)
+      continue;
+    float total = 0.0f;
+    for (uint32_t w = 0; w < warps; ++w)
+      total += scratch[j][w];
+    partial[((uint64_t)(t0 + tt) * kHcSlices + blockIdx.x) * (kHcMaxMix + 1) +
+            m] = total;
+  }
+}
+
 // Grid (column blocks, n).
 __global__ void HcApply(const float* h, const float* partial, const float* scale, const float* base, float* out,
                         float* post, uint32_t hc, uint32_t dim, float eps, float hc_eps, float magnitude) {
@@ -1134,7 +1190,17 @@ int hy4_hc_pre(const float* h, const float* fn, const float* scale, const float*
     partial_tokens = n;
   }
   const uint32_t n_mix = post ? 2 * hc : hc;
-  HcMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(h, fn, partial, hc * dim, n_mix);
+  constexpr uint32_t kTok = 8;
+  const dim3 groups(kHcSlices, (n + kTok - 1) / kTok);
+  if (n >= kTok && n_mix == 8)
+    HcMixTokens<kTok, 8>
+        <<<groups, kBlock, 0, stream>>>(h, fn, partial, hc * dim, n);
+  else if (n >= kTok && n_mix == 4)
+    HcMixTokens<kTok, 4>
+        <<<groups, kBlock, 0, stream>>>(h, fn, partial, hc * dim, n);
+  else
+    HcMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(h, fn, partial, hc * dim,
+                                                     n_mix);
   HcApply<<<dim3(Blocks(dim, 64), n), kBlock, 0, stream>>>(h, partial, scale, base, out, post, hc, dim, eps, hc_eps,
                                                          magnitude);
   return Status();

@@ -17,6 +17,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E9 | Prefill attention: 16-key tiles with transposed values | rejected |
 | E10 | Prefill attention: 32 heads per block | retained |
 | E11 | Matrix-core query absorption writing binary16 queries | retained |
+| E12 | Hyper-connection mixing for 8 tokens per block | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -208,3 +209,14 @@ head's rows 64 KB apart. Ordering the grid by head first halved the time.
 size. `--chunkcheck 200` on the first 1,000 tokens (whole is now one pass):
 first difference in layer 0 (6e-8), 789 / 800 same top, mean KL 0.0055, so
 the other batched kernels still depend on the pass width. Retained.
+
+## E12: Hyper-connection mixing, 8 tokens per block (2026-11-19)
+
+The hyper-connection mix (four streams of 4,096 against eight mixing rows,
+plus the sum of squares) ran one token per block, so every token read all of
+the 512 KB mixing weights again: 0.48 s of the prefill. Passes of 8 tokens or
+more now mix 8 tokens per block, each weight value loaded once for all 8,
+with the same per-token thread partition, products and reduction order, so
+the results are bit-identical (checked in `kernels_test`; KL and PPL against
+llama.cpp unchanged to the last digit). Smaller passes keep one token per
+block. 3,712-token prefill: 8.24 → 7.95 s (451 → 467 tok/s). Retained.
