@@ -48,6 +48,15 @@ int hy4_hc_pre(const float* h, const float* fn, const float* scale, const float*
 int hy4_hc_post(const float* y, const float* residual, const float* post, float* h, uint32_t n,
                 uint32_t hc, uint32_t dim, hipStream_t stream);
 
+/* hy4_hc_post(y, h, post_prev, h) followed by hy4_hc_pre(h, ...), with the
+ * same results; batched passes update h inside the pre-mix's pass over it.
+ * post_prev may be the same buffer as post. */
+int hy4_hc_post_pre(const float* y, const float* post_prev, float* h,
+                    const float* fn, const float* scale, const float* base,
+                    float* out, float* post, uint32_t n, uint32_t hc,
+                    uint32_t dim, float eps, float hc_eps, float magnitude,
+                    hipStream_t stream);
+
 /* h[t, i] = x[t] for every stream i. */
 int hy4_hc_init(const float* x, float* h, uint32_t n, uint32_t hc, uint32_t dim, hipStream_t stream);
 

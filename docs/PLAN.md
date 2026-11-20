@@ -491,7 +491,8 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   FP16 matrix-core kernels for every quantized projection and the routed
   experts instead of MMQ: 7.18 → 5.58 s (E17); coalesced dense stores and
   binary16 attention output: 5.43 s (E18, E19); the router's FP32 GEMM:
-  5.355 s (E20); the gate in `wv_b`'s stores, binary16 `attv`: 5.16 s (E21).
+  5.355 s (E20); the gate in `wv_b`'s stores, binary16 `attv`: 5.16 s
+  (E21); the post-mix in the next pre-mix: 5.07 s (E23).
 
 - **Prefill profile after E17** (3,712 tokens, 5.35 s of kernels): dense
   FP16 projections 1.87 s (27-33 TFLOPS standalone; `wo` and `attn_gate` are
@@ -499,11 +500,10 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   the attention 0.66 s, the FP32 router GEMM 0.2 s, hyper-connection kernels
   0.43 s, the indexer score 0.17 s (bound by its warp sums; a faster form
   changes the summation order, which the selection's near ties are sensitive
-  to), the attention gate 0.12 s. Candidates: `MlaPrefill` stores 2-byte
-  scalars;
-  fuse `HcPost` into the next `HcMix` (both read the four streams); in the
-  attention a conflict-free value transpose (P.V is about 20% of the
-  kernel). Register prefetch of key tiles does not fit beside the query
+  to), the attention gate 0.12 s. Candidates: in the attention a
+  conflict-free value transpose (P.V is about 20% of the kernel; its 2-byte
+  output stores bound 6% and staging them lost, E22). `HcPost` is folded
+  into the next pre-mix (E23). Register prefetch of key tiles does not fit beside the query
   fragments (E15).
 
 - **Designs to borrow for the prefill attention.** ds41's

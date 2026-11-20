@@ -495,9 +495,27 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   }
   HY4_CHECK(hy4_hc_init(s.x, s.h, n, c.hc, c.n_embd, st));
 
+  // A half's hy4_hc_post is deferred into the next pre-mix
+  // (hy4_hc_post_pre) unless something reads h in between.
+  bool post_pending = false;
+  auto hc_pre = [&](const Tensor& fn, const Tensor& scale, const Tensor& base,
+                    float* post, float magnitude) {
+    if (!post_pending)
+      return hy4_hc_pre(s.h, fn.f32(), scale.f32(), base.f32(), s.x, post, n,
+                        c.hc, c.n_embd, c.rms_eps, c.hc_eps, magnitude, st);
+    post_pending = false;
+    return hy4_hc_post_pre(s.y, s.post, s.h, fn.f32(), scale.f32(), base.f32(),
+                           s.x, post, n, c.hc, c.n_embd, c.rms_eps, c.hc_eps,
+                           magnitude, st);
+  };
+
   for (std::uint32_t il = 0; il < c.n_layer; ++il) {
     const Layer& l = w.layers[il];
     const int e = c.EngramIndex(il);
+    if (e >= 0 && post_pending) {
+      HY4_CHECK(hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st));
+      post_pending = false;
+    }
     if (e >= 0) {
       const std::uint32_t width = cols * c.engram_dim;
       HY4_CHECK(hy4_engram_rows(s.engram_rows + std::size_t(e) * n * width, s.engram_valid + std::size_t(e) * n * cols,
@@ -511,20 +529,22 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
                                  kEngramEps, st));
     }
 
-    HY4_CHECK(hy4_hc_pre(s.h, l.hc_attn_fn.f32(), l.hc_attn_scale.f32(), l.hc_attn_base.f32(), s.x, s.post, n, c.hc,
-                         c.n_embd, c.rms_eps, c.hc_eps, c.hc_magnitude, st));
+    HY4_CHECK(hc_pre(l.hc_attn_fn, l.hc_attn_scale, l.hc_attn_base, s.post,
+                     c.hc_magnitude));
     HY4_CHECK(hy4_rms_norm(s.x, l.attn_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
     if (!Attention(il, n, error)) return false;
-    HY4_CHECK(hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st));
+    post_pending = true;
 
-    HY4_CHECK(hy4_hc_pre(s.h, l.hc_ffn_fn.f32(), l.hc_ffn_scale.f32(), l.hc_ffn_base.f32(), s.x, s.post, n, c.hc,
-                         c.n_embd, c.rms_eps, c.hc_eps, c.hc_magnitude, st));
+    HY4_CHECK(hc_pre(l.hc_ffn_fn, l.hc_ffn_scale, l.hc_ffn_base, s.post,
+                     c.hc_magnitude));
     HY4_CHECK(hy4_rms_norm(s.x, l.ffn_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
     if (!Ffn(il, n, error)) return false;
     HY4_CHECK(hy4_rms_norm(s.y, l.ffn_post_norm.f32(), s.y, n, c.n_embd, c.n_embd, c.rms_eps, st));
-    HY4_CHECK(hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st));
+    post_pending = true;
 
     if (probe_) {
+      HY4_CHECK(hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st));
+      post_pending = false;
       HY4_CHECK(hipMemcpyAsync(s.host_h, s.h, std::size_t{n} * c.hc * c.n_embd * sizeof(float),
                                hipMemcpyDeviceToHost, st));
       HY4_CHECK(hipStreamSynchronize(st));
@@ -533,8 +553,8 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   }
 
   // Head: reduce the streams, norm, project.
-  HY4_CHECK(hy4_hc_pre(s.h, w.hc_head_fn.f32(), w.hc_head_scale.f32(), w.hc_head_base.f32(), s.x, nullptr, n, c.hc,
-                       c.n_embd, c.rms_eps, c.hc_eps, 1.0f, st));
+  HY4_CHECK(
+      hc_pre(w.hc_head_fn, w.hc_head_scale, w.hc_head_base, nullptr, 1.0f));
   HY4_CHECK(hy4_rms_norm(s.x, w.output_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
   if (tap_hidden_) {
     const std::uint32_t r = std::min(n, kTapRows);

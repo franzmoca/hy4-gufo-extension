@@ -147,11 +147,16 @@ __global__ void HcMix(const float* h, const float* fn, float* partial, uint32_t 
 // HcMix for T tokens per block with NM mixes: each weight value loaded once
 // serves T tokens. Per token the same thread partition, products and
 // reduction order as HcMix (warp sums, then the warps' partials in order), so
-// the results are identical. Grid (kHcSlices, token groups).
-template<uint32_t T, uint32_t NM>
+// the results are identical. With kPost the previous half's HcPost happens
+// here: each h value becomes h + y * post (as HcPost computes it), is stored
+// back and mixed, saving HcPost's pass over the streams. Grid (kHcSlices,
+// token groups).
+template<uint32_t T, uint32_t NM, bool kPost = false>
 __global__ void __launch_bounds__(kBlock)
-    HcMixTokens(const float* h, const float* fn, float* partial, uint32_t flat,
-                uint32_t n) {
+    HcMixTokens(float* h, const float* fn, float* partial, uint32_t flat,
+                uint32_t n, const float* y = nullptr,
+                const float* post = nullptr, uint32_t hc = 0,
+                uint32_t dim = 0) {
   constexpr uint32_t kValues = T * (NM + 1);
   __shared__ float scratch[kValues][kBlock / 32];
   const uint32_t t0 = blockIdx.y * T;
@@ -169,7 +174,13 @@ __global__ void __launch_bounds__(kBlock)
     for (uint32_t tt = 0; tt < T; ++tt) {
       if (tt >= nt)
         break;
-      const float v = h[(uint64_t)(t0 + tt) * flat + i];
+      float v = h[(uint64_t)(t0 + tt) * flat + i];
+      if constexpr (kPost) {
+        const uint32_t t = t0 + tt, stream = i / dim;
+        v = v + y[(uint64_t)t * dim + (i - stream * dim)] *
+                    post[(uint64_t)t * hc + stream];
+        h[(uint64_t)t * flat + i] = v;
+      }
       mix[tt][NM] += v * v;
 #pragma unroll
       for (uint32_t m = 0; m < NM; ++m)
@@ -1285,32 +1296,77 @@ int hy4_rms_norm(const float* x, const float* weight, float* out, uint32_t rows,
   return Status();
 }
 
-int hy4_hc_pre(const float* h, const float* fn, const float* scale, const float* base, float* out, float* post,
-               uint32_t n, uint32_t hc, uint32_t dim, float eps, float hc_eps, float magnitude, hipStream_t stream) {
-  if (n == 0) return 0;
-  if (hc > 8) return 1;
+// The mixes' per-slice partial sums, grown to n tokens on this thread.
+static float* HcPartial(uint32_t n) {
   static thread_local float* partial = nullptr;
   static thread_local uint32_t partial_tokens = 0;
   if (n > partial_tokens) {
     if (partial) (void)hipFree(partial);
     partial = nullptr;
-    if (hipMalloc(&partial, (size_t)n * kHcSlices * (kHcMaxMix + 1) * sizeof(float)) != hipSuccess) return 1;
+    partial_tokens = 0;
+    if (hipMalloc(&partial, (size_t)n * kHcSlices * (kHcMaxMix + 1) *
+                                sizeof(float)) != hipSuccess)
+      return nullptr;
     partial_tokens = n;
   }
+  return partial;
+}
+
+int hy4_hc_pre(const float* h, const float* fn, const float* scale,
+               const float* base, float* out, float* post, uint32_t n,
+               uint32_t hc, uint32_t dim, float eps, float hc_eps,
+               float magnitude, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (hc > 8)
+    return 1;
+  float* partial = HcPartial(n);
+  if (!partial)
+    return 1;
   const uint32_t n_mix = post ? 2 * hc : hc;
   constexpr uint32_t kTok = 8;
   const dim3 groups(kHcSlices, (n + kTok - 1) / kTok);
   if (n >= kTok && n_mix == 8)
-    HcMixTokens<kTok, 8>
-        <<<groups, kBlock, 0, stream>>>(h, fn, partial, hc * dim, n);
+    HcMixTokens<kTok, 8><<<groups, kBlock, 0, stream>>>(
+        const_cast<float*>(h), fn, partial, hc * dim, n);
   else if (n >= kTok && n_mix == 4)
-    HcMixTokens<kTok, 4>
-        <<<groups, kBlock, 0, stream>>>(h, fn, partial, hc * dim, n);
+    HcMixTokens<kTok, 4><<<groups, kBlock, 0, stream>>>(
+        const_cast<float*>(h), fn, partial, hc * dim, n);
   else
     HcMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(h, fn, partial, hc * dim,
                                                      n_mix);
   HcApply<<<dim3(Blocks(dim, 64), n), kBlock, 0, stream>>>(h, partial, scale, base, out, post, hc, dim, eps, hc_eps,
                                                          magnitude);
+  return Status();
+}
+
+int hy4_hc_post_pre(const float* y, const float* post_prev, float* h,
+                    const float* fn, const float* scale, const float* base,
+                    float* out, float* post, uint32_t n, uint32_t hc,
+                    uint32_t dim, float eps, float hc_eps, float magnitude,
+                    hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  const uint32_t n_mix = post ? 2 * hc : hc;
+  constexpr uint32_t kTok = 8;
+  if (n < kTok || (n_mix != 8 && n_mix != 4) || hc > 8) {
+    if (int rc = hy4_hc_post(y, h, post_prev, h, n, hc, dim, stream))
+      return rc;
+    return hy4_hc_pre(h, fn, scale, base, out, post, n, hc, dim, eps, hc_eps,
+                      magnitude, stream);
+  }
+  float* partial = HcPartial(n);
+  if (!partial)
+    return 1;
+  const dim3 groups(kHcSlices, (n + kTok - 1) / kTok);
+  if (n_mix == 8)
+    HcMixTokens<kTok, 8, true><<<groups, kBlock, 0, stream>>>(
+        h, fn, partial, hc * dim, n, y, post_prev, hc, dim);
+  else
+    HcMixTokens<kTok, 4, true><<<groups, kBlock, 0, stream>>>(
+        h, fn, partial, hc * dim, n, y, post_prev, hc, dim);
+  HcApply<<<dim3(Blocks(dim, 64), n), kBlock, 0, stream>>>(
+      h, partial, scale, base, out, post, hc, dim, eps, hc_eps, magnitude);
   return Status();
 }
 

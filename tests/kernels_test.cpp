@@ -289,6 +289,37 @@ void TestHyperConnections() {
             residual[(t * hc + i) * dim + c] +
             (double)y[t * dim + c] * post[t * hc + i];
   Near(Host(dres, n * flat), want, 1e-6, "hc_post in place");
+
+  // hc_post_pre: bit-identical to hc_post then hc_pre, with post_prev and
+  // post the same buffer as the forward pass uses them, on the batched (11
+  // tokens) and the per-token (3) paths.
+  for (uint32_t m : {n, 3u})
+    for (bool layer : {true, false}) {
+      const uint32_t n_mix = layer ? 2 * hc : hc;
+      const auto fn = Random(n_mix * flat, -0.1f, 0.1f);
+      float* dy = Device(y);
+      float* h_a = Device(residual);
+      float* h_b = Device(residual);
+      float* post_a = Device(post);
+      float* post_b = Device(post);
+      float* out_a = Device(std::vector<float>(m * dim));
+      float* out_b = Device(std::vector<float>(m * dim));
+      Expect(hy4_hc_post(dy, h_a, post_a, h_a, m, hc, dim, nullptr) == 0 &&
+                 hy4_hc_pre(h_a, Device(fn), Device(scale), Device(base), out_a,
+                            layer ? post_a : nullptr, m, hc, dim, eps, hc_eps,
+                            magnitude, nullptr) == 0,
+             "hc_post, hc_pre status");
+      Expect(hy4_hc_post_pre(dy, post_b, h_b, Device(fn), Device(scale),
+                             Device(base), out_b, layer ? post_b : nullptr, m,
+                             hc, dim, eps, hc_eps, magnitude, nullptr) == 0,
+             "hc_post_pre status");
+      Expect(Host(h_a, m * flat) == Host(h_b, m * flat),
+             "hc_post_pre streams identical");
+      Expect(Host(out_a, m * dim) == Host(out_b, m * dim),
+             "hc_post_pre output identical");
+      Expect(Host(post_a, m * hc) == Host(post_b, m * hc),
+             "hc_post_pre post identical");
+    }
 }
 
 void TestGemv() {

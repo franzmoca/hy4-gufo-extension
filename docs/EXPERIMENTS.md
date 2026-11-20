@@ -27,6 +27,8 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E19 | Prefill attention output in binary16 | retained |
 | E20 | FP32 GEMM for the router instead of hipBLAS | retained |
 | E21 | Attention gate applied in the value projection's stores, binary16 input to `wo` | retained |
+| E22 | `MlaPrefill` output staged through LDS for 16-byte stores | rejected |
+| E23 | Hyper-connection post-mix folded into the next pre-mix | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -411,3 +413,28 @@ PPL 15.1167 to the last digit: the FP32 gated value is rounded to binary16
 exactly as `wo`'s staging rounded it); `--passcheck 8` and `--chunkcheck` at
 517 and 999 exact. 3,712-token prefill 5.355 → 5.18, 5.14 s (about
 720 tok/s). Retained.
+
+## E22: `MlaPrefill` output staged through LDS for 16-byte stores (2026-11-20)
+
+`MlaPrefill` stores its output as 2-byte scalars (16 lanes write 32
+contiguous bytes per head). Ablation in a micro-benchmark (2,048 tokens,
+the 64-head window layer and the 32-head sparse layer): skipping the stores
+saves 0.44 of 7.58 ms and 0.1 of 17.4 ms, the bound for any store change.
+Staging the 32 heads' outputs in the then-free key tile and storing the
+block's contiguous 32 KB in 16-byte groups made the window layer slower,
+7.71–7.95 ms, and 7.67–7.69 ms with a pitch that removes the halves' bank
+conflict: the direct stores already overlap other blocks' work, the staged
+ones add a barrier and an LDS round trip. Rejected.
+
+## E23: Hyper-connection post-mix folded into the next pre-mix (2026-11-20)
+
+Each layer half ended with `HcPost` (h = h + y * post over the four
+streams) and the next half began with `HcMixTokens`, which reads the same
+streams again. `hy4_hc_post_pre` does the post-mix inside the pre-mix's
+pass: each value is updated with the same expression, stored back and
+mixed. The forward pass defers a half's post-mix to the next pre-mix (the
+FFN's, the next layer's attention, the head) unless the Engram or the
+probe reads the streams in between. Passes under 8 tokens keep the two
+kernels. Bit-identical (KL 0.08424, PPL 15.1167; `--passcheck 8`,
+`--chunkcheck` 517 and 999 exact; the unit test compares both paths
+bitwise). 3,712-token prefill 5.16 → 5.07 s (732 tok/s). Retained.
