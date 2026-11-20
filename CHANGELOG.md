@@ -79,3 +79,7 @@
   results are unchanged; prompt-cache entries from earlier builds are not
   reused
   ([E30](docs/EXPERIMENTS.md#e30-binary16-kv-cache-2026-11-20)).
+- DFly2 drafts through a Q8_0 copy of the LM head and stops before scoring
+  a slot its confidence head rejects: decoding with DFly2 7% faster, greedy
+  and sampled (24.3 → 26.0 and 23.6 → 25.3 tok/s), with the same replies
+  ([E31](docs/EXPERIMENTS.md#e31-dfly2-drafts-through-a-q8_0-copy-of-the-lm-head-2026-11-20)).

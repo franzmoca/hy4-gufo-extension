@@ -57,10 +57,15 @@ private:
   Tensor fuse_enorm_, fuse_hnorm_, fuse_eh_, fuse_gate_;
   Tensor corr_hnorm_, corr_enorm_, corr_gate_, corr_up_, corr_down_;
   Tensor final_norm_, confidence_w_;
+  // The target's LM head for drafts: a Q8_0 copy of a binary16 head (half the
+  // bytes per draft), else the target's own.
+  Tensor head_;
   float confidence_b_ = 0.0f;
   std::int32_t mask_token_ = 0;
   std::unique_ptr<Buffers> buf_;
   std::vector<void*> allocations_;
+  struct HostIo;
+  HostIo* io_ = nullptr;  // pinned
   std::uint64_t resident_bytes_ = 0;
 };
 

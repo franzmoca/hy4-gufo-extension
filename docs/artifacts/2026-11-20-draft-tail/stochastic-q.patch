@@ -1,0 +1,800 @@
+diff --git a/draft_sampling.hpp b/draft_sampling.hpp
+new file mode 100644
+index 0000000..2af2e75
+--- /dev/null
++++ b/draft_sampling.hpp
+@@ -0,0 +1,89 @@
++#ifndef HY4FLASH_DRAFT_SAMPLING_HPP_
++#define HY4FLASH_DRAFT_SAMPLING_HPP_
++
++#include <array>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <gufo/ext/sampling.hpp>
++#include <span>
++#include <stdexcept>
++
++namespace gufo::models::hy4_flash {
++
++/// A draft token and the distribution q it was drawn from, for exact
++/// speculative sampling: the target keeps it with probability
++/// min(1, p / q) and otherwise draws from the residual max(0, p - q).
++struct DraftProposal {
++  static constexpr std::size_t kCandidates = 8;
++  std::array<sampling::TokenId, kCandidates> ids{};
++  std::array<float, kCandidates> probabilities{};
++  std::size_t size = 0;  // 1: a point mass on `token`
++  sampling::TokenId token{};
++  float probability = 0;
++  float best = 0;  // q's largest probability
++};
++
++/// Drafts from the drafter's best candidates (logits, best first): q is
++/// their softmax at the request's temperature, or a point mass on the best
++/// when it holds at least 0.7 of q (concentrated proposals are accepted more
++/// often as point masses). q is held in 2^-24 units, so it sums to exactly
++/// one; one uniform from the request's generator draws the token.
++inline DraftProposal ProposeDraft(sampling::SamplerState& sampler,
++                                  std::span<const std::int32_t, DraftProposal::kCandidates> ids,
++                                  std::span<const float, DraftProposal::kCandidates> logits) {
++  for (std::size_t i = 0; i < ids.size(); ++i) {
++    if (std::isnan(logits[i]) || logits[i] == INFINITY) throw std::invalid_argument("non-finite draft logit");
++    if (ids[i] < 0) throw std::invalid_argument("invalid draft token");
++  }
++  sampling::SamplingConfig config;
++  config.temperature = sampler.config().temperature;
++  const auto q = sampling::BuildDistribution(logits, config);
++  const auto best = q.best_token();
++  DraftProposal proposal;
++  proposal.best = static_cast<float>(q.probability(best));
++  if (q.probability(best) >= 0.7) {
++    proposal.size = 1;
++    proposal.ids[0] = proposal.token = static_cast<sampling::TokenId>(ids[best]);
++    proposal.probabilities[0] = proposal.probability = 1.0F;
++    return proposal;
++  }
++  constexpr std::uint32_t kUnits = 1U << 24;
++  std::array<std::uint32_t, DraftProposal::kCandidates> masses{};
++  std::uint32_t total = 0;
++  for (const auto& entry : q.entries()) {
++    proposal.ids[proposal.size] = static_cast<sampling::TokenId>(ids[entry.token]);
++    masses[proposal.size] = static_cast<std::uint32_t>(std::floor(entry.value * kUnits));
++    total += masses[proposal.size++];
++  }
++  masses[0] += kUnits - total;
++  const auto draw = static_cast<std::uint32_t>(sampler.Uniform() * kUnits);
++  std::uint32_t cumulative = 0;
++  for (std::size_t i = 0; i < proposal.size; ++i) {
++    proposal.probabilities[i] = static_cast<float>(masses[i]) / kUnits;
++    cumulative += masses[i];
++    if (proposal.probability == 0 && draw < cumulative) {
++      proposal.token = proposal.ids[i];
++      proposal.probability = proposal.probabilities[i];
++    }
++  }
++  return proposal;
++}
++
++/// The target's token at a drafted position, distributed exactly as
++/// sampler.Sample(logits) would be. A point mass, or a forced token, samples
++/// the target and compares; otherwise p / q acceptance with a residual draw.
++/// Does not Accept the token.
++inline sampling::TokenId VerifyDraft(sampling::SamplerState& sampler, std::span<const float> logits,
++                                     const DraftProposal& proposal) {
++  if (proposal.size <= 1 || sampler.ForcedToken()) return sampler.Sample(logits);
++  const auto target = sampler.Distribution(logits);
++  if (sampler.Uniform() * proposal.probability < target.probability(proposal.token)) return proposal.token;
++  return target.SampleResidual(std::span(proposal.ids).first(proposal.size),
++                               std::span(proposal.probabilities).first(proposal.size),
++                               sampler.mutable_rng_state());
++}
++
++}  // namespace gufo::models::hy4_flash
++
++#endif  // HY4FLASH_DRAFT_SAMPLING_HPP_
+diff --git a/extension.cmake b/extension.cmake
+index 7465b44..3d57cb1 100644
+--- a/extension.cmake
++++ b/extension.cmake
+@@ -160,6 +160,8 @@ endfunction()
+ 
+ _hy4flash_test(chat_template "cpu;tokenization;tools"
+   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
++_hy4flash_test(draft_sampling "cpu;sampling"
++  LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
+ _hy4flash_test(vision_prompt "cpu;vision"
+   LINK_LIBRARIES gufo_hy4flash_text gufo_hy4flash_hip gufo_hy4flash gufo_ext_hip)
+ _hy4flash_test(kernels "hip;gpu;gfx1151"
+diff --git a/extension.json b/extension.json
+index 2331433..905b47e 100644
+--- a/extension.json
++++ b/extension.json
+@@ -93,6 +93,12 @@
+       ],
+       "role": "test"
+     },
++    "hy4flash_draft_sampling_test": {
++      "requires": [
++        "testing"
++      ],
++      "role": "test"
++    },
+     "hy4flash_vision_prompt_test": {
+       "requires": [
+         "testing"
+diff --git a/kernels/rocm/hy4_kernels.h b/kernels/rocm/hy4_kernels.h
+index ff91d83..ef42bd6 100644
+--- a/kernels/rocm/hy4_kernels.h
++++ b/kernels/rocm/hy4_kernels.h
+@@ -239,7 +239,14 @@ int hy4_gather_indexed(const uint16_t* src, uint32_t ring, const int32_t* idx,
+ int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64_t period, hipStream_t stream);
+ /* out [blocks * 32] = dequantized Q8_0 blocks. */
+ int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t stream);
+-int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream);
++/* ids/vals [8] = the 8 largest of x [dim] (dim >= 8), largest first; ties go
++ * to the lower index and NaN counts as -inf. work holds
++ * hy4_top8_work_floats() floats. */
++uint64_t hy4_top8_work_floats(void);
++int hy4_top8(const float* x, uint32_t dim, float* work, int32_t* ids, float* vals, hipStream_t stream);
++/* dst [blocks] = Q8_0 blocks of src [blocks * 32] binary16 values:
++ * d = max |v| / 127 (binary16), q = v / d rounded to nearest even. */
++int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst, hipStream_t stream);
+ /* y [n][m] = x [n][k] w^T for w [m][k], all FP32; each output sums its k
+  * products in order, so a token's row does not depend on n. k must be a
+  * multiple of 32. */
+diff --git a/kernels/rocm/hy4_kernels.hip.cpp b/kernels/rocm/hy4_kernels.hip.cpp
+index 06c71ec..e55031e 100644
+--- a/kernels/rocm/hy4_kernels.hip.cpp
++++ b/kernels/rocm/hy4_kernels.hip.cpp
+@@ -1255,20 +1255,107 @@ __global__ void __launch_bounds__(256)
+   }
+ }
+ 
+-__global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
+-  __shared__ float scratch[32];
+-  __shared__ int32_t picked;
+-  const float* row = x + (uint64_t)blockIdx.x * dim;
+-  float best = -INFINITY;
+-  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) best = fmaxf(best, row[i]);
+-  best = BlockMax(best, scratch);
+-  if (threadIdx.x == 0) picked = (int32_t)dim;
+-  __syncthreads();
+-  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+-    if (row[i] == best) atomicMin(&picked, (int32_t)i);
++// The kTop best of a row, best first: larger value, then lower index (NaN
++// counts as -inf). Each thread keeps a sorted list of its elements, and the
++// block merges the lists in kTop rounds, the winner's thread popping its head.
++constexpr uint32_t kTop = 8, kTopBlocks = 64;
++
++__device__ __forceinline__ bool Better(float a, int32_t ia, float b, int32_t ib) {
++  return a > b || (a == b && ia < ib);
++}
++
++// Rows of `count` candidates per block, from x (with indices idx, or their
++// positions); block b writes its kTop to out_v/out_i [b][kTop].
++__global__ void TopRows(const float* x, const int32_t* idx, uint32_t count, uint32_t chunk, float* out_v,
++                        int32_t* out_i) {
++  __shared__ float sv[kBlock / 32];
++  __shared__ int32_t si[kBlock / 32];
++  float v[kTop];
++  int32_t id[kTop];
++#pragma unroll
++  for (uint32_t j = 0; j < kTop; ++j) {
++    v[j] = -INFINITY;
++    id[j] = INT32_MAX;
+   }
+-  __syncthreads();
+-  if (threadIdx.x == 0) out[blockIdx.x] = picked == (int32_t)dim ? 0 : picked;
++  const uint32_t lo = blockIdx.x * chunk, hi = min(count, lo + chunk);
++  for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
++    float e = x[i];
++    if (e != e) e = -INFINITY;
++    const int32_t ie = idx ? idx[i] : (int32_t)i;
++    if (!Better(e, ie, v[kTop - 1], id[kTop - 1])) continue;
++    v[kTop - 1] = e;
++    id[kTop - 1] = ie;
++#pragma unroll
++    for (uint32_t j = kTop - 1; j > 0; --j) {
++      if (Better(v[j], id[j], v[j - 1], id[j - 1])) {
++        const float tv = v[j];
++        const int32_t ti = id[j];
++        v[j] = v[j - 1];
++        id[j] = id[j - 1];
++        v[j - 1] = tv;
++        id[j - 1] = ti;
++      }
++    }
++  }
++  const int lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
++  const int warps = (blockDim.x + warpSize - 1) / warpSize;
++  for (uint32_t r = 0; r < kTop; ++r) {
++    float bv = v[0];
++    int32_t bi = id[0];
++    for (int o = warpSize / 2; o > 0; o >>= 1) {
++      const float ov = __shfl_xor(bv, o);
++      const int32_t oi = __shfl_xor(bi, o);
++      if (Better(ov, oi, bv, bi)) {
++        bv = ov;
++        bi = oi;
++      }
++    }
++    __syncthreads();
++    if (lane == 0) {
++      sv[warp] = bv;
++      si[warp] = bi;
++    }
++    __syncthreads();
++    bv = sv[0];
++    bi = si[0];
++    for (int w = 1; w < warps; ++w)
++      if (Better(sv[w], si[w], bv, bi)) {
++        bv = sv[w];
++        bi = si[w];
++      }
++    if (threadIdx.x == 0) {
++      out_v[blockIdx.x * kTop + r] = bv;
++      out_i[blockIdx.x * kTop + r] = bi;
++    }
++    // Indices are unique, so exactly one thread holds the winner.
++    if (id[0] == bi && v[0] == bv) {
++#pragma unroll
++      for (uint32_t j = 0; j + 1 < kTop; ++j) {
++        v[j] = v[j + 1];
++        id[j] = id[j + 1];
++      }
++      v[kTop - 1] = -INFINITY;
++      id[kTop - 1] = INT32_MAX;
++    }
++  }
++}
++
++// Q8_0 blocks of 32 binary16 values: d = max |v| / 127, q = round(v / d).
++__global__ void QuantizeQ8Half(const _Float16* src, BlockQ8_0* dst, uint64_t blocks) {
++  const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
++  if (b >= blocks) return;
++  float v[32];
++  float amax = 0.0f;
++#pragma unroll
++  for (int i = 0; i < 32; ++i) {
++    v[i] = (float)src[b * 32 + i];
++    amax = fmaxf(amax, fabsf(v[i]));
++  }
++  const float d = amax / 127.0f;
++  const float inv = d > 0.0f ? 1.0f / d : 0.0f;
++  dst[b].d = (__half)d;
++#pragma unroll
++  for (int i = 0; i < 32; ++i) dst[b].qs[i] = (int8_t)rintf(v[i] * inv);
+ }
+ 
+ // ------------------------------------------------- fused prefill attention
+@@ -2085,9 +2172,22 @@ int hy4_sgemm_nt(const float* x, const float* w, float* y, uint32_t n,
+   return Status();
+ }
+ 
+-int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream) {
+-  if (n == 0) return 0;
+-  Argmax<<<n, kBlock, 0, stream>>>(x, dim, out);
++uint64_t hy4_top8_work_floats(void) { return 2ull * kTopBlocks * kTop; }
++
++int hy4_top8(const float* x, uint32_t dim, float* work, int32_t* ids, float* vals, hipStream_t stream) {
++  if (dim < kTop) return 1;
++  float* part_v = work;
++  int32_t* part_i = reinterpret_cast<int32_t*>(work + kTopBlocks * kTop);
++  const uint32_t chunk = (dim + kTopBlocks - 1) / kTopBlocks;
++  TopRows<<<kTopBlocks, kBlock, 0, stream>>>(x, nullptr, dim, chunk, part_v, part_i);
++  TopRows<<<1, kBlock, 0, stream>>>(part_v, part_i, kTopBlocks * kTop, kTopBlocks * kTop, vals, ids);
++  return Status();
++}
++
++int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst, hipStream_t stream) {
++  if (blocks == 0) return 0;
++  QuantizeQ8Half<<<(blocks + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
++      reinterpret_cast<const _Float16*>(src), static_cast<BlockQ8_0*>(dst), blocks);
+   return Status();
+ }
+ 
+diff --git a/runner.cpp b/runner.cpp
+index 6e4143e..78639ca 100644
+--- a/runner.cpp
++++ b/runner.cpp
+@@ -3,6 +3,7 @@
+ #include <hip/hip_runtime.h>
+ 
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+@@ -17,6 +18,7 @@
+ #include <limits>
+ #include <memory>
+ #include <optional>
++#include <span>
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -26,6 +28,7 @@
+ 
+ #include "chat_template.hpp"
+ #include "continuation_adapter.hpp"
++#include "draft_sampling.hpp"
+ #include "runtime/hy4_dfly.hpp"
+ #include "runtime/hy4_runtime.hpp"
+ #include "runtime/hy4_vision.hpp"
+@@ -48,6 +51,7 @@ constexpr std::size_t kBatchTransferStreams = 16;
+ constexpr std::int64_t kDefaultDraftTokens = 7;
+ // See Hy4TextRunner::min_accept_.
+ constexpr float kDefaultMinAccept = 0.45f;
++const float kSampledMinBest = std::getenv("HY4_Q_MIN_BEST") ? std::strtof(std::getenv("HY4_Q_MIN_BEST"), nullptr) : 0.6f;
+ 
+ std::size_t CacheCeilingBytes() { return std::max(HostSnapshotCeilingBytes(), HostSnapshotBudgetBytes()); }
+ 
+@@ -465,8 +469,10 @@ public:
+ 
+   // With the drafter: sample the anchor from the frontier, draft after it,
+   // verify anchor and drafts in one pass, and keep the drafts the target's
+-  // own draws agree with. A disagreeing draw is deferred to the next step,
+-  // which samples it from the same logits, so sampling stays exact.
++  // own draws agree with. Sampled requests draw each draft from the
++  // drafter's distribution q and verify it with p / q acceptance and a
++  // residual draw (VerifyDraft); greedy requests draft the best token. A
++  // disagreeing draw is deferred to the next step, so sampling stays exact.
+   [[nodiscard]] TextDecodeStep DecodeStep(TextRunnerState& state, std::size_t max_tokens,
+                                           sampling::SamplerState& sampler) const override {
+     auto& hy4 = RequireState(state);
+@@ -501,8 +507,18 @@ public:
+ 
+     std::vector<std::int32_t> drafts;
+     std::string error;
++    std::array<DraftProposal, Drafter::kBlock> proposals{};
++    Drafter::Pick pick;
++    if (sampler.config().uses_random_sampling()) {
++      pick = [&](std::uint32_t slot, std::span<const std::int32_t, Drafter::kCandidates> ids,
++                 std::span<const float, Drafter::kCandidates> logits) {
++        proposals.at(slot) = ProposeDraft(work, ids, logits);
++        if (proposals[slot].best < kSampledMinBest) return std::int32_t{-1};
++        return static_cast<std::int32_t>(proposals[slot].token);
++      };
++    }
+     const auto t0 = std::chrono::steady_clock::now();
+-    if (!drafter_->Draft(session, anchor_token, count, min_accept_, &drafts, &error)) {
++    if (!drafter_->Draft(session, anchor_token, count, min_accept_, pick, &drafts, &error)) {
+       throw std::runtime_error("Hy4 draft failed: " + error);
+     }
+     const auto t1 = std::chrono::steady_clock::now();
+@@ -513,7 +529,7 @@ public:
+     std::uint32_t kept = 1;
+     for (std::uint32_t i = 0; i < drafts.size(); ++i) {
+       const auto logits = session.PassLogits(i);
+-      const auto token = static_cast<std::int32_t>(work.Sample(logits));
++      const auto token = static_cast<std::int32_t>(pick ? VerifyDraft(work, logits, proposals[i]) : work.Sample(logits));
+       if (token != drafts[i]) {
+         work.DeferSample(static_cast<sampling::TokenId>(token));
+         break;
+diff --git a/runtime/hy4_dfly.cpp b/runtime/hy4_dfly.cpp
+index b458bee..4e39ae0 100644
+--- a/runtime/hy4_dfly.cpp
++++ b/runtime/hy4_dfly.cpp
+@@ -17,6 +17,7 @@
+ #include <algorithm>
+ #include <climits>
+ #include <cmath>
++#include <cstddef>
+ #include <cstring>
+ #include <numeric>
+ #include <string>
+@@ -163,7 +164,9 @@ struct Drafter::Buffers {
+   std::int32_t* tokens = nullptr;  // [kBlock]
+   std::int32_t* pos = nullptr;     // [kBlock]
+   std::int32_t* iota = nullptr;    // [max selection] 0, 1, ...
+-  std::int32_t* best = nullptr;    // [1]
++  std::int32_t* prev = nullptr;    // [1] the token before the slot
++  std::int32_t* top = nullptr;     // [kCandidates] ids, then [kCandidates] float logits
++  float* top_work = nullptr;       // hy4_top8_work_floats()
+   float* conf = nullptr;           // [1] confidence logit
+   float* x = nullptr;              // [kBlock][hidden] residual
+   float* xn = nullptr;             // [kBlock][hidden]
+@@ -190,8 +193,18 @@ struct Drafter::Buffers {
+ 
+ Drafter::Drafter(Model& target) : target_(target), buf_(std::make_unique<Buffers>()) {}
+ 
++// Host side of each slot's two reads: the confidence logit, then the head's
++// best candidates.
++struct Drafter::HostIo {
++  std::int32_t prev;
++  float conf;
++  std::int32_t ids[kCandidates];
++  float logits[kCandidates];
++};
++
+ Drafter::~Drafter() {
+   for (void* p : allocations_) (void)hipFree(p);
++  if (io_) (void)hipHostFree(io_);
+ }
+ 
+ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, std::string* error) {
+@@ -320,7 +333,9 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
+   const std::size_t n_keys = b.max_sel + kBlock;
+   std::vector<void*>* own = &d->allocations_;
+   ok = DeviceAlloc(&b.tokens, kBlock, own) && DeviceAlloc(&b.pos, kBlock, own) &&
+-       DeviceAlloc(&b.iota, b.max_sel, own) && DeviceAlloc(&b.best, 1, own) && DeviceAlloc(&b.conf, 1, own) &&
++       DeviceAlloc(&b.iota, b.max_sel, own) && DeviceAlloc(&b.prev, 1, own) &&
++       DeviceAlloc(&b.top, 2 * kCandidates, own) && DeviceAlloc(&b.top_work, hy4_top8_work_floats(), own) &&
++       DeviceAlloc(&b.conf, 1, own) &&
+        DeviceAlloc(&b.x, std::size_t{kBlock} * kHidden, own) && DeviceAlloc(&b.xn, std::size_t{kBlock} * kHidden, own) &&
+        DeviceAlloc(&b.y, std::size_t{kBlock} * kHidden, own) && DeviceAlloc(&b.cat, 2 * kHidden, own) &&
+        DeviceAlloc(&b.f, kHidden, own) && DeviceAlloc(&b.qr, std::size_t{kBlock} * kQLora, own) &&
+@@ -339,6 +354,29 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
+     Fail(error, "hy4 dfly: scratch allocation failed");
+     return nullptr;
+   }
++  if (hipHostMalloc(reinterpret_cast<void**>(&d->io_), sizeof(HostIo)) != hipSuccess) {
++    d->io_ = nullptr;
++    Fail(error, "hy4 dfly: pinned allocation failed");
++    return nullptr;
++  }
++  const Tensor& out = target.weights().output;
++  d->head_ = out;
++  if (out.type == HY4_TYPE_F16 && out.dims.size() >= 2 && out.dims[0] % 32 == 0) {
++    const std::uint64_t blocks = out.dims[0] * out.dims[1] / 32;
++    void* q8 = nullptr;
++    if (!DeviceAlloc(reinterpret_cast<std::uint8_t**>(&q8), blocks * sizeof(BlockQ8), own)) {
++      Fail(error, "hy4 dfly: head allocation failed");
++      return nullptr;
++    }
++    if (hy4_quantize_q8_0_half(static_cast<const std::uint16_t*>(out.data), blocks, q8, nullptr) != 0 ||
++        hipDeviceSynchronize() != hipSuccess) {
++      Fail(error, "hy4 dfly: head quantization failed");
++      return nullptr;
++    }
++    d->head_.data = q8;
++    d->head_.type = HY4_TYPE_Q8_0;
++    d->resident_bytes_ += blocks * sizeof(BlockQ8);
++  }
+   std::vector<std::int32_t> iota(b.max_sel);
+   std::iota(iota.begin(), iota.end(), 0);
+   if (hipMemcpy(b.iota, iota.data(), iota.size() * sizeof(std::int32_t), hipMemcpyHostToDevice) != hipSuccess) {
+@@ -349,7 +387,7 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
+ }
+ 
+ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t count, float min_accept,
+-                    std::vector<std::int32_t>* drafts, std::string* error) {
++                    const Pick& pick, std::vector<std::int32_t>* drafts, std::string* error) {
+   drafts->clear();
+   if (count == 0) return true;
+   if (count >= kBlock) return Fail(error, "hy4 dfly: at most 7 drafts per block");
+@@ -448,13 +486,17 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
+   HY4_CHECK(hy4_rms_norm(b.x, final_norm_.f32(), b.xn, n, kHidden, kHidden, kEps, st));
+ 
+   // Slot k predicts the token at a + k from its hidden, corrected by the
+-  // token before it, through the target's LM head.
++  // token before it, through the target's LM head. The confidence head reads
++  // the corrected hidden, so a slot it stops at skips the LM head.
++  HostIo& io = *io_;
++  static_assert(offsetof(HostIo, logits) == offsetof(HostIo, ids) + sizeof io.ids, "one copy reads the candidates");
+   std::int32_t prev = anchor;
+   float accept = 1.0f;
+   for (std::uint32_t k = 1; k <= count; ++k) {
+     const float* h = b.xn + std::size_t{k} * kHidden;
+-    HY4_CHECK(hipMemcpyAsync(b.tokens, &prev, sizeof prev, hipMemcpyHostToDevice, st));
+-    HY4_CHECK(hy4_embed_q8_0(tw.tok_embd.data, b.tokens, 1, kHidden, b.y, st));
++    io.prev = prev;  // read by the copy before the synchronization below
++    HY4_CHECK(hipMemcpyAsync(b.prev, &io.prev, sizeof io.prev, hipMemcpyHostToDevice, st));
++    HY4_CHECK(hy4_embed_q8_0(tw.tok_embd.data, b.prev, 1, kHidden, b.y, st));
+     HY4_CHECK(hy4_rms_norm(h, corr_hnorm_.f32(), b.cat, 1, kHidden, kHidden, kEps, st));
+     HY4_CHECK(hy4_rms_norm(b.y, corr_enorm_.f32(), b.cat + kHidden, 1, kHidden, kHidden, kEps, st));
+     if (!MatVec(corr_gate_, b.cat, b.ffa, kHidden, 2 * kHidden, 1, ex, error)) return false;
+@@ -462,16 +504,20 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
+     HY4_CHECK(hy4_swiglu(b.ffa, b.ffb, nullptr, b.ffc, 1, kHidden, 0.0f, st));
+     if (!MatVec(corr_down_, b.ffc, b.hk, kHidden, kHidden, 1, ex, error)) return false;
+     HY4_CHECK(hy4_add(b.hk, h, b.hk, kHidden, st));
+-    if (!MatVec(tw.output, b.hk, b.logits, c.n_vocab, kHidden, 1, ex, error)) return false;
+-    HY4_CHECK(hy4_argmax(b.logits, 1, c.n_vocab, b.best, st));
+     // The confidence head: the chance the target accepts this slot's draft.
+     if (!MatVec(confidence_w_, b.hk, b.conf, 1, kHidden, 1, ex, error)) return false;
+-    float logit = 0.0f;
+-    HY4_CHECK(hipMemcpyAsync(&prev, b.best, sizeof prev, hipMemcpyDeviceToHost, st));
+-    HY4_CHECK(hipMemcpyAsync(&logit, b.conf, sizeof logit, hipMemcpyDeviceToHost, st));
++    HY4_CHECK(hipMemcpyAsync(&io.conf, b.conf, sizeof io.conf, hipMemcpyDeviceToHost, st));
+     HY4_CHECK(hipStreamSynchronize(st));
+-    accept *= 1.0f / (1.0f + std::exp(-(logit + confidence_b_)));
++    accept *= 1.0f / (1.0f + std::exp(-(io.conf + confidence_b_)));
+     if (accept < min_accept) break;
++    if (!MatVec(head_, b.hk, b.logits, c.n_vocab, kHidden, 1, ex, error)) return false;
++    HY4_CHECK(hy4_top8(b.logits, c.n_vocab, b.top_work, b.top, reinterpret_cast<float*>(b.top + kCandidates), st));
++    HY4_CHECK(hipMemcpyAsync(io.ids, b.top, sizeof io.ids + sizeof io.logits, hipMemcpyDeviceToHost, st));
++    HY4_CHECK(hipStreamSynchronize(st));
++    prev = pick ? pick(k - 1, std::span<const std::int32_t, kCandidates>(io.ids),
++                       std::span<const float, kCandidates>(io.logits))
++                : io.ids[0];
++    if (prev < 0) break;
+     drafts->push_back(prev);
+   }
+   return true;
+diff --git a/runtime/hy4_dfly.hpp b/runtime/hy4_dfly.hpp
+index 22c4b25..6cc8835 100644
+--- a/runtime/hy4_dfly.hpp
++++ b/runtime/hy4_dfly.hpp
+@@ -2,6 +2,7 @@
+ #define HY4FLASH_RUNTIME_HY4_DFLY_HPP_
+ 
+ #include <cstdint>
++#include <functional>
+ #include <memory>
+ #include <span>
+ #include <string>
+@@ -24,6 +25,11 @@ namespace gufo::models::hy4_flash {
+ class Drafter {
+ public:
+   static constexpr std::uint32_t kBlock = 8;
++  static constexpr std::uint32_t kCandidates = 8;
++  /// Chooses draft `slot` (0-based) from the head's kCandidates best tokens
++  /// and their logits, best first.
++  using Pick = std::function<std::int32_t(std::uint32_t slot, std::span<const std::int32_t, kCandidates> ids,
++                                          std::span<const float, kCandidates> logits)>;
+ 
+   ~Drafter();
+   Drafter(const Drafter&) = delete;
+@@ -42,9 +48,10 @@ public:
+   /// Drafts up to `count` (< kBlock) tokens after `anchor`, the token that
+   /// follows the session's frontier, while the confidence head's estimate
+   /// that the target accepts every draft so far stays at least `min_accept`.
+-  /// Needs the session's taps (TapsReady). May draft nothing.
++  /// `pick` chooses each draft (empty: the best candidate). Needs the
++  /// session's taps (TapsReady). May draft nothing.
+   [[nodiscard]] bool Draft(const Session& session, std::int32_t anchor, std::uint32_t count, float min_accept,
+-                           std::vector<std::int32_t>* drafts, std::string* error);
++                           const Pick& pick, std::vector<std::int32_t>* drafts, std::string* error);
+ 
+ private:
+   struct LayerWeights;
+@@ -57,10 +64,15 @@ private:
+   Tensor fuse_enorm_, fuse_hnorm_, fuse_eh_, fuse_gate_;
+   Tensor corr_hnorm_, corr_enorm_, corr_gate_, corr_up_, corr_down_;
+   Tensor final_norm_, confidence_w_;
++  // The target's LM head for drafts: a Q8_0 copy of a binary16 head (half the
++  // bytes per draft), else the target's own.
++  Tensor head_;
+   float confidence_b_ = 0.0f;
+   std::int32_t mask_token_ = 0;
+   std::unique_ptr<Buffers> buf_;
+   std::vector<void*> allocations_;
++  struct HostIo;
++  HostIo* io_ = nullptr;  // pinned
+   std::uint64_t resident_bytes_ = 0;
+ };
+ 
+diff --git a/tests/draft_sampling_test.cpp b/tests/draft_sampling_test.cpp
+new file mode 100644
+index 0000000..e3e993c
+--- /dev/null
++++ b/tests/draft_sampling_test.cpp
+@@ -0,0 +1,117 @@
++// Speculative sampling with DFly2 proposals: ProposeDraft and VerifyDraft
++// together must emit tokens distributed exactly as the target's own sampler,
++// for diffuse proposals (p / q and residual draws), point masses, and
++// proposals holding tokens the target's filters exclude.
++
++#include <array>
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <random>
++#include <string>
++#include <vector>
++
++#include "draft_sampling.hpp"
++
++namespace {
++
++using gufo::models::hy4_flash::DraftProposal;
++using gufo::models::hy4_flash::ProposeDraft;
++using gufo::models::hy4_flash::VerifyDraft;
++namespace sampling = gufo::sampling;
++
++int g_failures = 0;
++
++void Expect(bool ok, const std::string& what) {
++  if (!ok) {
++    std::fprintf(stderr, "FAIL %s\n", what.c_str());
++    ++g_failures;
++  }
++}
++
++sampling::SamplingConfig Config(float temperature, float top_p) {
++  sampling::SamplingConfig config;
++  config.temperature = temperature;
++  config.top_p = top_p;
++  config.seed = 20261120;
++  return config;
++}
++
++// Draws `trials` tokens through propose + verify and compares their
++// frequencies with the target distribution.
++void CheckExact(const sampling::SamplingConfig& config, const std::vector<float>& target,
++                const std::array<std::int32_t, 8>& ids, const std::array<float, 8>& draft, const std::string& what,
++                std::size_t* point_masses = nullptr) {
++  sampling::SamplerState sampler(config);
++  const auto p = sampler.Distribution(target);
++  constexpr int kTrials = 400000;
++  std::vector<int> counts(target.size());
++  std::size_t points = 0;
++  for (int t = 0; t < kTrials; ++t) {
++    const DraftProposal proposal = ProposeDraft(sampler, ids, draft);
++    points += proposal.size == 1;
++    double mass = 0;
++    for (std::size_t i = 0; i < proposal.size; ++i) mass += proposal.probabilities[i];
++    if (std::fabs(mass - 1.0) > 1e-6) {
++      Expect(false, what + ": q does not sum to one");
++      return;
++    }
++    const auto token = VerifyDraft(sampler, target, proposal);
++    ++counts.at(static_cast<std::size_t>(token));
++  }
++  double worst = 0;
++  for (std::size_t v = 0; v < target.size(); ++v) {
++    const double want = p.probability(static_cast<sampling::TokenId>(v));
++    const double got = static_cast<double>(counts[v]) / kTrials;
++    const double sigma = std::sqrt(std::max(want * (1 - want), 1e-9) / kTrials);
++    worst = std::max(worst, std::fabs(got - want) / sigma);
++    if (want == 0 && counts[v] != 0) Expect(false, what + ": emitted a token the target excludes");
++  }
++  Expect(worst < 5.0, what + ": frequencies off by " + std::to_string(worst) + " sigma");
++  if (point_masses) *point_masses = points;
++}
++
++}  // namespace
++
++int main() {
++  std::mt19937 rng(7);
++  std::uniform_real_distribution<float> dist(-2, 2);
++  std::vector<float> target(24);
++  for (float& x : target) x = dist(rng);
++  // The drafter's candidates: some the target likes, some it does not.
++  const std::array<std::int32_t, 8> ids{3, 17, 0, 9, 22, 5, 11, 14};
++  std::array<float, 8> diffuse{};
++  for (std::size_t i = 0; i < 8; ++i) diffuse[i] = 1.0f - 0.15f * static_cast<float>(i);
++  std::size_t points = 1;
++  CheckExact(Config(0.9F, 1.0F), target, ids, diffuse, "diffuse q, T 0.9", &points);
++  Expect(points == 0, "a diffuse q is not a point mass");
++  CheckExact(Config(0.6F, 0.8F), target, ids, diffuse, "diffuse q, T 0.6, top-p 0.8");
++
++  std::array<float, 8> sharp = diffuse;
++  sharp[0] = 8.0f;
++  CheckExact(Config(0.9F, 1.0F), target, ids, sharp, "point mass", &points);
++  Expect(points == 400000, "a concentrated q is a point mass");
++
++  // The draw follows q: token frequencies of the proposals themselves.
++  {
++    sampling::SamplerState sampler(Config(1.0F, 1.0F));
++    std::array<int, 24> seen{};
++    for (int t = 0; t < 200000; ++t) ++seen[static_cast<std::size_t>(ProposeDraft(sampler, ids, diffuse).token)];
++    double z = 0;
++    for (std::size_t i = 0; i < 8; ++i) z += std::exp(diffuse[i] - diffuse[0]);
++    double worst = 0;
++    for (std::size_t i = 0; i < 8; ++i) {
++      const double want = std::exp(diffuse[i] - diffuse[0]) / z;
++      worst = std::max(worst, std::fabs(seen[static_cast<std::size_t>(ids[i])] / 200000.0 - want) /
++                                  std::sqrt(want * (1 - want) / 200000));
++    }
++    Expect(worst < 5.0, "proposals follow q (" + std::to_string(worst) + " sigma)");
++  }
++
++  if (g_failures) {
++    std::fprintf(stderr, "%d failures\n", g_failures);
++    return 1;
++  }
++  std::printf("hy4 draft sampling: all checks passed\n");
++  return 0;
++}
+diff --git a/tests/kernels_test.cpp b/tests/kernels_test.cpp
+index c9257a2..b61fada 100644
+--- a/tests/kernels_test.cpp
++++ b/tests/kernels_test.cpp
+@@ -902,20 +902,83 @@ void TestElementwise() {
+       want[i] = a[i] + (double)b[i] * c[i % period];
+     Near(Host(x, count), want, 1e-6, "mul_add");
+   }
+-  {
+-    // Ties go to the lowest index; an all -inf row gives 0.
+-    std::vector<float> x = Random(4 * dim);
+-    x[0 * dim + 10] = x[0 * dim + 70] = 5.0f;
+-    x[1 * dim + 99] = 4.0f;
+-    std::fill(x.begin() + 2 * dim, x.begin() + 3 * dim, -INFINITY);
+-    int32_t* out = Device(std::vector<int32_t>(4));
+-    Expect(hy4_argmax(Device(x), 4, dim, out, nullptr) == 0, "argmax status");
+-    const auto got = Host(out, 4);
+-    const int32_t last =
+-        (int32_t)(std::max_element(x.begin() + 3 * dim, x.end()) -
+-                  (x.begin() + 3 * dim));
+-    Expect(got == std::vector<int32_t>{10, 99, 0, last}, "argmax");
++}
++
++// The 8 best by (value, then lower index), NaN as -inf, from a host sort.
++std::vector<int32_t> HostTop8(const std::vector<float>& x) {
++  std::vector<int32_t> order(x.size());
++  std::iota(order.begin(), order.end(), 0);
++  auto key = [&](int32_t i) { return std::isnan(x[i]) ? -INFINITY : x[i]; };
++  std::partial_sort(order.begin(), order.begin() + 8, order.end(), [&](int32_t a, int32_t b) {
++    return key(a) > key(b) || (key(a) == key(b) && a < b);
++  });
++  order.resize(8);
++  return order;
++}
++
++void TestTop8() {
++  float* work = Device(std::vector<float>(hy4_top8_work_floats()));
++  int32_t* ids = Device(std::vector<int32_t>(8));
++  float* vals = Device(std::vector<float>(8));
++  auto check = [&](const std::vector<float>& x, const std::string& what) {
++    Expect(hy4_top8(Device(x), (uint32_t)x.size(), work, ids, vals, nullptr) == 0, what + " status");
++    const auto want = HostTop8(x);
++    Expect(Host(ids, 8) == want, what + " ids");
++    const auto got = Host(vals, 8);
++    bool same = true;
++    for (int j = 0; j < 8; ++j) {
++      const float w = std::isnan(x[want[j]]) ? -INFINITY : x[want[j]];
++      same &= got[j] == w;
++    }
++    Expect(same, what + " values");
++  };
++  // The Hy4 vocabulary: ties across blocks, +inf, NaN and a run of equal values.
++  auto x = Random(120832, -4, 4);
++  x[77001] = x[501] = 9.0f;
++  x[64000] = INFINITY;
++  x[3] = NAN;
++  for (int i = 0; i < 6; ++i) x[100000 + 7 * i] = 6.0f;
++  x[100100] = 6.0f;
++  check(x, "top8 vocab");
++  // Fewer finite values than 8; most blocks hold only -inf.
++  std::vector<float> sparse(5000, -INFINITY);
++  sparse[4999] = 1.0f;
++  sparse[17] = NAN;
++  sparse[2500] = 2.0f;
++  check(sparse, "top8 sparse");
++  check(Random(8), "top8 eight");
++  check(Random(1000), "top8 small");
++}
++
++void TestQuantizeHalf() {
++  const uint64_t blocks = 3000;
++  std::vector<uint16_t> src(blocks * 32);
++  std::vector<float> values(src.size());
++  for (std::size_t i = 0; i < src.size(); ++i) {
++    const _Float16 h = (_Float16)Random(1, -3, 3)[0];
++    std::memcpy(&src[i], &h, 2);
++    values[i] = (float)h;
++  }
++  for (int i = 0; i < 32; ++i) {  // an all-zero block
++    src[32 + i] = 0;
++    values[32 + i] = 0.0f;
++  }
++  BlockQ8_0* out = Device(std::vector<BlockQ8_0>(blocks));
++  Expect(hy4_quantize_q8_0_half(Device(src), blocks, out, nullptr) == 0, "quantize_q8_0_half status");
++  const auto got = Host(out, blocks);
++  int mismatches = 0;
++  for (uint64_t b = 0; b < blocks; ++b) {
++    float amax = 0.0f;
++    for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(values[b * 32 + i]));
++    const float d = amax / 127.0f;
++    const float inv = d > 0.0f ? 1.0f / d : 0.0f;
++    const _Float16 dh = (_Float16)d;
++    uint16_t dbits;
++    std::memcpy(&dbits, &dh, 2);
++    mismatches += got[b].d != dbits;
++    for (int i = 0; i < 32; ++i) mismatches += got[b].qs[i] != (int8_t)std::nearbyint(values[b * 32 + i] * inv);
+   }
++  Expect(mismatches == 0, "quantize_q8_0_half (" + std::to_string(mismatches) + " mismatches)");
+ }
+ 
+ void TestRoute() {
+@@ -1607,6 +1670,8 @@ int main() {
+   TestMlaAttention();
+   TestMlaPrefill();
+   TestRows();
++  TestTop8();
++  TestQuantizeHalf();
+   TestElementwise();
+   TestRoute();
+   TestEngram();

@@ -163,7 +163,9 @@ struct Drafter::Buffers {
   std::int32_t* tokens = nullptr;  // [kBlock]
   std::int32_t* pos = nullptr;     // [kBlock]
   std::int32_t* iota = nullptr;    // [max selection] 0, 1, ...
-  std::int32_t* best = nullptr;    // [1]
+  std::int32_t* prev = nullptr;    // [1] the token before the slot
+  std::int32_t* best = nullptr;    // [1] the slot's draft
+  float* best_work = nullptr;      // hy4_argmax_work_floats()
   float* conf = nullptr;           // [1] confidence logit
   float* x = nullptr;              // [kBlock][hidden] residual
   float* xn = nullptr;             // [kBlock][hidden]
@@ -190,8 +192,18 @@ struct Drafter::Buffers {
 
 Drafter::Drafter(Model& target) : target_(target), buf_(std::make_unique<Buffers>()) {}
 
+// Host side of each slot's copies: the token before it, the confidence
+// logit and the draft.
+struct Drafter::HostIo {
+  std::int32_t prev;
+  float conf;
+  std::int32_t best;
+};
+
 Drafter::~Drafter() {
   for (void* p : allocations_) (void)hipFree(p);
+  if (io_)
+    (void)hipHostFree(io_);
 }
 
 std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, std::string* error) {
@@ -319,25 +331,62 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
   b.max_sel = c.idx_top_k / c.kpool * c.kpool;
   const std::size_t n_keys = b.max_sel + kBlock;
   std::vector<void*>* own = &d->allocations_;
-  ok = DeviceAlloc(&b.tokens, kBlock, own) && DeviceAlloc(&b.pos, kBlock, own) &&
-       DeviceAlloc(&b.iota, b.max_sel, own) && DeviceAlloc(&b.best, 1, own) && DeviceAlloc(&b.conf, 1, own) &&
-       DeviceAlloc(&b.x, std::size_t{kBlock} * kHidden, own) && DeviceAlloc(&b.xn, std::size_t{kBlock} * kHidden, own) &&
-       DeviceAlloc(&b.y, std::size_t{kBlock} * kHidden, own) && DeviceAlloc(&b.cat, 2 * kHidden, own) &&
-       DeviceAlloc(&b.f, kHidden, own) && DeviceAlloc(&b.qr, std::size_t{kBlock} * kQLora, own) &&
+  ok = DeviceAlloc(&b.tokens, kBlock, own) &&
+       DeviceAlloc(&b.pos, kBlock, own) &&
+       DeviceAlloc(&b.iota, b.max_sel, own) && DeviceAlloc(&b.prev, 1, own) &&
+       DeviceAlloc(&b.best, 1, own) &&
+       DeviceAlloc(&b.best_work, hy4_argmax_work_floats(), own) &&
+       DeviceAlloc(&b.conf, 1, own) &&
+       DeviceAlloc(&b.x, std::size_t{kBlock} * kHidden, own) &&
+       DeviceAlloc(&b.xn, std::size_t{kBlock} * kHidden, own) &&
+       DeviceAlloc(&b.y, std::size_t{kBlock} * kHidden, own) &&
+       DeviceAlloc(&b.cat, 2 * kHidden, own) &&
+       DeviceAlloc(&b.f, kHidden, own) &&
+       DeviceAlloc(&b.qr, std::size_t{kBlock} * kQLora, own) &&
        DeviceAlloc(&b.q, std::size_t{kBlock} * kHeads * kHeadK, own) &&
        DeviceAlloc(&b.kva, std::size_t{kBlock} * kLatent, own) &&
        DeviceAlloc(&b.qfull, std::size_t{kBlock} * kHeads * kLatent, own) &&
-       DeviceAlloc(&b.keys, n_keys * kLatent, own) && DeviceAlloc(&b.mask, kBlock * n_keys, own) &&
+       DeviceAlloc(&b.keys, n_keys * kLatent, own) &&
+       DeviceAlloc(&b.mask, kBlock * n_keys, own) &&
        DeviceAlloc(&b.scores, std::size_t{kBlock} * kHeads * n_keys, own) &&
        DeviceAlloc(&b.att, std::size_t{kBlock} * kHeads * kKvLora, own) &&
        DeviceAlloc(&b.attv, std::size_t{kBlock} * kHeads * kHeadV, own) &&
        DeviceAlloc(&b.gate, std::size_t{kBlock} * kHeads * kHeadV, own) &&
-       DeviceAlloc(&b.ffa, std::size_t{kBlock} * kInter, own) && DeviceAlloc(&b.ffb, std::size_t{kBlock} * kInter, own) &&
-       DeviceAlloc(&b.ffc, std::size_t{kBlock} * kInter, own) && DeviceAlloc(&b.hk, kHidden, own) &&
+       DeviceAlloc(&b.ffa, std::size_t{kBlock} * kInter, own) &&
+       DeviceAlloc(&b.ffb, std::size_t{kBlock} * kInter, own) &&
+       DeviceAlloc(&b.ffc, std::size_t{kBlock} * kInter, own) &&
+       DeviceAlloc(&b.hk, kHidden, own) &&
        DeviceAlloc(&b.logits, c.n_vocab, own);
   if (!ok) {
     Fail(error, "hy4 dfly: scratch allocation failed");
     return nullptr;
+  }
+  if (hipHostMalloc(reinterpret_cast<void**>(&d->io_), sizeof(HostIo)) !=
+      hipSuccess) {
+    d->io_ = nullptr;
+    Fail(error, "hy4 dfly: pinned allocation failed");
+    return nullptr;
+  }
+  const Tensor& out = target.weights().output;
+  d->head_ = out;
+  if (out.type == HY4_TYPE_F16 && out.dims.size() >= 2 &&
+      out.dims[0] % 32 == 0) {
+    const std::uint64_t blocks = out.dims[0] * out.dims[1] / 32;
+    void* q8 = nullptr;
+    if (!DeviceAlloc(reinterpret_cast<std::uint8_t**>(&q8),
+                     blocks * sizeof(BlockQ8), own)) {
+      Fail(error, "hy4 dfly: head allocation failed");
+      return nullptr;
+    }
+    if (hy4_quantize_q8_0_half(static_cast<const std::uint16_t*>(out.data),
+                               blocks, q8, nullptr) != 0 ||
+        hipDeviceSynchronize() != hipSuccess) {
+      Fail(error, "hy4 dfly: head quantization failed");
+      return nullptr;
+    }
+    d->head_.data = q8;
+    d->head_.type = HY4_TYPE_Q8_0;
+    d->resident_bytes_ += blocks * sizeof(BlockQ8);
   }
   std::vector<std::int32_t> iota(b.max_sel);
   std::iota(iota.begin(), iota.end(), 0);
@@ -448,13 +497,17 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
   HY4_CHECK(hy4_rms_norm(b.x, final_norm_.f32(), b.xn, n, kHidden, kHidden, kEps, st));
 
   // Slot k predicts the token at a + k from its hidden, corrected by the
-  // token before it, through the target's LM head.
+  // token before it, through the target's LM head. The confidence head reads
+  // the corrected hidden, so a slot it stops at skips the LM head.
+  HostIo& io = *io_;
   std::int32_t prev = anchor;
   float accept = 1.0f;
   for (std::uint32_t k = 1; k <= count; ++k) {
     const float* h = b.xn + std::size_t{k} * kHidden;
-    HY4_CHECK(hipMemcpyAsync(b.tokens, &prev, sizeof prev, hipMemcpyHostToDevice, st));
-    HY4_CHECK(hy4_embed_q8_0(tw.tok_embd.data, b.tokens, 1, kHidden, b.y, st));
+    io.prev = prev;  // read by the copy before the synchronization below
+    HY4_CHECK(hipMemcpyAsync(b.prev, &io.prev, sizeof io.prev,
+                             hipMemcpyHostToDevice, st));
+    HY4_CHECK(hy4_embed_q8_0(tw.tok_embd.data, b.prev, 1, kHidden, b.y, st));
     HY4_CHECK(hy4_rms_norm(h, corr_hnorm_.f32(), b.cat, 1, kHidden, kHidden, kEps, st));
     HY4_CHECK(hy4_rms_norm(b.y, corr_enorm_.f32(), b.cat + kHidden, 1, kHidden, kHidden, kEps, st));
     if (!MatVec(corr_gate_, b.cat, b.ffa, kHidden, 2 * kHidden, 1, ex, error)) return false;
@@ -462,16 +515,20 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
     HY4_CHECK(hy4_swiglu(b.ffa, b.ffb, nullptr, b.ffc, 1, kHidden, 0.0f, st));
     if (!MatVec(corr_down_, b.ffc, b.hk, kHidden, kHidden, 1, ex, error)) return false;
     HY4_CHECK(hy4_add(b.hk, h, b.hk, kHidden, st));
-    if (!MatVec(tw.output, b.hk, b.logits, c.n_vocab, kHidden, 1, ex, error)) return false;
-    HY4_CHECK(hy4_argmax(b.logits, 1, c.n_vocab, b.best, st));
     // The confidence head: the chance the target accepts this slot's draft.
     if (!MatVec(confidence_w_, b.hk, b.conf, 1, kHidden, 1, ex, error)) return false;
-    float logit = 0.0f;
-    HY4_CHECK(hipMemcpyAsync(&prev, b.best, sizeof prev, hipMemcpyDeviceToHost, st));
-    HY4_CHECK(hipMemcpyAsync(&logit, b.conf, sizeof logit, hipMemcpyDeviceToHost, st));
+    HY4_CHECK(hipMemcpyAsync(&io.conf, b.conf, sizeof io.conf,
+                             hipMemcpyDeviceToHost, st));
     HY4_CHECK(hipStreamSynchronize(st));
-    accept *= 1.0f / (1.0f + std::exp(-(logit + confidence_b_)));
+    accept *= 1.0f / (1.0f + std::exp(-(io.conf + confidence_b_)));
     if (accept < min_accept) break;
+    if (!MatVec(head_, b.hk, b.logits, c.n_vocab, kHidden, 1, ex, error))
+      return false;
+    HY4_CHECK(hy4_argmax(b.logits, c.n_vocab, b.best_work, b.best, st));
+    HY4_CHECK(hipMemcpyAsync(&io.best, b.best, sizeof io.best,
+                             hipMemcpyDeviceToHost, st));
+    HY4_CHECK(hipStreamSynchronize(st));
+    prev = io.best;
     drafts->push_back(prev);
   }
   return true;

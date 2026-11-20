@@ -1255,20 +1255,79 @@ __global__ void __launch_bounds__(256)
   }
 }
 
-__global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
-  __shared__ float scratch[32];
-  __shared__ int32_t picked;
-  const float* row = x + (uint64_t)blockIdx.x * dim;
-  float best = -INFINITY;
-  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) best = fmaxf(best, row[i]);
-  best = BlockMax(best, scratch);
-  if (threadIdx.x == 0) picked = (int32_t)dim;
-  __syncthreads();
-  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
-    if (row[i] == best) atomicMin(&picked, (int32_t)i);
+// The index of a row's largest value, the lower index on ties (NaN counts as
+// -inf), in two launches: kArgBlocks blocks each reduce a chunk to its best
+// (value, index), then one block reduces those.
+constexpr uint32_t kArgBlocks = 64;
+
+__device__ __forceinline__ bool Better(float a, int32_t ia, float b,
+                                       int32_t ib) {
+  return a > b || (a == b && ia < ib);
+}
+
+// Block b reduces x[b chunk .. (b + 1) chunk) (indices idx, else positions)
+// to out_v/out_i[b].
+__global__ void ArgmaxRows(const float* x, const int32_t* idx, uint32_t count,
+                           uint32_t chunk, float* out_v, int32_t* out_i) {
+  __shared__ float sv[kBlock / 32];
+  __shared__ int32_t si[kBlock / 32];
+  float v = -INFINITY;
+  int32_t id = INT32_MAX;
+  const uint32_t lo = blockIdx.x * chunk, hi = min(count, lo + chunk);
+  for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+    float e = x[i];
+    if (e != e)
+      e = -INFINITY;
+    const int32_t ie = idx ? idx[i] : (int32_t)i;
+    if (Better(e, ie, v, id)) {
+      v = e;
+      id = ie;
+    }
+  }
+  for (int o = warpSize / 2; o > 0; o >>= 1) {
+    const float ov = __shfl_xor(v, o);
+    const int32_t oi = __shfl_xor(id, o);
+    if (Better(ov, oi, v, id)) {
+      v = ov;
+      id = oi;
+    }
+  }
+  const int lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
+  if (lane == 0) {
+    sv[warp] = v;
+    si[warp] = id;
   }
   __syncthreads();
-  if (threadIdx.x == 0) out[blockIdx.x] = picked == (int32_t)dim ? 0 : picked;
+  if (threadIdx.x != 0)
+    return;
+  for (int w = 1; w < (int)((blockDim.x + warpSize - 1) / warpSize); ++w)
+    if (Better(sv[w], si[w], v, id)) {
+      v = sv[w];
+      id = si[w];
+    }
+  out_v[blockIdx.x] = v;
+  out_i[blockIdx.x] = id;
+}
+
+// Q8_0 blocks of 32 binary16 values: d = max |v| / 127, q = round(v / d).
+__global__ void QuantizeQ8Half(const _Float16* src, BlockQ8_0* dst,
+                               uint64_t blocks) {
+  const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= blocks)
+    return;
+  float v[32];
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 32; ++i) {
+    v[i] = (float)src[b * 32 + i];
+    amax = fmaxf(amax, fabsf(v[i]));
+  }
+  const float d = amax / 127.0f;
+  const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+  dst[b].d = (__half)d;
+#pragma unroll
+  for (int i = 0; i < 32; ++i)
+    dst[b].qs[i] = (int8_t)rintf(v[i] * inv);
 }
 
 // ------------------------------------------------- fused prefill attention
@@ -2085,9 +2144,31 @@ int hy4_sgemm_nt(const float* x, const float* w, float* y, uint32_t n,
   return Status();
 }
 
-int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream) {
-  if (n == 0) return 0;
-  Argmax<<<n, kBlock, 0, stream>>>(x, dim, out);
+uint64_t hy4_argmax_work_floats(void) {
+  return 2ull * kArgBlocks + 1;
+}
+
+int hy4_argmax(const float* x, uint32_t dim, float* work, int32_t* out,
+               hipStream_t stream) {
+  if (dim == 0)
+    return 1;
+  float* part_v = work;
+  int32_t* part_i = reinterpret_cast<int32_t*>(work + kArgBlocks);
+  const uint32_t chunk = (dim + kArgBlocks - 1) / kArgBlocks;
+  ArgmaxRows<<<kArgBlocks, kBlock, 0, stream>>>(x, nullptr, dim, chunk, part_v,
+                                                part_i);
+  ArgmaxRows<<<1, kBlock, 0, stream>>>(part_v, part_i, kArgBlocks, kArgBlocks,
+                                       part_v + 2 * kArgBlocks, out);
+  return Status();
+}
+
+int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst,
+                           hipStream_t stream) {
+  if (blocks == 0)
+    return 0;
+  QuantizeQ8Half<<<(blocks + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+      reinterpret_cast<const _Float16*>(src), static_cast<BlockQ8_0*>(dst),
+      blocks);
   return Status();
 }
 

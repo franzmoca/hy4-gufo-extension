@@ -239,7 +239,15 @@ int hy4_gather_indexed(const uint16_t* src, uint32_t ring, const int32_t* idx,
 int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64_t period, hipStream_t stream);
 /* out [blocks * 32] = dequantized Q8_0 blocks. */
 int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t stream);
-int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream);
+/* *out = the index of the largest of x [dim] (dim > 0); ties go to the lower
+ * index and NaN counts as -inf. work holds hy4_argmax_work_floats() floats. */
+uint64_t hy4_argmax_work_floats(void);
+int hy4_argmax(const float* x, uint32_t dim, float* work, int32_t* out,
+               hipStream_t stream);
+/* dst [blocks] = Q8_0 blocks of src [blocks * 32] binary16 values:
+ * d = max |v| / 127 (binary16), q = v / d rounded to nearest even. */
+int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst,
+                           hipStream_t stream);
 /* y [n][m] = x [n][k] w^T for w [m][k], all FP32; each output sums its k
  * products in order, so a token's row does not depend on n. k must be a
  * multiple of 32. */

@@ -36,6 +36,8 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E28 | Verify passes: four rows per warp in the float and grouped GEMVs | retained |
 | E29 | Fused decode attention over each token's own keys | retained |
 | E30 | Binary16 KV cache | retained |
+| E31 | DFly2 drafts through a Q8_0 copy of the LM head | retained |
+| E32 | Sampled drafts from the drafter's distribution | rejected |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -678,3 +680,98 @@ rows are now computed once.
 
 Gufo's `conversation`, `long-context` and `cache` suites (with DFly2 and
 vision, disk prompt cache included): 16 of 16 cases pass. Retained.
+
+## E31: DFly2 drafts through a Q8_0 copy of the LM head (2026-11-20)
+
+At the model's default sampling (temperature 0.9, top-p 1) DFly2 already
+decodes 19.8 to 27.2 tok/s against 16.6 without it, with the same replies.
+A cycle (HY4_DFLY_PROFILE, six replies) spent 18.4 ms drafting and 85.6 ms
+verifying, and a sweep of the confidence cut-off at temperature 0.9 (three
+prompts, seeds 1-3, mirrored order, identical replies in every arm) kept
+0.45:
+
+| cut-off | tok/s | drafted / accepted per cycle | draft | verify |
+| --- | --- | --- | --- | --- |
+| 0.15 | 22.06 | 3.85 / 1.70 | 22.7 ms | 97.8 ms |
+| 0.30 | 23.05 | 3.06 / 1.60 | 20.1 ms | 90.3 ms |
+| 0.45 | 23.69 | 2.32 / 1.43 | 17.5 ms | 82.9 ms |
+| 0.60 | 23.25 | 1.67 / 1.18 | 15.3 ms | 76.6 ms |
+
+A draft costs about 3.4 ms in the drafter on top of its 9.7 ms row in the
+verify pass. A kernel trace shows where: each slot scored the target's
+binary16 LM head (120,832 × 3,072, 3.08 ms at 240 GB/s), then a one-block
+argmax read the logits (0.19 ms), against 0.23 ms for the correction MLP.
+The slot the confidence head stopped at paid for both too, since the
+confidence was read after the head.
+
+Drafts now score a Q8_0 copy of the head, made on the device at load (394
+MB), the argmax runs in two launches over 64 blocks, and each slot reads the
+confidence before the head, so the slot it stops at skips the head. The
+target's own head and every verified token are unchanged. Drafting takes
+10.8 ms per cycle instead of 17 to 18.
+
+Mirrored order (base, E31, E31, base; plus the E32 arms in between), a fresh
+server each; four greedy requests (code, prose, list, a 3,500-token summary)
+and twelve sampled ones (the three prompts, seeds 1-4, temperature 0.9).
+Every reply is identical in all arms. Greedy drafts accept 549 of 839
+tokens instead of 548 of 838 (the Q8_0 head changes one draft), and sampled
+drafts 1,594 of 2,609 instead of 1,593 of 2,611.
+
+| | base | E31 |
+| --- | --- | --- |
+| greedy, pooled (tok/s) | 24.30 | 26.03 |
+| code / prose / list / long | 32.1 / 19.5 / 24.9 / 23.7 | 34.7 / 20.8 / 26.7 / 25.4 |
+| sampled, pooled (tok/s) | 23.60 | 25.26 |
+| code / prose / list | 27.8 / 19.9 / 24.4 | 30.0 / 21.2 / 26.1 |
+
+Geometric mean over the pairs: +7.3% greedy, +7.2% sampled (12/12 faster);
+the two arms of each kind agree within 0.3%. The drafter's resident memory
+grows from 0.90 to 1.29 GB; a 1,048,576-token session with DFly2 and vision
+still loads (122.7 of 124.4 GiB of device memory in use, 4.7 GB of host
+memory available) and answers. Scripts and per-request numbers:
+[artifacts/2026-11-20-draft-tail/](artifacts/2026-11-20-draft-tail/).
+Retained.
+
+## E32: Sampled drafts from the drafter's distribution (2026-11-20)
+
+A sampled request keeps a greedy draft d with probability p(d), the target's
+probability for it. Speculative sampling with a proposal distribution q
+keeps a draft with probability min(1, p/q) and draws from max(0, p - q)
+otherwise, so a q close to p accepts more. Tencent's reference serving code
+(SGLang PR 51159) drafts the argmax, ignores the confidence head and
+verifies target-only, as here. Gufo's DeepSeek V4 Flash and the DeepSeek
+V4.1 Flash extension draw from a bounded q: the drafter's top 8 at the
+request's temperature, or a point mass when its best holds at least 0.7; the
+V4.1 extension gained 3.85% with it, after also stopping each draft at the
+first proposal whose q best is under 0.6.
+
+Host sampling took 1.8 ms of a 106 ms sampled cycle (0.3 ms for the anchor,
+0.5 ms per verified row), so moving the draws to the device was not tried.
+
+Ported on top of E31: the drafter picks its top 8 with a two-stage kernel,
+the runner draws each draft from q with the request's generator, and the
+verify pass keeps or replaces it with p/q acceptance and a residual draw (a
+point mass samples the target and compares, as before). A CPU test drew
+400,000 tokens through proposal and verification for diffuse q, top-p 0.8
+and point masses: frequencies matched the target within 5 sigma, and a
+deliberately wrong residual draw failed it at 154 sigma. The replies differ
+from plain decoding (the proposal draws use the request's generator) but
+repeat exactly for a seed.
+
+Against E31, temperature 0.9, a fresh server each in mirrored order:
+
+| | E31 | q from the top 8 | and stop at q best < 0.6 |
+| --- | --- | --- | --- |
+| seeds 1-4: tok/s, pooled | 25.26 | 24.94 | |
+| tokens per verify pass | 2.42 | 2.37 | |
+| accepted / drafted | 61.1% | 60.7% | |
+| seeds 1-6: tok/s, pooled | 26.10 | | 25.77 |
+| tokens per verify pass | 2.55 | | 2.34 |
+| accepted / drafted | 63.2% | | 71.9% |
+
+Geometric means over the pairs: +1.4% for q from the top 8 (code +8%, prose
+-3.6%, list -2%) and -0.3% with the stop rule (8 of 18 faster, per-pair SD
+12%). The proposals change the continuation, so per-request rates measure
+different text; the cycle statistics do not, and neither variant emits more
+tokens per verify pass. Rejected; the patch is
+[artifacts/2026-11-20-draft-tail/stochastic-q.patch](artifacts/2026-11-20-draft-tail/stochastic-q.patch).

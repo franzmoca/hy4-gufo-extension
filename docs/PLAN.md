@@ -89,13 +89,14 @@ Not needed: expert streaming. The trunk is resident.
 
 ## Memory budget (124 GiB host)
 
-- Trunk 91.1 GiB (97.8 GB), vision 1 GB, DFly2 about 1 GB at Q8_0.
+- Trunk 91.1 GiB (97.8 GB), vision 1 GB, DFly2 1.3 GB at Q8_0 (0.9 GB of
+  layers and, since E31, a 394 MB copy of the LM head for drafts).
 - KV (binary16 since E30): the 12 sparse layers × 576 × 2 bytes come to
   13.8 KB per token; the indexer's pooled keys add 1.5 KB and its score buffer
   2 KB, about 17.4 KB per token of session context (18 GB at 1M). The 30 SWA
   layers hold rings of 2,560 rows. With DFly2 and vision, a 1,048,576-token
-  session loads with 122.6 of 124 GiB of device memory in use; the prompt cache
-  shrinks to 3.4 GB.
+  session loads with 122.7 of 124.4 GiB of device memory in use (E31); the
+  prompt cache shrinks to 3.4 GB.
 - What's left goes to the page cache for the 63.4 GB Engram file (its hot rows),
   the prompt cache and the runtime. Decode reads 64 rows per token
   (4 layers × 2 orders × 8 heads), 96 bytes each.
@@ -237,7 +238,8 @@ These are judgment calls made without the maintainer; revisit any of them.
 15. **DFly2 runs from the safetensors file, quantized at load.** No GGUF
     converter: the loader reads the BF16 `model.dfly_layers.*` tensors of the
     Tencent shard (a file or the checkpoint directory, `--dfly-model`) and
-    uploads Q8_0 matrices and F32 norms (0.9 GB). The draft only decides how
+    uploads Q8_0 matrices and F32 norms (0.9 GB), plus a Q8_0 copy of the
+    target's binary16 LM head for drafts (E31). The draft only decides how
     many target tokens one pass checks, so its rounding costs acceptance,
     never output. The design, from AngelSpec's `dfly2` code (public, read
     only): a block of 8 slots at positions a .. a + 7, the anchor a (sampled
@@ -252,7 +254,10 @@ These are judgment calls made without the maintainer; revisit any of them.
     the target's pair layout at the sparse base (1e7). Slot k >= 1 predicts
     a + k: its final-normed hidden plus the hidden correction on the previous
     token's embedding (the anchor, then slot k - 1's draft), through the
-    target's LM head. The confidence head sets the draft length (decision 18).
+    target's LM head (its Q8_0 copy). The confidence head sets the draft
+    length (decision 18), read before the head so the slot it stops at skips
+    it. Drafts are the head's argmax at any temperature: drawing them from
+    the drafter's distribution did not emit more tokens per pass (E32).
 16. **Speculative steps inside the runner.** `DecodeStep` samples the anchor,
     drafts `--dfly-draft-tokens` (default 3) tokens, verifies anchor and drafts
     in one pass (`Session::Verify`), and walks the rows with the request's own
@@ -549,6 +554,15 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   (E28), and attention runs all the pass's tokens in three launches per
   layer (E29). The difference is now mostly the routed experts (43 ms against
   14): four tokens name about 2.6 times as many distinct experts as one.
+
+- **Drafting** (E31-E32, 2026-11-20). A DFly2 cycle at the 0.45 cut-off
+  drafts about 2.3 tokens: 10.8 ms of drafting (17-18 ms before E31, when
+  every slot read the binary16 LM head) and about 60 ms + 9.7 ms per draft
+  of verification. The five draft layers over the block are most of what is
+  left (about 5 ms of Q8_0 GEMVs at about 200 GB/s); each slot adds the
+  correction MLP, the Q8_0 head (about 1.7 ms) and two host
+  synchronizations. Sampled requests spend 1.8 ms per cycle on the host
+  sampler, which device draws could recover.
 
 - **Prefill batch invariance** (done, E17-E18). A token's result depended
   on the passes its span was cut into, so a restore re-prefilling a gap in

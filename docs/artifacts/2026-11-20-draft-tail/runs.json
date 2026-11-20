@@ -1,0 +1,1385 @@
+{
+ "note": "Hy4 Flash Q4_K_M + DFly2, gufo serve, context 32768, reasoning_effort none, 400 tokens (long: 300). Fresh server per arm, order as listed. base = e6bb904; tail = E31; stochastic = E32 (q from the top 8, point mass at >= 0.7); qcut = E32 with drafting stopped at q best < 0.6. Run 2 sends only the sampled requests, seeds 1-6. The tail binary measured here picked drafts with a top-8 kernel's best; the committed two-stage argmax gives the same replies, drafts and speed.",
+ "run1_order": [
+  "base1",
+  "tail1",
+  "stochastic1",
+  "stochastic2",
+  "tail2",
+  "base2"
+ ],
+ "run1": {
+  "base1": {
+   "greedy/code": {
+    "completion_tokens": 237,
+    "decode_tps": 32.09882021562358,
+    "draft_tokens": 257,
+    "draft_accepted": 180,
+    "rounds": 57,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "greedy/prose": {
+    "completion_tokens": 223,
+    "decode_tps": 19.543399532534572,
+    "draft_tokens": 169,
+    "draft_accepted": 90,
+    "rounds": 133,
+    "reply_sha256": "772a59834f7f0cf8"
+   },
+   "greedy/list": {
+    "completion_tokens": 166,
+    "decode_tps": 24.930243204617703,
+    "draft_tokens": 148,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "c079d516336dead3"
+   },
+   "greedy/long": {
+    "completion_tokens": 300,
+    "decode_tps": 23.611345604347875,
+    "draft_tokens": 264,
+    "draft_accepted": 179,
+    "rounds": 121,
+    "reply_sha256": "5bf1ec7ce3e6ebf5"
+   },
+   "sampled/code/1": {
+    "completion_tokens": 233,
+    "decode_tps": 28.71561522846744,
+    "draft_tokens": 283,
+    "draft_accepted": 172,
+    "rounds": 60,
+    "reply_sha256": "86cf665b5c8dc064"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 120,
+    "decode_tps": 25.014474422381912,
+    "draft_tokens": 160,
+    "draft_accepted": 82,
+    "rounds": 37,
+    "reply_sha256": "49ec81a0ad1e47bf"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 169,
+    "decode_tps": 26.859747876332516,
+    "draft_tokens": 213,
+    "draft_accepted": 120,
+    "rounds": 48,
+    "reply_sha256": "c83f61ddd0282636"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 240,
+    "decode_tps": 29.32291675324181,
+    "draft_tokens": 276,
+    "draft_accepted": 177,
+    "rounds": 62,
+    "reply_sha256": "9deee6fe291501eb"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 196,
+    "decode_tps": 19.05226914550312,
+    "draft_tokens": 173,
+    "draft_accepted": 82,
+    "rounds": 113,
+    "reply_sha256": "b920ccefe4bc3dd3"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 215,
+    "decode_tps": 20.36693575996784,
+    "draft_tokens": 161,
+    "draft_accepted": 95,
+    "rounds": 119,
+    "reply_sha256": "7374514b2a335d0e"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 202,
+    "decode_tps": 20.499772024369435,
+    "draft_tokens": 160,
+    "draft_accepted": 92,
+    "rounds": 109,
+    "reply_sha256": "2cbe557ec55da03b"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 203,
+    "decode_tps": 19.609711808497924,
+    "draft_tokens": 164,
+    "draft_accepted": 87,
+    "rounds": 115,
+    "reply_sha256": "875750aac4d70f5b"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 26.005706629068822,
+    "draft_tokens": 352,
+    "draft_accepted": 252,
+    "rounds": 146,
+    "reply_sha256": "a76c24216c1fc4b3"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 375,
+    "decode_tps": 24.090232309383477,
+    "draft_tokens": 340,
+    "draft_accepted": 221,
+    "rounds": 153,
+    "reply_sha256": "024f94e7de3e7524"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 197,
+    "decode_tps": 23.529616416864386,
+    "draft_tokens": 154,
+    "draft_accepted": 108,
+    "rounds": 88,
+    "reply_sha256": "511debe7eb5ec872"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 189,
+    "decode_tps": 22.610464968962585,
+    "draft_tokens": 175,
+    "draft_accepted": 105,
+    "rounds": 83,
+    "reply_sha256": "7a4658830e210ae9"
+   }
+  },
+  "tail1": {
+   "greedy/code": {
+    "completion_tokens": 237,
+    "decode_tps": 34.622382377026454,
+    "draft_tokens": 258,
+    "draft_accepted": 181,
+    "rounds": 56,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "greedy/prose": {
+    "completion_tokens": 223,
+    "decode_tps": 20.80863589115346,
+    "draft_tokens": 169,
+    "draft_accepted": 90,
+    "rounds": 133,
+    "reply_sha256": "772a59834f7f0cf8"
+   },
+   "greedy/list": {
+    "completion_tokens": 166,
+    "decode_tps": 26.746747545952474,
+    "draft_tokens": 148,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "c079d516336dead3"
+   },
+   "greedy/long": {
+    "completion_tokens": 300,
+    "decode_tps": 25.394483437482823,
+    "draft_tokens": 264,
+    "draft_accepted": 179,
+    "rounds": 121,
+    "reply_sha256": "5bf1ec7ce3e6ebf5"
+   },
+   "sampled/code/1": {
+    "completion_tokens": 233,
+    "decode_tps": 30.892546897494153,
+    "draft_tokens": 283,
+    "draft_accepted": 172,
+    "rounds": 60,
+    "reply_sha256": "86cf665b5c8dc064"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 120,
+    "decode_tps": 26.926232671504877,
+    "draft_tokens": 160,
+    "draft_accepted": 82,
+    "rounds": 37,
+    "reply_sha256": "49ec81a0ad1e47bf"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 169,
+    "decode_tps": 28.909201853090448,
+    "draft_tokens": 213,
+    "draft_accepted": 120,
+    "rounds": 48,
+    "reply_sha256": "c83f61ddd0282636"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 240,
+    "decode_tps": 31.798044261287707,
+    "draft_tokens": 277,
+    "draft_accepted": 178,
+    "rounds": 61,
+    "reply_sha256": "9deee6fe291501eb"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 196,
+    "decode_tps": 20.32040689046962,
+    "draft_tokens": 173,
+    "draft_accepted": 82,
+    "rounds": 113,
+    "reply_sha256": "b920ccefe4bc3dd3"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 215,
+    "decode_tps": 21.548548727287887,
+    "draft_tokens": 161,
+    "draft_accepted": 94,
+    "rounds": 120,
+    "reply_sha256": "7374514b2a335d0e"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 202,
+    "decode_tps": 21.85767663785277,
+    "draft_tokens": 160,
+    "draft_accepted": 92,
+    "rounds": 109,
+    "reply_sha256": "2cbe557ec55da03b"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 203,
+    "decode_tps": 20.99824266358819,
+    "draft_tokens": 164,
+    "draft_accepted": 87,
+    "rounds": 115,
+    "reply_sha256": "875750aac4d70f5b"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 27.822478821339583,
+    "draft_tokens": 351,
+    "draft_accepted": 252,
+    "rounds": 146,
+    "reply_sha256": "a76c24216c1fc4b3"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 375,
+    "decode_tps": 25.800832925234502,
+    "draft_tokens": 339,
+    "draft_accepted": 221,
+    "rounds": 153,
+    "reply_sha256": "024f94e7de3e7524"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 197,
+    "decode_tps": 25.347054243796556,
+    "draft_tokens": 153,
+    "draft_accepted": 109,
+    "rounds": 87,
+    "reply_sha256": "511debe7eb5ec872"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 189,
+    "decode_tps": 24.28335527246686,
+    "draft_tokens": 175,
+    "draft_accepted": 105,
+    "rounds": 83,
+    "reply_sha256": "7a4658830e210ae9"
+   }
+  },
+  "stochastic1": {
+   "greedy/code": {
+    "completion_tokens": 237,
+    "decode_tps": 34.83791394475498,
+    "draft_tokens": 258,
+    "draft_accepted": 181,
+    "rounds": 56,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "greedy/prose": {
+    "completion_tokens": 223,
+    "decode_tps": 20.81523153368967,
+    "draft_tokens": 169,
+    "draft_accepted": 90,
+    "rounds": 133,
+    "reply_sha256": "772a59834f7f0cf8"
+   },
+   "greedy/list": {
+    "completion_tokens": 166,
+    "decode_tps": 26.753067475169043,
+    "draft_tokens": 148,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "c079d516336dead3"
+   },
+   "greedy/long": {
+    "completion_tokens": 300,
+    "decode_tps": 25.397937530851895,
+    "draft_tokens": 264,
+    "draft_accepted": 179,
+    "rounds": 121,
+    "reply_sha256": "5bf1ec7ce3e6ebf5"
+   },
+   "sampled/code/1": {
+    "completion_tokens": 222,
+    "decode_tps": 32.854693597241464,
+    "draft_tokens": 261,
+    "draft_accepted": 169,
+    "rounds": 52,
+    "reply_sha256": "44d776961d106ea1"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 169,
+    "decode_tps": 33.20029398620654,
+    "draft_tokens": 187,
+    "draft_accepted": 127,
+    "rounds": 41,
+    "reply_sha256": "6db58af92ff81a52"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 116,
+    "decode_tps": 30.064782195699635,
+    "draft_tokens": 130,
+    "draft_accepted": 82,
+    "rounds": 33,
+    "reply_sha256": "0e47d38610a98bd7"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 224,
+    "decode_tps": 32.65148031216039,
+    "draft_tokens": 263,
+    "draft_accepted": 170,
+    "rounds": 53,
+    "reply_sha256": "a63dcfbd532fc8ab"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 226,
+    "decode_tps": 20.46768216499358,
+    "draft_tokens": 184,
+    "draft_accepted": 94,
+    "rounds": 131,
+    "reply_sha256": "4b364e9f7e468b7a"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 205,
+    "decode_tps": 20.78816371898109,
+    "draft_tokens": 176,
+    "draft_accepted": 90,
+    "rounds": 114,
+    "reply_sha256": "b2f72ab5712c28c1"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 209,
+    "decode_tps": 20.71408289084935,
+    "draft_tokens": 168,
+    "draft_accepted": 88,
+    "rounds": 120,
+    "reply_sha256": "ea1da274d20b395c"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 234,
+    "decode_tps": 19.635341608868902,
+    "draft_tokens": 203,
+    "draft_accepted": 93,
+    "rounds": 140,
+    "reply_sha256": "435570adf94ee9fa"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 281,
+    "decode_tps": 25.686295924621728,
+    "draft_tokens": 254,
+    "draft_accepted": 166,
+    "rounds": 114,
+    "reply_sha256": "d213e49b6bdc3bfc"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 289,
+    "decode_tps": 26.2810007993673,
+    "draft_tokens": 235,
+    "draft_accepted": 169,
+    "rounds": 119,
+    "reply_sha256": "62343580baf467c7"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 184,
+    "decode_tps": 25.1602707193715,
+    "draft_tokens": 173,
+    "draft_accepted": 107,
+    "rounds": 76,
+    "reply_sha256": "04a85bf7fab329b3"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 176,
+    "decode_tps": 24.73901352083262,
+    "draft_tokens": 162,
+    "draft_accepted": 100,
+    "rounds": 75,
+    "reply_sha256": "7b29baee1d1bc7e5"
+   }
+  },
+  "stochastic2": {
+   "greedy/code": {
+    "completion_tokens": 237,
+    "decode_tps": 34.79745753107735,
+    "draft_tokens": 258,
+    "draft_accepted": 181,
+    "rounds": 56,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "greedy/prose": {
+    "completion_tokens": 223,
+    "decode_tps": 20.804033714733066,
+    "draft_tokens": 169,
+    "draft_accepted": 90,
+    "rounds": 133,
+    "reply_sha256": "772a59834f7f0cf8"
+   },
+   "greedy/list": {
+    "completion_tokens": 166,
+    "decode_tps": 26.743647131486668,
+    "draft_tokens": 148,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "c079d516336dead3"
+   },
+   "greedy/long": {
+    "completion_tokens": 300,
+    "decode_tps": 25.37948376798608,
+    "draft_tokens": 264,
+    "draft_accepted": 179,
+    "rounds": 121,
+    "reply_sha256": "5bf1ec7ce3e6ebf5"
+   },
+   "sampled/code/1": {
+    "completion_tokens": 222,
+    "decode_tps": 32.935986588523235,
+    "draft_tokens": 261,
+    "draft_accepted": 169,
+    "rounds": 52,
+    "reply_sha256": "44d776961d106ea1"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 169,
+    "decode_tps": 33.233841065346034,
+    "draft_tokens": 187,
+    "draft_accepted": 127,
+    "rounds": 41,
+    "reply_sha256": "6db58af92ff81a52"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 116,
+    "decode_tps": 30.101873253248144,
+    "draft_tokens": 130,
+    "draft_accepted": 82,
+    "rounds": 33,
+    "reply_sha256": "0e47d38610a98bd7"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 224,
+    "decode_tps": 32.743169472266125,
+    "draft_tokens": 263,
+    "draft_accepted": 170,
+    "rounds": 53,
+    "reply_sha256": "a63dcfbd532fc8ab"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 226,
+    "decode_tps": 20.503374126831066,
+    "draft_tokens": 184,
+    "draft_accepted": 94,
+    "rounds": 131,
+    "reply_sha256": "4b364e9f7e468b7a"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 205,
+    "decode_tps": 20.971182611250896,
+    "draft_tokens": 176,
+    "draft_accepted": 90,
+    "rounds": 114,
+    "reply_sha256": "b2f72ab5712c28c1"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 209,
+    "decode_tps": 20.747011357748956,
+    "draft_tokens": 168,
+    "draft_accepted": 88,
+    "rounds": 120,
+    "reply_sha256": "ea1da274d20b395c"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 234,
+    "decode_tps": 19.769516507164244,
+    "draft_tokens": 203,
+    "draft_accepted": 93,
+    "rounds": 140,
+    "reply_sha256": "435570adf94ee9fa"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 281,
+    "decode_tps": 25.80580335311138,
+    "draft_tokens": 254,
+    "draft_accepted": 166,
+    "rounds": 114,
+    "reply_sha256": "d213e49b6bdc3bfc"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 289,
+    "decode_tps": 26.390096080675555,
+    "draft_tokens": 235,
+    "draft_accepted": 169,
+    "rounds": 119,
+    "reply_sha256": "62343580baf467c7"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 184,
+    "decode_tps": 25.20282014714122,
+    "draft_tokens": 173,
+    "draft_accepted": 107,
+    "rounds": 76,
+    "reply_sha256": "04a85bf7fab329b3"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 176,
+    "decode_tps": 24.884067269067945,
+    "draft_tokens": 162,
+    "draft_accepted": 100,
+    "rounds": 75,
+    "reply_sha256": "7b29baee1d1bc7e5"
+   }
+  },
+  "tail2": {
+   "greedy/code": {
+    "completion_tokens": 237,
+    "decode_tps": 34.823350715304024,
+    "draft_tokens": 258,
+    "draft_accepted": 181,
+    "rounds": 56,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "greedy/prose": {
+    "completion_tokens": 223,
+    "decode_tps": 20.785656152974383,
+    "draft_tokens": 169,
+    "draft_accepted": 90,
+    "rounds": 133,
+    "reply_sha256": "772a59834f7f0cf8"
+   },
+   "greedy/list": {
+    "completion_tokens": 166,
+    "decode_tps": 26.724841223765914,
+    "draft_tokens": 148,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "c079d516336dead3"
+   },
+   "greedy/long": {
+    "completion_tokens": 300,
+    "decode_tps": 25.371872793022114,
+    "draft_tokens": 264,
+    "draft_accepted": 179,
+    "rounds": 121,
+    "reply_sha256": "5bf1ec7ce3e6ebf5"
+   },
+   "sampled/code/1": {
+    "completion_tokens": 233,
+    "decode_tps": 30.877576411044394,
+    "draft_tokens": 283,
+    "draft_accepted": 172,
+    "rounds": 60,
+    "reply_sha256": "86cf665b5c8dc064"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 120,
+    "decode_tps": 26.91478804481504,
+    "draft_tokens": 160,
+    "draft_accepted": 82,
+    "rounds": 37,
+    "reply_sha256": "49ec81a0ad1e47bf"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 169,
+    "decode_tps": 28.90400053774028,
+    "draft_tokens": 213,
+    "draft_accepted": 120,
+    "rounds": 48,
+    "reply_sha256": "c83f61ddd0282636"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 240,
+    "decode_tps": 31.728792229937238,
+    "draft_tokens": 277,
+    "draft_accepted": 178,
+    "rounds": 61,
+    "reply_sha256": "9deee6fe291501eb"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 196,
+    "decode_tps": 20.313938693574833,
+    "draft_tokens": 173,
+    "draft_accepted": 82,
+    "rounds": 113,
+    "reply_sha256": "b920ccefe4bc3dd3"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 215,
+    "decode_tps": 21.53996054708767,
+    "draft_tokens": 161,
+    "draft_accepted": 94,
+    "rounds": 120,
+    "reply_sha256": "7374514b2a335d0e"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 202,
+    "decode_tps": 21.848131931224394,
+    "draft_tokens": 160,
+    "draft_accepted": 92,
+    "rounds": 109,
+    "reply_sha256": "2cbe557ec55da03b"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 203,
+    "decode_tps": 20.959714485571585,
+    "draft_tokens": 164,
+    "draft_accepted": 87,
+    "rounds": 115,
+    "reply_sha256": "875750aac4d70f5b"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 27.823511511647688,
+    "draft_tokens": 351,
+    "draft_accepted": 252,
+    "rounds": 146,
+    "reply_sha256": "a76c24216c1fc4b3"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 375,
+    "decode_tps": 25.777090571449705,
+    "draft_tokens": 339,
+    "draft_accepted": 221,
+    "rounds": 153,
+    "reply_sha256": "024f94e7de3e7524"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 197,
+    "decode_tps": 25.348261700794684,
+    "draft_tokens": 153,
+    "draft_accepted": 109,
+    "rounds": 87,
+    "reply_sha256": "511debe7eb5ec872"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 189,
+    "decode_tps": 24.276972551780602,
+    "draft_tokens": 175,
+    "draft_accepted": 105,
+    "rounds": 83,
+    "reply_sha256": "7a4658830e210ae9"
+   }
+  },
+  "base2": {
+   "greedy/code": {
+    "completion_tokens": 237,
+    "decode_tps": 32.08577328992734,
+    "draft_tokens": 257,
+    "draft_accepted": 180,
+    "rounds": 57,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "greedy/prose": {
+    "completion_tokens": 223,
+    "decode_tps": 19.529860252434982,
+    "draft_tokens": 169,
+    "draft_accepted": 90,
+    "rounds": 133,
+    "reply_sha256": "772a59834f7f0cf8"
+   },
+   "greedy/list": {
+    "completion_tokens": 166,
+    "decode_tps": 24.935698303518592,
+    "draft_tokens": 148,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "c079d516336dead3"
+   },
+   "greedy/long": {
+    "completion_tokens": 300,
+    "decode_tps": 23.785525237714086,
+    "draft_tokens": 264,
+    "draft_accepted": 179,
+    "rounds": 121,
+    "reply_sha256": "5bf1ec7ce3e6ebf5"
+   },
+   "sampled/code/1": {
+    "completion_tokens": 233,
+    "decode_tps": 28.714756824131925,
+    "draft_tokens": 283,
+    "draft_accepted": 172,
+    "rounds": 60,
+    "reply_sha256": "86cf665b5c8dc064"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 120,
+    "decode_tps": 25.03389197297038,
+    "draft_tokens": 160,
+    "draft_accepted": 82,
+    "rounds": 37,
+    "reply_sha256": "49ec81a0ad1e47bf"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 169,
+    "decode_tps": 26.83865674066633,
+    "draft_tokens": 213,
+    "draft_accepted": 120,
+    "rounds": 48,
+    "reply_sha256": "c83f61ddd0282636"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 240,
+    "decode_tps": 29.347715693689704,
+    "draft_tokens": 276,
+    "draft_accepted": 177,
+    "rounds": 62,
+    "reply_sha256": "9deee6fe291501eb"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 196,
+    "decode_tps": 19.04813143865249,
+    "draft_tokens": 173,
+    "draft_accepted": 82,
+    "rounds": 113,
+    "reply_sha256": "b920ccefe4bc3dd3"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 215,
+    "decode_tps": 20.359655471073022,
+    "draft_tokens": 161,
+    "draft_accepted": 95,
+    "rounds": 119,
+    "reply_sha256": "7374514b2a335d0e"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 202,
+    "decode_tps": 20.502715044685917,
+    "draft_tokens": 160,
+    "draft_accepted": 92,
+    "rounds": 109,
+    "reply_sha256": "2cbe557ec55da03b"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 203,
+    "decode_tps": 19.688261450937144,
+    "draft_tokens": 164,
+    "draft_accepted": 87,
+    "rounds": 115,
+    "reply_sha256": "875750aac4d70f5b"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 26.01021955090485,
+    "draft_tokens": 352,
+    "draft_accepted": 252,
+    "rounds": 146,
+    "reply_sha256": "a76c24216c1fc4b3"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 375,
+    "decode_tps": 24.08253601885618,
+    "draft_tokens": 340,
+    "draft_accepted": 221,
+    "rounds": 153,
+    "reply_sha256": "024f94e7de3e7524"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 197,
+    "decode_tps": 23.514832136260157,
+    "draft_tokens": 154,
+    "draft_accepted": 108,
+    "rounds": 88,
+    "reply_sha256": "511debe7eb5ec872"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 189,
+    "decode_tps": 22.7081109182253,
+    "draft_tokens": 175,
+    "draft_accepted": 105,
+    "rounds": 83,
+    "reply_sha256": "7a4658830e210ae9"
+   }
+  }
+ },
+ "run2_order": [
+  "tail1",
+  "qcut1",
+  "qcut2",
+  "tail2"
+ ],
+ "run2": {
+  "tail1": {
+   "sampled/code/1": {
+    "completion_tokens": 233,
+    "decode_tps": 31.31390851220436,
+    "draft_tokens": 280,
+    "draft_accepted": 174,
+    "rounds": 59,
+    "reply_sha256": "86cf665b5c8dc064"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 120,
+    "decode_tps": 26.905816921721673,
+    "draft_tokens": 160,
+    "draft_accepted": 82,
+    "rounds": 37,
+    "reply_sha256": "49ec81a0ad1e47bf"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 169,
+    "decode_tps": 28.89544244438677,
+    "draft_tokens": 213,
+    "draft_accepted": 120,
+    "rounds": 48,
+    "reply_sha256": "c83f61ddd0282636"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 240,
+    "decode_tps": 31.77890826668361,
+    "draft_tokens": 277,
+    "draft_accepted": 178,
+    "rounds": 61,
+    "reply_sha256": "9deee6fe291501eb"
+   },
+   "sampled/code/5": {
+    "completion_tokens": 221,
+    "decode_tps": 32.21855264440839,
+    "draft_tokens": 262,
+    "draft_accepted": 167,
+    "rounds": 53,
+    "reply_sha256": "46f5a2f9b1c4a385"
+   },
+   "sampled/code/6": {
+    "completion_tokens": 248,
+    "decode_tps": 32.56406406187772,
+    "draft_tokens": 280,
+    "draft_accepted": 186,
+    "rounds": 61,
+    "reply_sha256": "2c1dad383c039081"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 196,
+    "decode_tps": 20.27049916311444,
+    "draft_tokens": 174,
+    "draft_accepted": 82,
+    "rounds": 114,
+    "reply_sha256": "b920ccefe4bc3dd3"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 215,
+    "decode_tps": 21.547589441493642,
+    "draft_tokens": 161,
+    "draft_accepted": 94,
+    "rounds": 120,
+    "reply_sha256": "7374514b2a335d0e"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 202,
+    "decode_tps": 21.802480110018596,
+    "draft_tokens": 160,
+    "draft_accepted": 92,
+    "rounds": 109,
+    "reply_sha256": "2cbe557ec55da03b"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 203,
+    "decode_tps": 20.986535861408264,
+    "draft_tokens": 164,
+    "draft_accepted": 87,
+    "rounds": 115,
+    "reply_sha256": "875750aac4d70f5b"
+   },
+   "sampled/prose/5": {
+    "completion_tokens": 190,
+    "decode_tps": 20.88685438614917,
+    "draft_tokens": 164,
+    "draft_accepted": 83,
+    "rounds": 106,
+    "reply_sha256": "ec37964ab9477896"
+   },
+   "sampled/prose/6": {
+    "completion_tokens": 215,
+    "decode_tps": 20.340183672320233,
+    "draft_tokens": 170,
+    "draft_accepted": 87,
+    "rounds": 127,
+    "reply_sha256": "8ac8d9c6d41a6cd9"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 28.21638244184596,
+    "draft_tokens": 344,
+    "draft_accepted": 254,
+    "rounds": 145,
+    "reply_sha256": "a76c24216c1fc4b3"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 375,
+    "decode_tps": 25.78970532897262,
+    "draft_tokens": 339,
+    "draft_accepted": 221,
+    "rounds": 153,
+    "reply_sha256": "024f94e7de3e7524"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 197,
+    "decode_tps": 25.291097129063143,
+    "draft_tokens": 153,
+    "draft_accepted": 109,
+    "rounds": 87,
+    "reply_sha256": "511debe7eb5ec872"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 189,
+    "decode_tps": 24.280819947981158,
+    "draft_tokens": 175,
+    "draft_accepted": 105,
+    "rounds": 83,
+    "reply_sha256": "7a4658830e210ae9"
+   },
+   "sampled/list/5": {
+    "completion_tokens": 356,
+    "decode_tps": 25.482077437051213,
+    "draft_tokens": 325,
+    "draft_accepted": 209,
+    "rounds": 146,
+    "reply_sha256": "548c980c3a0a812a"
+   },
+   "sampled/list/6": {
+    "completion_tokens": 400,
+    "decode_tps": 35.869846535532744,
+    "draft_tokens": 370,
+    "draft_accepted": 306,
+    "rounds": 93,
+    "reply_sha256": "45e7aa4a9a197d85"
+   }
+  },
+  "qcut1": {
+   "sampled/code/1": {
+    "completion_tokens": 236,
+    "decode_tps": 33.6426347697965,
+    "draft_tokens": 215,
+    "draft_accepted": 173,
+    "rounds": 63,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 152,
+    "decode_tps": 29.183593570131507,
+    "draft_tokens": 147,
+    "draft_accepted": 102,
+    "rounds": 49,
+    "reply_sha256": "ac46f03e0d9e1dfd"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 202,
+    "decode_tps": 32.475734140694414,
+    "draft_tokens": 197,
+    "draft_accepted": 146,
+    "rounds": 55,
+    "reply_sha256": "ff1c1d8676f91a74"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 248,
+    "decode_tps": 32.831465280016815,
+    "draft_tokens": 233,
+    "draft_accepted": 179,
+    "rounds": 68,
+    "reply_sha256": "bc844a39ec8760d1"
+   },
+   "sampled/code/5": {
+    "completion_tokens": 218,
+    "decode_tps": 31.203745059626456,
+    "draft_tokens": 220,
+    "draft_accepted": 155,
+    "rounds": 62,
+    "reply_sha256": "286ea4b647a3e1a9"
+   },
+   "sampled/code/6": {
+    "completion_tokens": 152,
+    "decode_tps": 29.43886102422577,
+    "draft_tokens": 155,
+    "draft_accepted": 104,
+    "rounds": 47,
+    "reply_sha256": "b5bcd2004fc1c094"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 218,
+    "decode_tps": 21.275913466046507,
+    "draft_tokens": 141,
+    "draft_accepted": 91,
+    "rounds": 127,
+    "reply_sha256": "97c1e86a4e4fa637"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 229,
+    "decode_tps": 19.144782629310374,
+    "draft_tokens": 131,
+    "draft_accepted": 74,
+    "rounds": 154,
+    "reply_sha256": "daebf2942de80043"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 212,
+    "decode_tps": 20.533705944160264,
+    "draft_tokens": 117,
+    "draft_accepted": 79,
+    "rounds": 132,
+    "reply_sha256": "94a814311135fd32"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 209,
+    "decode_tps": 19.863666328715748,
+    "draft_tokens": 130,
+    "draft_accepted": 75,
+    "rounds": 133,
+    "reply_sha256": "215859bd0045e2f5"
+   },
+   "sampled/prose/5": {
+    "completion_tokens": 214,
+    "decode_tps": 20.668449895001505,
+    "draft_tokens": 126,
+    "draft_accepted": 82,
+    "rounds": 131,
+    "reply_sha256": "58d70a23821f4a80"
+   },
+   "sampled/prose/6": {
+    "completion_tokens": 212,
+    "decode_tps": 20.05160060361062,
+    "draft_tokens": 124,
+    "draft_accepted": 76,
+    "rounds": 135,
+    "reply_sha256": "84b1d7b145d29f9c"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 32.547136012386574,
+    "draft_tokens": 307,
+    "draft_accepted": 278,
+    "rounds": 122,
+    "reply_sha256": "40540d06bf937994"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 173,
+    "decode_tps": 23.902450593068497,
+    "draft_tokens": 134,
+    "draft_accepted": 90,
+    "rounds": 82,
+    "reply_sha256": "fb0ff511cd521f56"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 231,
+    "decode_tps": 23.231358994395396,
+    "draft_tokens": 185,
+    "draft_accepted": 118,
+    "rounds": 112,
+    "reply_sha256": "fb2e6045a8cf8494"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 400,
+    "decode_tps": 31.333748048648918,
+    "draft_tokens": 371,
+    "draft_accepted": 282,
+    "rounds": 117,
+    "reply_sha256": "91be19ee7437b99c"
+   },
+   "sampled/list/5": {
+    "completion_tokens": 167,
+    "decode_tps": 26.845454236873575,
+    "draft_tokens": 133,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "ec8decc45260e5dc"
+   },
+   "sampled/list/6": {
+    "completion_tokens": 265,
+    "decode_tps": 26.251028124735967,
+    "draft_tokens": 215,
+    "draft_accepted": 155,
+    "rounds": 109,
+    "reply_sha256": "f5c47cdbca5150c6"
+   }
+  },
+  "qcut2": {
+   "sampled/code/1": {
+    "completion_tokens": 236,
+    "decode_tps": 33.66473117709132,
+    "draft_tokens": 215,
+    "draft_accepted": 173,
+    "rounds": 63,
+    "reply_sha256": "8c129a2b0400a4db"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 152,
+    "decode_tps": 29.17512427367317,
+    "draft_tokens": 147,
+    "draft_accepted": 102,
+    "rounds": 49,
+    "reply_sha256": "ac46f03e0d9e1dfd"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 202,
+    "decode_tps": 32.46963671563478,
+    "draft_tokens": 197,
+    "draft_accepted": 146,
+    "rounds": 55,
+    "reply_sha256": "ff1c1d8676f91a74"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 248,
+    "decode_tps": 32.84374911287527,
+    "draft_tokens": 233,
+    "draft_accepted": 179,
+    "rounds": 68,
+    "reply_sha256": "bc844a39ec8760d1"
+   },
+   "sampled/code/5": {
+    "completion_tokens": 218,
+    "decode_tps": 31.202718403613897,
+    "draft_tokens": 220,
+    "draft_accepted": 155,
+    "rounds": 62,
+    "reply_sha256": "286ea4b647a3e1a9"
+   },
+   "sampled/code/6": {
+    "completion_tokens": 152,
+    "decode_tps": 29.640320928055424,
+    "draft_tokens": 155,
+    "draft_accepted": 104,
+    "rounds": 47,
+    "reply_sha256": "b5bcd2004fc1c094"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 218,
+    "decode_tps": 21.35980946802258,
+    "draft_tokens": 141,
+    "draft_accepted": 91,
+    "rounds": 127,
+    "reply_sha256": "97c1e86a4e4fa637"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 229,
+    "decode_tps": 19.230240145625785,
+    "draft_tokens": 131,
+    "draft_accepted": 74,
+    "rounds": 154,
+    "reply_sha256": "daebf2942de80043"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 212,
+    "decode_tps": 20.548716398434106,
+    "draft_tokens": 117,
+    "draft_accepted": 79,
+    "rounds": 132,
+    "reply_sha256": "94a814311135fd32"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 209,
+    "decode_tps": 19.879558728949153,
+    "draft_tokens": 130,
+    "draft_accepted": 75,
+    "rounds": 133,
+    "reply_sha256": "215859bd0045e2f5"
+   },
+   "sampled/prose/5": {
+    "completion_tokens": 214,
+    "decode_tps": 20.67316292983469,
+    "draft_tokens": 126,
+    "draft_accepted": 82,
+    "rounds": 131,
+    "reply_sha256": "58d70a23821f4a80"
+   },
+   "sampled/prose/6": {
+    "completion_tokens": 212,
+    "decode_tps": 20.042060188098798,
+    "draft_tokens": 124,
+    "draft_accepted": 76,
+    "rounds": 135,
+    "reply_sha256": "84b1d7b145d29f9c"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 32.592757139420584,
+    "draft_tokens": 307,
+    "draft_accepted": 278,
+    "rounds": 122,
+    "reply_sha256": "40540d06bf937994"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 173,
+    "decode_tps": 23.90906547214444,
+    "draft_tokens": 134,
+    "draft_accepted": 90,
+    "rounds": 82,
+    "reply_sha256": "fb0ff511cd521f56"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 231,
+    "decode_tps": 23.275740065468398,
+    "draft_tokens": 185,
+    "draft_accepted": 118,
+    "rounds": 112,
+    "reply_sha256": "fb2e6045a8cf8494"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 400,
+    "decode_tps": 31.358446090957145,
+    "draft_tokens": 371,
+    "draft_accepted": 282,
+    "rounds": 117,
+    "reply_sha256": "91be19ee7437b99c"
+   },
+   "sampled/list/5": {
+    "completion_tokens": 167,
+    "decode_tps": 26.809298173335197,
+    "draft_tokens": 133,
+    "draft_accepted": 99,
+    "rounds": 67,
+    "reply_sha256": "ec8decc45260e5dc"
+   },
+   "sampled/list/6": {
+    "completion_tokens": 265,
+    "decode_tps": 26.32825819687812,
+    "draft_tokens": 215,
+    "draft_accepted": 155,
+    "rounds": 109,
+    "reply_sha256": "f5c47cdbca5150c6"
+   }
+  },
+  "tail2": {
+   "sampled/code/1": {
+    "completion_tokens": 233,
+    "decode_tps": 31.317206304702985,
+    "draft_tokens": 280,
+    "draft_accepted": 174,
+    "rounds": 59,
+    "reply_sha256": "86cf665b5c8dc064"
+   },
+   "sampled/code/2": {
+    "completion_tokens": 120,
+    "decode_tps": 26.807727978123896,
+    "draft_tokens": 160,
+    "draft_accepted": 82,
+    "rounds": 37,
+    "reply_sha256": "49ec81a0ad1e47bf"
+   },
+   "sampled/code/3": {
+    "completion_tokens": 169,
+    "decode_tps": 28.908831006010757,
+    "draft_tokens": 213,
+    "draft_accepted": 120,
+    "rounds": 48,
+    "reply_sha256": "c83f61ddd0282636"
+   },
+   "sampled/code/4": {
+    "completion_tokens": 240,
+    "decode_tps": 31.773737314396435,
+    "draft_tokens": 277,
+    "draft_accepted": 178,
+    "rounds": 61,
+    "reply_sha256": "9deee6fe291501eb"
+   },
+   "sampled/code/5": {
+    "completion_tokens": 221,
+    "decode_tps": 32.37378927332805,
+    "draft_tokens": 262,
+    "draft_accepted": 167,
+    "rounds": 53,
+    "reply_sha256": "46f5a2f9b1c4a385"
+   },
+   "sampled/code/6": {
+    "completion_tokens": 248,
+    "decode_tps": 32.565969390082195,
+    "draft_tokens": 280,
+    "draft_accepted": 186,
+    "rounds": 61,
+    "reply_sha256": "2c1dad383c039081"
+   },
+   "sampled/prose/1": {
+    "completion_tokens": 196,
+    "decode_tps": 20.189619938060236,
+    "draft_tokens": 174,
+    "draft_accepted": 82,
+    "rounds": 114,
+    "reply_sha256": "b920ccefe4bc3dd3"
+   },
+   "sampled/prose/2": {
+    "completion_tokens": 215,
+    "decode_tps": 21.539085090890584,
+    "draft_tokens": 161,
+    "draft_accepted": 94,
+    "rounds": 120,
+    "reply_sha256": "7374514b2a335d0e"
+   },
+   "sampled/prose/3": {
+    "completion_tokens": 202,
+    "decode_tps": 21.84785546219997,
+    "draft_tokens": 160,
+    "draft_accepted": 92,
+    "rounds": 109,
+    "reply_sha256": "2cbe557ec55da03b"
+   },
+   "sampled/prose/4": {
+    "completion_tokens": 203,
+    "decode_tps": 20.94680819316606,
+    "draft_tokens": 164,
+    "draft_accepted": 87,
+    "rounds": 115,
+    "reply_sha256": "875750aac4d70f5b"
+   },
+   "sampled/prose/5": {
+    "completion_tokens": 190,
+    "decode_tps": 20.919387850178524,
+    "draft_tokens": 164,
+    "draft_accepted": 83,
+    "rounds": 106,
+    "reply_sha256": "ec37964ab9477896"
+   },
+   "sampled/prose/6": {
+    "completion_tokens": 215,
+    "decode_tps": 20.37951527868701,
+    "draft_tokens": 170,
+    "draft_accepted": 87,
+    "rounds": 127,
+    "reply_sha256": "8ac8d9c6d41a6cd9"
+   },
+   "sampled/list/1": {
+    "completion_tokens": 400,
+    "decode_tps": 28.18809022965937,
+    "draft_tokens": 344,
+    "draft_accepted": 254,
+    "rounds": 145,
+    "reply_sha256": "a76c24216c1fc4b3"
+   },
+   "sampled/list/2": {
+    "completion_tokens": 375,
+    "decode_tps": 25.79109547086262,
+    "draft_tokens": 339,
+    "draft_accepted": 221,
+    "rounds": 153,
+    "reply_sha256": "024f94e7de3e7524"
+   },
+   "sampled/list/3": {
+    "completion_tokens": 197,
+    "decode_tps": 25.35289112890207,
+    "draft_tokens": 153,
+    "draft_accepted": 109,
+    "rounds": 87,
+    "reply_sha256": "511debe7eb5ec872"
+   },
+   "sampled/list/4": {
+    "completion_tokens": 189,
+    "decode_tps": 24.26533641887569,
+    "draft_tokens": 175,
+    "draft_accepted": 105,
+    "rounds": 83,
+    "reply_sha256": "7a4658830e210ae9"
+   },
+   "sampled/list/5": {
+    "completion_tokens": 356,
+    "decode_tps": 25.583008331107237,
+    "draft_tokens": 325,
+    "draft_accepted": 209,
+    "rounds": 146,
+    "reply_sha256": "548c980c3a0a812a"
+   },
+   "sampled/list/6": {
+    "completion_tokens": 400,
+    "decode_tps": 35.96767732665807,
+    "draft_tokens": 370,
+    "draft_accepted": 306,
+    "rounds": 93,
+    "reply_sha256": "45e7aa4a9a197d85"
+   }
+  }
+ }
+}

@@ -902,20 +902,73 @@ void TestElementwise() {
       want[i] = a[i] + (double)b[i] * c[i % period];
     Near(Host(x, count), want, 1e-6, "mul_add");
   }
-  {
-    // Ties go to the lowest index; an all -inf row gives 0.
-    std::vector<float> x = Random(4 * dim);
-    x[0 * dim + 10] = x[0 * dim + 70] = 5.0f;
-    x[1 * dim + 99] = 4.0f;
-    std::fill(x.begin() + 2 * dim, x.begin() + 3 * dim, -INFINITY);
-    int32_t* out = Device(std::vector<int32_t>(4));
-    Expect(hy4_argmax(Device(x), 4, dim, out, nullptr) == 0, "argmax status");
-    const auto got = Host(out, 4);
-    const int32_t last =
-        (int32_t)(std::max_element(x.begin() + 3 * dim, x.end()) -
-                  (x.begin() + 3 * dim));
-    Expect(got == std::vector<int32_t>{10, 99, 0, last}, "argmax");
+}
+
+void TestArgmax() {
+  float* work = Device(std::vector<float>(hy4_argmax_work_floats()));
+  int32_t* out = Device(std::vector<int32_t>(1));
+  auto check = [&](const std::vector<float>& x, const std::string& what) {
+    Expect(hy4_argmax(Device(x), (uint32_t)x.size(), work, out, nullptr) == 0,
+           what + " status");
+    int32_t want = 0;
+    auto key = [&](std::size_t i) {
+      return std::isnan(x[i]) ? -INFINITY : x[i];
+    };
+    for (std::size_t i = 1; i < x.size(); ++i)
+      if (key(i) > key(want))
+        want = (int32_t)i;
+    Expect(Host(out, 1)[0] == want, what);
+  };
+  // The Hy4 vocabulary: a tie across blocks goes to the lower index.
+  auto x = Random(120832, -4, 4);
+  x[77001] = x[501] = 9.0f;
+  x[3] = NAN;
+  check(x, "argmax tie");
+  x[64000] = INFINITY;
+  check(x, "argmax inf");
+  // Most blocks hold only -inf; NaN never wins.
+  std::vector<float> sparse(5000, -INFINITY);
+  sparse[17] = NAN;
+  sparse[4999] = 1.0f;
+  check(sparse, "argmax sparse");
+  check(std::vector<float>(300, -INFINITY), "argmax all -inf");
+  check(Random(1), "argmax one");
+}
+
+void TestQuantizeHalf() {
+  const uint64_t blocks = 3000;
+  std::vector<uint16_t> src(blocks * 32);
+  std::vector<float> values(src.size());
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    const _Float16 h = (_Float16)Random(1, -3, 3)[0];
+    std::memcpy(&src[i], &h, 2);
+    values[i] = (float)h;
   }
+  for (int i = 0; i < 32; ++i) {  // an all-zero block
+    src[32 + i] = 0;
+    values[32 + i] = 0.0f;
+  }
+  BlockQ8_0* out = Device(std::vector<BlockQ8_0>(blocks));
+  Expect(hy4_quantize_q8_0_half(Device(src), blocks, out, nullptr) == 0,
+         "quantize_q8_0_half status");
+  const auto got = Host(out, blocks);
+  int mismatches = 0;
+  for (uint64_t b = 0; b < blocks; ++b) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i)
+      amax = std::max(amax, std::fabs(values[b * 32 + i]));
+    const float d = amax / 127.0f;
+    const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    const _Float16 dh = (_Float16)d;
+    uint16_t dbits;
+    std::memcpy(&dbits, &dh, 2);
+    mismatches += got[b].d != dbits;
+    for (int i = 0; i < 32; ++i)
+      mismatches +=
+          got[b].qs[i] != (int8_t)std::nearbyint(values[b * 32 + i] * inv);
+  }
+  Expect(mismatches == 0,
+         "quantize_q8_0_half (" + std::to_string(mismatches) + " mismatches)");
 }
 
 void TestRoute() {
@@ -1607,6 +1660,8 @@ int main() {
   TestMlaAttention();
   TestMlaPrefill();
   TestRows();
+  TestArgmax();
+  TestQuantizeHalf();
   TestElementwise();
   TestRoute();
   TestEngram();
