@@ -83,3 +83,9 @@
   a slot its confidence head rejects: decoding with DFly2 7% faster, greedy
   and sampled (24.3 → 26.0 and 23.6 → 25.3 tok/s), with the same replies
   ([E31](docs/EXPERIMENTS.md#e31-dfly2-drafts-through-a-q8_0-copy-of-the-lm-head-2026-11-20)).
+- Copy repeated context into the verify pass (prompt lookup), with or
+  without DFly2: rewriting a file decodes 16% faster with DFly2 and 2.5
+  times faster without it, with the same replies
+  ([E33](docs/EXPERIMENTS.md#e33-prompt-lookup-2026-11-20)); greedy requests
+  verify up to 15 copied tokens per pass
+  ([E34](docs/EXPERIMENTS.md#e34-16-token-verify-passes-for-copies-2026-11-20)).

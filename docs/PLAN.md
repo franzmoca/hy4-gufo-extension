@@ -189,7 +189,8 @@ These are judgment calls made without the maintainer; revisit any of them.
    Engram.
 4. **Evaluation in chunks of up to 8 tokens.** `mmvq` serves N ≤ 8, so one
    evaluation takes 1-8 tokens: decode is N = 1, and prefill loops over chunks
-   of 8. Large-batch MMQ prefill is phase 5.
+   of 8. Large-batch MMQ prefill is phase 5. (Verify passes now take up to 16
+   tokens, as 8-column `mmvq` launches, E34.)
 5. **KV in FP32 at first** (binary16 since E30). Each layer stores one
    576-wide latent row per token (512 normed `kv_cmpr` + 64 roped `k_pe`).
    Sparse layers keep every row; SWA layers keep a 512-row ring. FP32 cost
@@ -214,8 +215,8 @@ These are judgment calls made without the maintainer; revisit any of them.
     expert buckets), F32 projections through hipBLAS SGEMM, `wk_b` (K = 192)
     dequantized to F32 for a strided-batched SGEMM, `wv_b` through the grouped
     MMQ, and attention as two SGEMMs around a softmax kernel with sinks, the
-    SWA window and the indexer's selection mask. Passes of up to 8 tokens keep
-    the matvecs.
+    SWA window and the indexer's selection mask. Passes of up to 16 tokens
+    keep the matvecs (8 before E34).
 11. **The gate for kernel changes is the KL divergence** from llama.cpp's
     logits over 4,094 positions (see Correctness oracle), not greedy identity
     or perplexity, both of which rounding moves on this model.
@@ -269,7 +270,9 @@ These are judgment calls made without the maintainer; revisit any of them.
     rows are never read). The session taps the frontier's hidden and the five
     layers' selections on every pass; a restored state has none, so its first
     step is a plain one. `--speculative` is not used: Gufo's serve knows no
-    `dfly` backend, so the drafter is a provider option.
+    `dfly` backend, so the drafter is a provider option. A prompt-lookup copy
+    of repeated context, when there is one, takes the drafts' place in the
+    same pass (E33-E34), with or without the drafter.
 17. **Verify passes compute exactly what one-token decoding would.** The gate
     is identical replies and draft counts with and without the drafter, and
     `hy4_eval_probe --passcheck N` (logits of greedy tokens decoded one by one
@@ -563,6 +566,14 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   correction MLP, the Q8_0 head (about 1.7 ms) and two host
   synchronizations. Sampled requests spend 1.8 ms per cycle on the host
   sampler, which device draws could recover.
+
+- **Prompt lookup** (E33-E34, 2026-11-20). Before drafting, a step copies
+  what followed an earlier occurrence of the context (12 tokens for greedy
+  requests, 24 from the prompt for sampled ones), as far as every occurrence
+  agrees, up to 15 tokens greedy and 7 sampled; without `--dfly-model` it is
+  the only proposer. Rewriting a file: 43.4 → 51.8 tok/s with DFly2, 16.7 →
+  41.5 without. A 16-token pass costs about 239 ms against 137 ms for 8, so
+  long sampled copies lose more than they keep.
 
 - **Prefill batch invariance** (done, E17-E18). A token's result depended
   on the passes its span was cut into, so a restore re-prefilling a gap in

@@ -38,6 +38,8 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E30 | Binary16 KV cache | retained |
 | E31 | DFly2 drafts through a Q8_0 copy of the LM head | retained |
 | E32 | Sampled drafts from the drafter's distribution | rejected |
+| E33 | Prompt lookup | retained |
+| E34 | 16-token verify passes for copies | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -775,3 +777,68 @@ Geometric means over the pairs: +1.4% for q from the top 8 (code +8%, prose
 different text; the cycle statistics do not, and neither variant emits more
 tokens per verify pass. Rejected; the patch is
 [artifacts/2026-11-20-draft-tail/stochastic-q.patch](artifacts/2026-11-20-draft-tail/stochastic-q.patch).
+
+## E33: Prompt lookup (2026-11-20)
+
+The DeepSeek V4.1 Flash extension's prompt lookup (`prompt_lookup.hpp`:
+Gufo's `PromptLookup` plus the agreement rule, which copies only as far as
+every earlier occurrence of the context agrees) now proposes tokens before
+DFly2 does. When the session's committed tokens repeat the context ending in
+the anchor (12 tokens for greedy requests; 24 for sampled ones, from the
+prompt only), the step verifies a copy of what followed, up to 7 tokens, in
+the same pass and with the same compare-sample walk as drafts; otherwise
+DFly2 drafts. A copy is a point mass, so sampled output stays exact, and a
+server without `--dfly-model` now takes multi-token steps too.
+
+The file-edit workload: a 2,929-character C++ header to rewrite with a class
+renamed (about 830 output tokens), greedy and at the default sampling (seeds
+1-2), plus the three standard prompts. Mirrored order (base, lookup, lookup,
+base), a fresh server each; the two arms of each kind agree within 0.4%.
+Every reply is identical in all arms, and the standard prompts copy nothing
+(the same draft counts as base).
+
+| file edit (tok/s) | base | lookup |
+| --- | --- | --- |
+| greedy, DFly2 | 43.4 | 50.5 (+16%) |
+| seed 1 / seed 2, DFly2 | 41.5 / 40.5 | 46.0 / 45.3 (+11%, +12%) |
+| greedy, no drafter | 16.7 | 39.4 (2.4x) |
+| seed 1 / seed 2, no drafter | 16.5 / 16.5 | 27.8 / 25.8 |
+
+Without a drafter, greedy copies averaged 6.85 tokens against the cap of 7
+(1,217 of 1,315 accepted), so E34 raises the cap. The DeepSeek extension's
+53-request coding-agent recording (`tools/ds41/agent_replay.py`, one run per
+arm, base then lookup): 53 of 53 replies identical, decode 124.8 → 121.7 s
+(-2.5%), with 55 copy rounds (342 of 349 copied tokens accepted).
+Scripts and per-request numbers:
+[artifacts/2026-11-20-prompt-lookup/](artifacts/2026-11-20-prompt-lookup/).
+Retained.
+
+## E34: 16-token verify passes for copies (2026-11-20)
+
+Verify passes take up to 16 tokens (`kVecMax` and `kTapRows`): the vendored
+MMVQ serves at most 8 columns, each summed as a one-column launch sums it, so
+wider passes run in 8-column launches; the attention, expert and grouped
+kernels already took any token count. `hy4_eval_probe --passcheck N` is exact
+(0 logit difference over 64 tokens) at N = 2, 8, 9, 12, 15 and 16.
+
+Copies of up to 15 tokens against E33's 7, the file edit in mirrored order
+(identical replies):
+
+| file edit (tok/s) | 7 | 15 |
+| --- | --- | --- |
+| greedy, DFly2 | 50.5 | 51.75 (+2.4%) |
+| seed 1 / seed 2, DFly2 | 46.0 / 45.3 | 46.6 / 45.1 |
+| greedy, no drafter | 39.4 | 41.5 (+5.4%) |
+| seed 1 / seed 2, no drafter | 27.8 / 25.8 | 27.7 / 24.7 |
+
+Greedy copies are almost always kept; sampled draws leave a long copy more
+often, and a 16-token pass costs about 239 ms against 137 ms for 8. Greedy
+requests now copy up to 15 tokens and sampled ones up to 7; a run of that
+build reproduces each reference arm's replies and draft counts (greedy file
+edit 51.76 / 41.45 tok/s with / without DFly2). DFly2 still drafts at most 7.
+Gufo's `conversation`, `long-context`, `cache`, `tools` and
+`reasoning-budget` suites with DFly2 and vision, and `conversation`, `cache`
+and `reasoning-budget` without a drafter, pass every case except `tools`'
+`auto-tools` length check, which fails the same way on the base build (the
+model's 11-token tool call finishes inside the case's 12-token limit).
+Retained.

@@ -112,8 +112,15 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m,
                                         static_cast<int>(k), stream));
           return true;
         }
-        HY4_CHECK(hy4_mmq_dense_vec_typed(w.type, w.data, x, y, static_cast<int>(m), static_cast<int>(n),
-                                          static_cast<int>(k), stream));
+        // MMVQ takes up to 8 columns, each summed as a one-column launch
+        // sums it, so wider passes run in 8-column launches.
+        for (std::uint32_t t = 0; t < n; t += 8) {
+          const std::uint32_t nt = std::min<std::uint32_t>(8, n - t);
+          HY4_CHECK(hy4_mmq_dense_vec_typed(
+              w.type, w.data, x + std::size_t{t} * k, y + std::size_t{t} * m,
+              static_cast<int>(m), static_cast<int>(nt), static_cast<int>(k),
+              stream));
+        }
         return true;
       }
       if (w.type == HY4_TYPE_Q8_0) {
@@ -319,7 +326,8 @@ bool Session::Evaluate(std::span<const std::int32_t> tokens,
 }
 
 bool Session::Verify(std::span<const std::int32_t> tokens, std::string* error) {
-  if (tokens.empty() || tokens.size() > kTapRows) return Fail(error, "hy4: verify takes 1 to 8 tokens");
+  if (tokens.empty() || tokens.size() > kTapRows)
+    return Fail(error, "hy4: verify takes 1 to 16 tokens");
   pass_pos0_ = Position();
   tap_ready_ = false;
   if (!Evaluate(tokens, &pass_logits_, true, error)) return false;

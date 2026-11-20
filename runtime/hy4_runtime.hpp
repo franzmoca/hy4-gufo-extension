@@ -133,7 +133,7 @@ public:
   /// Most tokens one evaluation pass takes (longer spans run in passes).
   static constexpr std::uint32_t kMaxChunk = 2048;
   /// Passes up to this many tokens use matvecs; longer ones use GEMMs.
-  static constexpr std::uint32_t kVecMax = 8;
+  static constexpr std::uint32_t kVecMax = 16;
   /// Rows of each indexer layer's value and gate ring.
   static constexpr std::uint32_t kIndexerRing = kMaxChunk + 8;
 
@@ -232,7 +232,7 @@ public:
   /// Draft taps: each evaluation leaves its last kTapRows tokens' final
   /// hidden (after the output norm) and the indexer selections of the tapped
   /// layers on the device, for a drafter to read at the frontier.
-  static constexpr std::uint32_t kTapRows = 8;
+  static constexpr std::uint32_t kTapRows = 16;
   [[nodiscard]] bool EnableTaps(std::span<const std::uint32_t> layers, std::string* error);
   /// Whether the taps hold the frontier token (a restored state has none).
   [[nodiscard]] bool TapsReady() const { return tap_ready_; }

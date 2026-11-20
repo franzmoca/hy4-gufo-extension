@@ -26,6 +26,7 @@
 
 #include "chat_template.hpp"
 #include "continuation_adapter.hpp"
+#include "prompt_lookup.hpp"
 #include "runtime/hy4_dfly.hpp"
 #include "runtime/hy4_runtime.hpp"
 #include "runtime/hy4_vision.hpp"
@@ -150,6 +151,7 @@ public:
   void Invalidate() noexcept override {
     (void)adapter_->Invalidate(*slot_);
     position_ = 0;
+    lookup_.Clear();
   }
 
   [[nodiscard]] Session& session() const { return *session_; }
@@ -158,6 +160,8 @@ public:
   [[nodiscard]] const std::shared_ptr<ImageSource>& images() const {
     return images_;
   }
+  /// Prompt lookup over the session's committed tokens.
+  [[nodiscard]] lookup::PromptLookup<std::int32_t>& lookup() { return lookup_; }
   void set_images(std::shared_ptr<ImageSource> images) {
     images_ = std::move(images);
     session_->SetImages(images_);
@@ -165,6 +169,7 @@ public:
 
 private:
   std::shared_ptr<ImageSource> images_;
+  lookup::PromptLookup<std::int32_t> lookup_;
   Session* session_{};
   cache::Adapter* adapter_{};
   cache::Slot* slot_{};
@@ -263,7 +268,7 @@ public:
                 .incremental_prefill = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                .multi_token_decode = drafter_ != nullptr,
+                .multi_token_decode = true,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0u,
                 .prefix_reuse = true,
@@ -413,6 +418,7 @@ public:
     if (RequireState(state).position() != prefix.size()) {
       throw std::logic_error("Hy4 reused prefix does not match checkpoint");
     }
+    RequireState(state).lookup().BeginRequest();
   }
 
   [[nodiscard]] TextPrefillStep Prefill(TextRunnerState& state, std::span<const TextRunnerToken> prompt,
@@ -434,6 +440,7 @@ public:
       }
     }
     const auto tokens = EngineTokens(prompt.subspan(offset, consumed));
+    hy4.lookup().BeginRequest();
     std::string error;
     if (!hy4.session().Prompt(tokens, &error))
       throw std::runtime_error("Hy4 prefill failed: " + error);
@@ -463,27 +470,37 @@ public:
     hy4.set_position(hy4.position() + 1);
   }
 
-  // With the drafter: sample the anchor from the frontier, draft after it,
-  // verify anchor and drafts in one pass, and keep the drafts the target's
-  // own draws agree with. A disagreeing draw is deferred to the next step,
-  // which samples it from the same logits, so sampling stays exact.
+  // Sample the anchor from the frontier, propose tokens after it, verify
+  // anchor and proposals in one pass, and keep the proposals the target's own
+  // draws agree with. A disagreeing draw is deferred to the next step, which
+  // samples it from the same logits, so sampling stays exact. Proposals are
+  // a prompt-lookup copy of the session's own tokens when the context
+  // repeats them, else DFly2's drafts; without either the step is a plain
+  // one.
   [[nodiscard]] TextDecodeStep DecodeStep(TextRunnerState& state, std::size_t max_tokens,
                                           sampling::SamplerState& sampler) const override {
     auto& hy4 = RequireState(state);
     Session& session = hy4.session();
-    if (!drafter_ || max_tokens < 2 || !session.TapsReady()) {
-      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
-    }
     TextDecodeStep step;
+    if (max_tokens == 0)
+      return step;
     if (hy4.position() >= max_context_) {
       step.stop = true;
       return step;
     }
     sampling::SamplerState work = sampler;
     TextDecodeSelection anchor = Select(hy4, work);
-    const auto count = static_cast<std::uint32_t>(
-        std::min<std::size_t>({draft_tokens_, max_tokens - 1, max_context_ - hy4.position() - 1}));
-    if (anchor.stop || count == 0) {
+    const std::size_t room = std::min<std::size_t>(
+        max_tokens - 1, max_context_ - hy4.position() - 1);
+    std::vector<std::int32_t> proposals;
+    lookup::PromptLookup<std::int32_t>::Match copy{};
+    if (!anchor.stop && room > 0) {
+      copy = Copy(hy4, static_cast<std::int32_t>(anchor.token), work, room,
+                  &proposals);
+    }
+    const bool draft = !anchor.stop && proposals.empty() && drafter_ &&
+                       session.TapsReady() && room > 0;
+    if (anchor.stop || (proposals.empty() && !draft)) {
       sampler.CopyDrawStateFrom(work);
       step.stop = anchor.stop;
       if (anchor.stop) {
@@ -499,22 +516,31 @@ public:
     work.Accept(anchor.token);
     step.selections.push_back(std::move(anchor));
 
-    std::vector<std::int32_t> drafts;
     std::string error;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!drafter_->Draft(session, anchor_token, count, min_accept_, &drafts, &error)) {
-      throw std::runtime_error("Hy4 draft failed: " + error);
+    if (draft) {
+      const auto count = static_cast<std::uint32_t>(
+          std::min<std::size_t>(draft_tokens_, room));
+      if (!drafter_->Draft(session, anchor_token, count, min_accept_,
+                           &proposals, &error)) {
+        throw std::runtime_error("Hy4 draft failed: " + error);
+      }
     }
     const auto t1 = std::chrono::steady_clock::now();
     std::vector<std::int32_t> tokens{anchor_token};
-    tokens.insert(tokens.end(), drafts.begin(), drafts.end());
-    if (!session.Verify(tokens, &error)) throw std::runtime_error("Hy4 verify failed: " + error);
+    tokens.insert(tokens.end(), proposals.begin(), proposals.end());
+    if (tokens.size() == 1) {
+      if (!session.Step(tokens, &error))
+        throw std::runtime_error("Hy4 decode failed: " + error);
+    } else if (!session.Verify(tokens, &error)) {
+      throw std::runtime_error("Hy4 verify failed: " + error);
+    }
     const auto t2 = std::chrono::steady_clock::now();
     std::uint32_t kept = 1;
-    for (std::uint32_t i = 0; i < drafts.size(); ++i) {
+    for (std::uint32_t i = 0; i < proposals.size(); ++i) {
       const auto logits = session.PassLogits(i);
       const auto token = static_cast<std::int32_t>(work.Sample(logits));
-      if (token != drafts[i]) {
+      if (token != proposals[i]) {
         work.DeferSample(static_cast<sampling::TokenId>(token));
         break;
       }
@@ -531,25 +557,37 @@ public:
                                  .piece = DecodeToken(token),
                                  .logprobs = std::move(logprobs)});
     }
-    session.Keep(kept);
+    if (tokens.size() > 1)
+      session.Keep(kept);
     hy4.set_position(session.Position());
+    if (copy.length != 0)
+      hy4.lookup().Observe(copy.start, proposals.size(), kept - 1);
     if (profile_) {
-      profile_->rounds += 1;
-      profile_->draft_s += std::chrono::duration<double>(t1 - t0).count();
-      profile_->verify_s += std::chrono::duration<double>(t2 - t1).count();
-      profile_->accepted += kept - 1;
-      profile_->drafted += drafts.size();
-      if (profile_->rounds % 64 == 0) {
-        server::Logger::Info("dfly", "event=hy4_dfly_profile rounds=" + std::to_string(profile_->rounds) +
-                                         " draft_ms=" + std::to_string(1e3 * profile_->draft_s / profile_->rounds) +
-                                         " verify_ms=" + std::to_string(1e3 * profile_->verify_s / profile_->rounds) +
-                                         " drafted=" + std::to_string(double(profile_->drafted) / profile_->rounds) +
-                                         " accepted=" + std::to_string(double(profile_->accepted) / profile_->rounds));
+      Profile& p = *profile_;
+      p.rounds += 1;
+      (copy.length != 0 ? p.copy_rounds : p.draft_rounds) += 1;
+      (copy.length != 0 ? p.copied : p.drafted) += proposals.size();
+      (copy.length != 0 ? p.copy_accepted : p.accepted) += kept - 1;
+      p.draft_s += std::chrono::duration<double>(t1 - t0).count();
+      p.verify_s += std::chrono::duration<double>(t2 - t1).count();
+      if (p.rounds % 64 == 0) {
+        const double draft_rounds = std::max<double>(1, p.draft_rounds);
+        server::Logger::Info(
+            "dfly",
+            "event=hy4_dfly_profile rounds=" + std::to_string(p.rounds) +
+                " draft_ms=" + std::to_string(1e3 * p.draft_s / draft_rounds) +
+                " verify_ms=" + std::to_string(1e3 * p.verify_s / p.rounds) +
+                " drafted=" + std::to_string(double(p.drafted) / draft_rounds) +
+                " accepted=" +
+                std::to_string(double(p.accepted) / draft_rounds) +
+                " copy_rounds=" + std::to_string(p.copy_rounds) +
+                " copied=" + std::to_string(p.copied) +
+                " copy_accepted=" + std::to_string(p.copy_accepted));
       }
     }
     sampler.CopyDrawStateFrom(work);
     step.draft_rounds = 1;
-    step.draft_tokens = drafts.size();
+    step.draft_tokens = proposals.size();
     step.draft_accepted_tokens = kept - 1;
     return step;
   }
@@ -581,6 +619,40 @@ private:
     return selection;
   }
 
+  // Prompt lookup (PromptLookup): up to `cap` of the session's committed
+  // tokens that followed an earlier occurrence of the context ending in
+  // `anchor`, as far as every competing occurrence agrees. Greedy requests
+  // need 12 matching tokens and copy up to 15, filling a 16-token verify
+  // pass; sampled ones need 24, copy only from their prompt and at most 7,
+  // since their draws leave a long copy more often (E34). A request's first
+  // step copies nothing. Returns the source, or a zero-length match.
+  lookup::PromptLookup<std::int32_t>::Match Copy(
+      Hy4TextRunnerState& hy4, std::int32_t anchor,
+      const sampling::SamplerState& sampler, std::size_t cap,
+      std::vector<std::int32_t>* copies) const {
+    using Lookup = lookup::PromptLookup<std::int32_t>;
+    Lookup& lk = hy4.lookup();
+    const std::vector<std::int32_t>& committed = hy4.session().History();
+    if (!lk.Step(committed.size()))
+      return {};
+    const bool sampled = !sampler.config().can_use_unmodified_argmax();
+    cap = std::min<std::size_t>(cap, sampled ? 7 : Session::kTapRows - 1);
+    lk.Extend(committed, sampled);
+    std::size_t agreed = 0;
+    const auto match = lk.Find(
+        committed, std::span<const std::int32_t>(&anchor, 1),
+        sampled ? Lookup::kSampledMinMatch : Lookup::kMinMatch, false, &agreed);
+    if (match.length == 0)
+      return {};
+    while (copies->size() < std::min(cap, agreed)) {
+      const std::int32_t token = committed[match.start + copies->size()];
+      copies->push_back(token);
+      if (IsStopToken(token))
+        break;
+    }
+    return copies->empty() ? Lookup::Match{} : match;
+  }
+
   TextDecodeSelection Select(Hy4TextRunnerState& hy4, sampling::SamplerState& sampler) const {
     const auto& logits = hy4.session().LastLogits();
     if (logits.size() != model_->config().n_vocab) throw std::runtime_error("Hy4 token selection has no logits");
@@ -603,7 +675,8 @@ private:
                                                        : kDefaultMinAccept};
   // HY4_DFLY_PROFILE=1: mean draft and verify times, logged every 64 steps.
   struct Profile {
-    std::uint64_t rounds{0}, accepted{0}, drafted{0};
+    std::uint64_t rounds{0}, draft_rounds{0}, accepted{0}, drafted{0};
+    std::uint64_t copy_rounds{0}, copied{0}, copy_accepted{0};
     double draft_s{0}, verify_s{0};
   };
   std::unique_ptr<Profile> profile_{std::getenv("HY4_DFLY_PROFILE") ? std::make_unique<Profile>() : nullptr};
