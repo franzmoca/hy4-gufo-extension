@@ -1479,17 +1479,22 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
     __syncthreads();
 
     // Partial scores over this wave's dimensions.
-#pragma unroll
-    for (uint32_t b = 0; b < kMlaTile / 16; ++b) {
-      MlaFloat8 sc = {};
-      const _Float16* kr =
-          kt + (b * 16 + row) * kMlaKtPitch + sub * (kMlaDk / kMlaSplit);
+    // The two 16-key halves' products interleave (independent chains).
+    {
+      constexpr uint32_t kB = kMlaTile / 16;
+      MlaFloat8 sc[kB] = {};
+      const _Float16* kr = kt + row * kMlaKtPitch + sub * (kMlaDk / kMlaSplit);
 #pragma unroll
       for (uint32_t s = 0; s < kMlaQkSteps; ++s)
-        sc = MlaWmma(qa[s], MlaLoad16(kr + s * 16), sc);
 #pragma unroll
-      for (uint32_t i = 0; i < 8; ++i)
-        part[sub][hg + 2 * i + half][b * 16 + row] = sc[i];
+        for (uint32_t b = 0; b < kB; ++b)
+          sc[b] = MlaWmma(qa[s], MlaLoad16(kr + b * 16 * kMlaKtPitch + s * 16),
+                          sc[b]);
+#pragma unroll
+      for (uint32_t b = 0; b < kB; ++b)
+#pragma unroll
+        for (uint32_t i = 0; i < 8; ++i)
+          part[sub][hg + 2 * i + half][b * 16 + row] = sc[b][i];
     }
     __syncthreads();
 

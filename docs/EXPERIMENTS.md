@@ -47,6 +47,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E39 | Hyper-connection mixes in 256-token chunks | rejected |
 | E40 | Prefill kernel ablations after E37 | analysis |
 | E41 | Prefill attention: staging loads in flight together, paired value reads | retained |
+| E42 | Prefill attention: interleaved score chains | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1016,3 +1017,15 @@ read):
 | --- | --- | --- |
 | 3,712 tokens | 4.164 s (891 tok/s) | 4.039 s (919 tok/s, -3.0%) |
 | 16,384 tokens | 19.31 s (848 tok/s) | 18.58 s (882 tok/s, -3.8%) |
+
+## E42: Prefill attention: interleaved score chains (2026-11-20)
+
+After E41, removing parts of `MlaPrefill` in the bench (25.7 ms) costs the
+score products 7.1 ms and the softmax 2.5 ms. Each 16-key half of a tile
+summed its nine score products as one dependent chain, the halves one after
+the other; issuing the two chains' products alternately (each chain in the
+same order, so the outputs are bit-identical) ran at 25.18 against 25.70 ms
+(three alternating runs each, -2%; KL 0.08424, identical). A second row
+table filled during the values, saving one of the five barriers per tile,
+ran slower (25.63 ms) and was dropped, as were `#pragma unroll` on
+`RmsNorm` and `SumSlots` (unchanged under `prof.py`).
