@@ -95,6 +95,9 @@
   tok/s)
   ([E45](docs/EXPERIMENTS.md#e45-cache-checkpoints-inside-a-prefill-pass-2026-11-20),
   [E46](docs/EXPERIMENTS.md#e46-engram-rows-read-directly-beside-the-layers-2026-11-20)).
+- The server holds 3.7 GiB less device memory: the prompt scratch keeps
+  logits for 16 rows instead of 8,192
+  ([E50](docs/EXPERIMENTS.md#e50-prompt-scratch-logits-for-16-rows-2026-11-20)).
 - DFly2 drafts for concurrent requests in one drafter pass: four coding-agent
   sessions finish in 420 s instead of 465 s, with the same replies
   ([E49](docs/EXPERIMENTS.md#e49-several-sessions-drafts-in-one-drafter-pass-2026-11-20)).

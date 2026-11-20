@@ -55,6 +55,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E47 | Decode rounds between a prompt pass's layer groups | retained |
 | E48 | Several sessions' decoding in one pass | retained |
 | E49 | Several sessions' drafts in one drafter pass | retained |
+| E50 | Prompt scratch logits for 16 rows | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1217,3 +1218,23 @@ session it decodes 12% faster than E48 and 14% faster than plain decoding.
 Open: the drafter's 32-row products run at 7.7 ms where the weights alone
 need about 3 ms, and each of four sessions may propose only 3 drafts in a
 shared 16-row verify pass.
+
+## E50: Prompt scratch logits for 16 rows (2026-11-20)
+
+The card's memory row showed Gufo at 111.9 GiB against llama.cpp's 95.9 GiB
+with the same 91.09 GiB of weights. Measured after load (GTT and VRAM above
+idle, context 4,096, no vision sidecar, RAM cache off), Gufo held 13.2 GiB
+beyond the weights, 11.67 GiB of it the prompt scratch for 8,192-row passes
+(E43). Its logits buffer alone took 3.69 GiB, [8,192][120,832] floats, while
+the server needs the head for at most 16 rows: a prompt's last row, an
+in-pass checkpoint's row, or a verify pass. The buffer now holds kVecMax (16)
+rows and the head runs 16 rows at a time for the probe's all-row prompts.
+
+Load memory drops by 3,768 MiB (106,807 to 103,039 MiB). Decode logits stay
+bit-identical, the probe's whole-vs-cut check over 3,042 all-row logits
+matches exactly, and perplexity is unchanged (184.4842). The server runs the
+same kernels as before. The rest of the card's gap: 2.1 GiB of RAM prompt
+cache pages and the 1.05 GiB vision tower, which the llama.cpp arm runs
+without, and about 8 GiB of 8,192-row buffers that a narrow resident scratch
+with transiently mapped wide rows (Gufo's `mem::ScratchArena`, #1265) could
+free outside lone prefills.

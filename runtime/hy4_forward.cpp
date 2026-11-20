@@ -226,7 +226,9 @@ bool Model::AllocScratchRows(Scratch& s, std::uint32_t n) {
       DeviceAlloc(&s.route_w, std::size_t{n} * c.n_expert_used, owned) &&
       DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) &&
       DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
-      DeviceAlloc(&s.logits, std::size_t{n} * c.n_vocab, owned) &&
+      // The head runs at most kVecMax rows at a time (Pass).
+      DeviceAlloc(&s.logits, std::size_t{std::min(n, kVecMax)} * c.n_vocab,
+                  owned) &&
       HostAlloc(&s.host_h, std::size_t{n} * c.hc * c.n_embd, owned);
   s.attn_work_floats = hy4_mla_attention_work(kVecMax, hmax, c.idx_top_k);
   return ok && DeviceAlloc(&s.attn_work, s.attn_work_floats, owned);
@@ -797,14 +799,19 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
     if (auto* logits = parts.front().logits) {
       const std::uint32_t first_row = parts.front().all_logits ? 0 : n - 1;
       const std::uint32_t count = n - first_row;
-      if (!MatVec(w.output, s.cur + std::size_t{first_row} * c.n_embd, s.logits,
-                  c.n_vocab, c.n_embd, count, ex, error)) {
-        return false;
-      }
       logits->resize(std::size_t{count} * c.n_vocab);
-      HY4_CHECK(hipMemcpyAsync(logits->data(), s.logits,
-                               logits->size() * sizeof(float),
-                               hipMemcpyDeviceToHost, st));
+      // kVecMax rows per product: the scratch holds that many logit rows.
+      for (std::uint32_t r = 0; r < count; r += Model::kVecMax) {
+        const std::uint32_t rows = std::min(Model::kVecMax, count - r);
+        if (!MatVec(w.output, s.cur + std::size_t{first_row + r} * c.n_embd,
+                    s.logits, c.n_vocab, c.n_embd, rows, ex, error)) {
+          return false;
+        }
+        HY4_CHECK(hipMemcpyAsync(logits->data() + std::size_t{r} * c.n_vocab,
+                                 s.logits,
+                                 std::size_t{rows} * c.n_vocab * sizeof(float),
+                                 hipMemcpyDeviceToHost, st));
+      }
     }
   } else {
     // One head product over every session's rows; each takes its own.
