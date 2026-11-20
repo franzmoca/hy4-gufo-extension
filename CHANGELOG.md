@@ -61,3 +61,7 @@
   selection: 13.75 → 15.18 tok/s after a 3,712-token prompt, about 33 ms per
   token less at 32K
   ([E26](docs/EXPERIMENTS.md#e26-kpool-selection-by-radix-select-and-sort-2026-11-20)).
+- DFly2 decoding 6-15% faster: a verify pass runs its routed experts in one
+  launch with the tokens that share an expert back to back, with the same
+  results as one-token decoding
+  ([E27](docs/EXPERIMENTS.md#e27-verify-passes-routed-experts-in-one-launch-slots-ordered-by-expert-2026-11-20)).

@@ -1727,6 +1727,52 @@ extern "C" int hy4_mmq_moe_vec_typed(int type, const void* W, const float* X,
   }
 }
 
+// hy4: routed experts of a multi-token pass in one launch, the slots ordered
+// by expert (hy4_mmvq_moe_shared). X's n_rows rows are quantized to Q8_1 in one launch,
+// row by row as the one-token calls quantize them.
+static int hy4_mmq_moe_shared(const char* tag, int type, const void* W, const float* X,
+                              const int32_t* ids, float* out, int M, int K, int n_rows,
+                              int n_slots, int n_experts, bool per_token, hipStream_t stream) {
+  if (!W || !X || !ids || !out || M <= 0 || K <= 0 || n_rows <= 0 || n_slots <= 0 ||
+      n_experts <= 0 || K % 256 != 0) {
+    fprintf(stderr, "%s: bad arguments\n", tag);
+    return -1;
+  }
+  const int dev = hy4_ggml_hip_get_device();
+  hy4_ggml_hip_context* ctx = get_ctx_for_device(dev);
+  if (!ctx) return -1;
+  hy4_pool_set_stream(stream);
+  const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+  hy4_ggml_hip_pool_alloc<char> q8(ctx->pool(),
+                                   (size_t)n_rows * ne10_padded * sizeof(block_q8_1) / QK8_1);
+  hy4_quantize_row_q8_1_hip(X, nullptr, (void*)q8.get(), (ggml_type)type, K, K, K,
+                            (int64_t)K * n_rows, ne10_padded, 1, n_rows, 1, stream);
+  const int64_t s01_row = (int64_t)K / ggml_blck_size((ggml_type)type);
+  hy4_ggml_hip_pool_alloc<uint32_t> order(ctx->pool(), (size_t)n_slots);
+  if (!hy4_mmvq_moe_shared(W, (ggml_type)type, q8.get(), ids, order.get(), out, K, M, (int)s01_row,
+                           (int)(ne10_padded / QK8_1), (int)(M * s01_row), n_slots,
+                           per_token ? n_slots / n_rows : 1, per_token, stream)) {
+    fprintf(stderr, "%s: unsupported type %d\n", tag, type);
+    return -1;
+  }
+  return hipGetLastError() == hipSuccess ? 0 : -3;
+}
+
+extern "C" int hy4_mmq_moe_vec_tokens_typed(int type, const void* W, const float* X,
+                                             const int32_t* ids, float* out, int M, int K,
+                                             int n_tokens, int n_experts, int n_expert_used,
+                                             hipStream_t stream) {
+  return hy4_mmq_moe_shared("hy4_mmq_moe_vec_tokens_typed", type, W, X, ids, out, M, K, n_tokens,
+                            n_tokens * n_expert_used, n_experts, true, stream);
+}
+
+extern "C" int hy4_mmq_moe_vec_slots_typed(int type, const void* W, const float* X,
+                                            const int32_t* ids, float* out, int M, int K,
+                                            int n_slots, int n_experts, hipStream_t stream) {
+  return hy4_mmq_moe_shared("hy4_mmq_moe_vec_slots_typed", type, W, X, ids, out, M, K, n_slots,
+                            n_slots, n_experts, false, stream);
+}
+
 // V4.1 Flash batched GEMMs on the mmq tiles of each weight type. The tiles
 // for types outside the V4 set are instantiated in hy4_mmq_v41_types.hip.cpp.
 #define HY4_MMQ_BATCH_CASES(X) \

@@ -128,6 +128,20 @@ int hy4_mmq_moe_vec_typed(int type, const void* W, const float* X_f32,
                            const int32_t* ids, float* out_f32, int M, int K,
                            int n_tokens, int n_experts, int n_expert_used,
                            hipStream_t stream);
+// The same results as n_tokens one-token hy4_mmq_moe_vec_typed calls (token
+// t's slots ids[t * n_expert_used ..], out rows t * n_expert_used + j), in
+// one launch with the slots of an expert run back to back, so that repeated
+// experts read their rows from the caches. Q8_0, Q4_K, Q5_K, Q6_K;
+// n_tokens * n_expert_used <= 1024.
+int hy4_mmq_moe_vec_tokens_typed(int type, const void* W, const float* X_f32,
+                                 const int32_t* ids, float* out_f32, int M, int K,
+                                 int n_tokens, int n_experts, int n_expert_used,
+                                 hipStream_t stream);
+// The same results as hy4_mmq_moe_vec_typed(..., n_slots, n_experts, 1) for
+// n_slots > 1 (slot s reads X row s), ordered by expert as above.
+int hy4_mmq_moe_vec_slots_typed(int type, const void* W, const float* X_f32,
+                                const int32_t* ids, float* out_f32, int M, int K,
+                                int n_slots, int n_experts, hipStream_t stream);
 
 #ifdef __cplusplus
 } // extern "C"

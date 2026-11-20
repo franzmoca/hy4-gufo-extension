@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "kernels/rocm/hy4_kernels.h"
+#include "kernels/rocm/mmq/hy4_mmq.h"
 
 namespace {
 
@@ -1449,6 +1450,59 @@ void TestF16Matmul() {
   }
 }
 
+// The verify pass's shared-expert matvecs against the one-token calls the
+// decoder makes: bitwise equal, with experts repeated across tokens and an
+// invalid (-1) router id.
+void TestMoeShared() {
+  Expect(hy4_mmq_init(0) == 0, "mmq init");
+  const uint32_t experts = 6, used = 4, n = 5, k = 512, m = 96;
+  std::vector<int32_t> ids(n * used);
+  for (uint32_t t = 0; t < n; ++t) {
+    std::vector<int32_t> e(experts);
+    std::iota(e.begin(), e.end(), 0);
+    std::shuffle(e.begin(), e.end(), g_rng);
+    for (uint32_t j = 0; j < used; ++j)
+      ids[t * used + j] = e[j];
+  }
+  ids[2 * used + 1] = -1;
+  auto* dids = Device(ids);
+  {  // gate/up: one launch per token before
+    const auto w = RandomQuant(HY4_TYPE_Q4_K, (std::size_t)experts * m, k);
+    const auto x = Random(n * k);
+    auto* dw = Device(w);
+    auto* dx = Device(x);
+    float* a = Device(std::vector<float>(n * used * m, 7.0f));
+    float* b = Device(std::vector<float>(n * used * m, 9.0f));
+    bool ok = true;
+    for (uint32_t t = 0; t < n; ++t)
+      ok &= hy4_mmq_moe_vec_typed(HY4_TYPE_Q4_K, dw, dx + t * k,
+                                  dids + t * used, a + t * used * m, m, k, 1,
+                                  experts, used, nullptr) == 0;
+    ok &= hy4_mmq_moe_vec_tokens_typed(HY4_TYPE_Q4_K, dw, dx, dids, b, m, k, n,
+                                       experts, used, nullptr) == 0;
+    Expect(ok, "moe_vec_tokens status");
+    Expect(Host(a, n * used * m) == Host(b, n * used * m),
+           "moe_vec_tokens equals one-token calls");
+  }
+  for (int type : {HY4_TYPE_Q4_K, HY4_TYPE_Q6_K}) {  // down, every slot
+    const uint32_t slots = n * used;
+    const auto w = RandomQuant(type, (std::size_t)experts * m, k);
+    const auto x = Random(slots * k);
+    auto* dw = Device(w);
+    auto* dx = Device(x);
+    float* a = Device(std::vector<float>(slots * m, 7.0f));
+    float* b = Device(std::vector<float>(slots * m, 9.0f));
+    Expect(hy4_mmq_moe_vec_typed(type, dw, dx, dids, a, m, k, slots, experts, 1,
+                                 nullptr) == 0 &&
+               hy4_mmq_moe_vec_slots_typed(type, dw, dx, dids, b, m, k, slots,
+                                           experts, nullptr) == 0,
+           "moe_vec_slots status");
+    Expect(
+        Host(a, slots * m) == Host(b, slots * m),
+        "moe_vec_slots equals the slot matvec, type " + std::to_string(type));
+  }
+}
+
 int main() {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
@@ -1470,6 +1524,7 @@ int main() {
   TestAttnSoftmax();
   TestF16Matmul();
   TestSgemm();
+  TestMoeShared();
   if (g_failures) {
     std::fprintf(stderr, "%d failures\n", g_failures);
     return 1;

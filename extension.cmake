@@ -162,10 +162,10 @@ _hy4flash_test(chat_template "cpu;tokenization;tools"
   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
 _hy4flash_test(vision_prompt "cpu;vision"
   LINK_LIBRARIES gufo_hy4flash_text gufo_hy4flash_hip gufo_hy4flash gufo_ext_hip)
-foreach(name IN ITEMS kernels vision_kernels)
-  _hy4flash_test(${name} "hip;gpu;gfx1151"
-    LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip)
-endforeach()
+_hy4flash_test(kernels "hip;gpu;gfx1151"
+  LINK_LIBRARIES gufo_hy4flash_hip gufo_hy4flash_mmq gufo_ext_hip)
+_hy4flash_test(vision_kernels "hip;gpu;gfx1151"
+  LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip)
 
 install(FILES
   "${GUFO_EXTENSION_BUILD_ROOT}/LICENSE"

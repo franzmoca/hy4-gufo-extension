@@ -539,6 +539,16 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   lower-bit attention quant (half the bytes per token), a model-format
   choice rather than a kernel one.
 
+- **Verify passes** (E27, 2026-11-20). A 4-token verify pass costs about
+  100 ms of kernels against 57 ms for a one-token step (400-token prompt).
+  Beyond the experts (now read once per pass where tokens share them), the
+  pass grows in the per-token attention GEMMs (6.6 ms against 1.7), the
+  FP32 router and F16 head GEMVs (9.3 against 5.0) and the grouped
+  `wk_b`/`wv_b` GEMV (6.1 against 3.5). Sparse-layer decode attention also
+  scores every cached key before masking to the selection, which grows with
+  the context: a fused decode attention over the selected keys is the next
+  decode item.
+
 - **Prefill batch invariance** (done, E17-E18). A token's result depended
   on the passes its span was cut into, so a restore re-prefilling a gap in
   other pass shapes could flip a greedy near tie. E17's FP16 kernels made

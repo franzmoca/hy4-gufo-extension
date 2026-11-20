@@ -926,9 +926,37 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex,
               error))
     return false;
-  // One token per launch: the vendored launcher sums a multi-token batch in
-  // another order than one token, and a verify pass must compute what
-  // one-token decoding would (no weight row is shared across tokens anyway).
+  // A verify pass must compute what one-token decoding would. The shared
+  // kernels give each slot the one-token launches' arithmetic and read each
+  // expert's rows once for the pass (consecutive tokens share about a third
+  // of their experts).
+  const auto shared_type = [](int type) {
+    return type == HY4_TYPE_Q8_0 || type == HY4_TYPE_Q4_K ||
+           type == HY4_TYPE_Q6_K;
+  };
+  if (n > 1 && shared_type(l.gate_exps.type) && shared_type(l.up_exps.type) &&
+      shared_type(l.down_exps.type)) {
+    const auto f_ = static_cast<int>(f);
+    const auto k_ = static_cast<int>(c.n_latent);
+    const auto e_ = static_cast<int>(c.n_expert);
+    HY4_CHECK(hy4_mmq_moe_vec_tokens_typed(
+        l.gate_exps.type, l.gate_exps.data, s.latent, s.ids, s.ffn_a, f_, k_,
+        static_cast<int>(n), e_, static_cast<int>(used), st));
+    HY4_CHECK(hy4_mmq_moe_vec_tokens_typed(
+        l.up_exps.type, l.up_exps.data, s.latent, s.ids, s.ffn_b, f_, k_,
+        static_cast<int>(n), e_, static_cast<int>(used), st));
+    HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, s.route_w, s.ffn_c, n * used, f,
+                         c.swiglu_clamp[il], st));
+    HY4_CHECK(hy4_mmq_moe_vec_slots_typed(l.down_exps.type, l.down_exps.data,
+                                          s.ffn_c, s.ids, s.ffn_a, k_, f_,
+                                          static_cast<int>(n * used), e_, st));
+    HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
+    if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error))
+      return false;
+    HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
+    return true;
+  }
+  // One-token decoding: one token per launch.
   for (std::uint32_t t = 0; t < n; ++t) {
     const float* x = s.latent + std::size_t{t} * c.n_latent;
     const std::int32_t* ids = s.ids + std::size_t{t} * used;

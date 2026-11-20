@@ -1049,3 +1049,201 @@ void mul_mat_vec_q_switch_type(
 // (above) directly through hy4_mmq.cu and never builds ggml_tensor structs.
 // Re-enable with HY4_MMVQ_INCLUDE_GGML_ENTRIES if the full upstream entries
 // are needed for parity comparisons against llama.cpp.
+
+// hy4: the routed experts of a multi-token (verify) pass in one launch,
+// with the slots that share an expert run back to back so that the repeated
+// weight rows come from the caches. Each slot (a token's routed expert
+// ids[s]) is computed exactly as the one-token launches the decoder makes
+// compute it: mul_mat_vec_q<type, 1> over a token's slots (gate and up) or
+// mul_mat_vec_q_moe<type, 2> over every slot (down), so the results are
+// bitwise those of one-token decoding. Only the order of the slots changes.
+
+// order[r] = the slot of rank r by (expert, slot). One block of n_slots
+// (<= 1024) threads.
+static __global__ void hy4_expert_order(const int32_t * __restrict__ ids, uint32_t n_slots,
+                                        uint32_t * __restrict__ order) {
+    const uint32_t s = threadIdx.x;
+    if (s >= n_slots) {
+        return;
+    }
+    const int32_t e = ids[s];
+    uint32_t rank = 0;
+    for (uint32_t i = 0; i < n_slots; ++i) {
+        const int32_t f = ids[i];
+        rank += f < e || (f == e && i < s);
+    }
+    order[rank] = s;
+}
+
+// mul_mat_vec_q<type, 1, false, false> with ids for slot order[blockIdx.y],
+// which reads y row s / slots_per_row and writes dst row s
+// (stride_slot_dst floats). Grid (row blocks, n_slots): an expert's rows
+// stream in order, and its next slot rereads them from the cache.
+template <ggml_type type>
+__launch_bounds__(calc_nwarps(type, 1, get_device_table_id())*hy4_ggml_hip_get_physical_warp_size(), 1)
+static __global__ void hy4_mul_mat_vec_q_shared(
+        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const uint32_t * __restrict__ order, float * __restrict__ dst, const uint32_t ncols_x,
+        const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_channel_x, const uint32_t stride_slot_dst, const uint32_t slots_per_row) {
+
+    constexpr int qk  = hy4_ggml_hip_type_traits<type>::qk;
+    constexpr int qi  = hy4_ggml_hip_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+    constexpr int nwarps = calc_nwarps(type, 1, table_id);
+    constexpr int rows_per_hip_block = calc_rows_per_block(1, table_id, false, nwarps);
+    constexpr int warp_size = hy4_ggml_hip_get_physical_warp_size();
+
+    constexpr hy4_vec_dot_q_hip_t hy4_vec_dot_q_hip = hy4_get_vec_dot_q_hip(type);
+
+    const     int tid = warp_size*threadIdx.y + threadIdx.x;
+    const     int row0 = rows_per_hip_block*blockIdx.x;
+    const     int blocks_per_row_x = ncols_x / qk;
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    const uint32_t slot = order[blockIdx.y];
+    const int32_t expert = ids[slot];
+    const bool invalid_id = expert < 0;
+    const uint32_t channel_x = invalid_id ? 0u : (uint32_t)expert;
+
+    float tmp[rows_per_hip_block] = {0.0f};
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + (slot / slots_per_row)*stride_col_y;
+    const int kbx_offset = channel_x*stride_channel_x + row0*stride_row_x;
+
+    for (int kbx = tid / (qi/vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (tid % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < rows_per_hip_block; ++i) {
+            tmp[i] += hy4_vec_dot_q_hip(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][rows_per_hip_block][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < rows_per_hip_block; ++i) {
+            tmp_shared[threadIdx.y-1][i][threadIdx.x] = tmp[i];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+#pragma unroll
+    for (int i = 0; i < rows_per_hip_block; ++i) {
+#pragma unroll
+        for (int l = 0; l < nwarps-1; ++l) {
+            tmp[i] += tmp_shared[l][i][threadIdx.x];
+        }
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+    }
+    if (threadIdx.x < rows_per_hip_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+        const float result = tmp[threadIdx.x];
+        dst[slot*stride_slot_dst + row0 + threadIdx.x] = isfinite(result) ? result : 0.0f;
+    }
+}
+
+// mul_mat_vec_q_moe<type, 2> for slot order[blockIdx.y * kHy4SharedWarps +
+// threadIdx.y], which reads y row s and writes dst row s: a warp per slot,
+// grid (row pairs, slot groups).
+constexpr int kHy4SharedWarps = 8;
+
+template <ggml_type type>
+__launch_bounds__(kHy4SharedWarps*hy4_ggml_hip_get_physical_warp_size(), 1)
+static __global__ void hy4_mul_mat_vec_q_moe_shared(
+        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
+        const uint32_t * __restrict__ order, float * __restrict__ dst, const uint32_t ncols_x,
+        const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_col_y,
+        const uint32_t stride_channel_x, const uint32_t stride_col_dst, const uint32_t n_slots) {
+
+    constexpr int c_rows_per_block = 2;
+    constexpr int qk  = hy4_ggml_hip_type_traits<type>::qk;
+    constexpr int qi  = hy4_ggml_hip_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = hy4_ggml_hip_get_physical_warp_size();
+
+    constexpr hy4_vec_dot_q_hip_t hy4_vec_dot_q_hip = hy4_get_vec_dot_q_hip(type);
+
+    const int      row0 = c_rows_per_block*blockIdx.x;
+    const int      blocks_per_row_x = ncols_x / qk;
+    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+
+    const uint32_t rank = blockIdx.y*kHy4SharedWarps + threadIdx.y;
+    if (rank >= n_slots) {
+        return;
+    }
+    const uint32_t slot       = order[rank];
+    const int32_t  expert     = ids[slot];
+    const bool     invalid_id = expert < 0;
+    const uint32_t channel_x  = invalid_id ? 0u : (uint32_t)expert;
+
+    const block_q8_1 * y = ((const block_q8_1 *) vy) + slot*stride_col_y;
+    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+
+    float tmp[c_rows_per_block] = {0.0f};
+    for (int kbx = threadIdx.x / (qi/vdr); !invalid_id && kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            tmp[i] += hy4_vec_dot_q_hip(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < c_rows_per_block; ++i) {
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+    }
+    if (threadIdx.x < c_rows_per_block && uint32_t(row0 + threadIdx.x) < nrows_x) {
+        const float value = tmp[threadIdx.x];
+        dst[slot*stride_col_dst + row0 + threadIdx.x] = isfinite(value) ? value : 0.0f;
+    }
+}
+
+template <ggml_type type>
+static void hy4_mmvq_moe_shared_launch(
+        const void * vx, const void * vy, const int32_t * ids, const uint32_t * order, float * dst,
+        int ncols_x, int nrows_x, int stride_row_x, int stride_col_y, int stride_channel_x,
+        int n_slots, int slots_per_row, bool per_token, hipStream_t stream) {
+    const int device = hy4_ggml_hip_get_device();
+    const int warp_size = hy4_ggml_hip_info().devices[device].warp_size;
+    if (per_token) {
+        const mmvq_parameter_table_id table_id = get_device_table_id(hy4_ggml_hip_info().devices[device].cc);
+        const int nwarps = calc_nwarps(type, 1, table_id);
+        const int rpb = calc_rows_per_block(1, table_id, false, nwarps);
+        hy4_mul_mat_vec_q_shared<type><<<dim3((nrows_x + rpb - 1) / rpb, n_slots), dim3(warp_size, nwarps), 0, stream>>>(
+            vx, vy, ids, order, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_channel_x, nrows_x,
+            slots_per_row);
+    } else {
+        hy4_mul_mat_vec_q_moe_shared<type><<<dim3((nrows_x + 1) / 2, (n_slots + kHy4SharedWarps - 1) / kHy4SharedWarps),
+                                              dim3(warp_size, kHy4SharedWarps), 0, stream>>>(
+            vx, vy, ids, order, dst, ncols_x, nrows_x, stride_row_x, stride_col_y, stride_channel_x, nrows_x,
+            n_slots);
+    }
+}
+
+bool hy4_mmvq_moe_shared(
+        const void * vx, ggml_type type, const void * vy, const int32_t * ids, uint32_t * order, float * dst,
+        int ncols_x, int nrows_x, int stride_row_x, int stride_col_y, int stride_channel_x,
+        int n_slots, int slots_per_row, bool per_token, hipStream_t stream) {
+    if (n_slots <= 0 || n_slots > 1024) {
+        return false;
+    }
+    hy4_expert_order<<<1, n_slots, 0, stream>>>(ids, n_slots, order);
+    switch (type) {
+#define HY4_SHARED_CASE(T)                                                                          \
+        case T:                                                                                     \
+            hy4_mmvq_moe_shared_launch<T>(vx, vy, ids, order, dst, ncols_x, nrows_x, stride_row_x, \
+                                          stride_col_y, stride_channel_x, n_slots, slots_per_row,   \
+                                          per_token, stream);                                       \
+            return true;
+        HY4_SHARED_CASE(GGML_TYPE_Q8_0)
+        HY4_SHARED_CASE(GGML_TYPE_Q4_K)
+        HY4_SHARED_CASE(GGML_TYPE_Q5_K)
+        HY4_SHARED_CASE(GGML_TYPE_Q6_K)
+#undef HY4_SHARED_CASE
+        default:
+            return false;
+    }
+}

@@ -32,6 +32,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E24 | Binary16 activations for the FP16 projections: normed inputs and the expert latent | retained |
 | E25 | Indexer scores with a thread per group | retained |
 | E26 | Kpool selection by radix select and sort | retained |
+| E27 | Verify passes: routed experts in one launch, slots ordered by expert | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -497,3 +498,42 @@ Standalone per token: 0.27 → 0.014 ms at 300 groups (1.2K context), 2.9 →
 7.7 → 0.44 ms. Decode of 64 tokens after the 3,712-token prompt: 13.75 →
 15.18 tok/s, identical tokens; prefill 4.70 → 4.62 s (804 tok/s).
 The gain grows with the context (about 33 ms per token at 32K). Retained.
+
+## E27: Verify passes: routed experts in one launch, slots ordered by expert (2026-11-20)
+
+A verify pass must compute what one-token decoding would, so its routed
+experts ran as one-token launches: gate and up once per token, each
+reading its 16 experts' rows, and down over every slot. A 4-token pass
+(400-token prompt, `--passcheck 4` profile) took 109 ms of kernels against
+57 ms for a one-token step; the experts were 53 ms of it, against 14 ms.
+Consecutive decoded tokens share experts: over windows of 2, 4 and 8
+tokens, 81%, 66% and 53% of the (token, expert) slots name distinct
+experts (128 decoded tokens, every layer).
+
+`hy4_mmq_moe_vec_tokens_typed` and `_slots_typed` run the pass's slots in
+one launch each, ordered by expert, with each slot computed by a copy of the
+one-token kernel's code (`mul_mat_vec_q<type, 1>` for gate and up,
+`mul_mat_vec_q_moe<type, 2>` for down). An expert's rows stream in order
+and its next slot rereads them from the cache. Results are bitwise those of
+the one-token launches (unit test with repeated experts and a -1 id;
+`--passcheck` 2, 4 and 8 exact). 4-token pass: gate/up 32.5 → 27.7 ms,
+down 20.3 → 15.6 ms, 109 → 100 ms of kernels.
+
+Not retained, from the same profile: one block per expert computing its
+slots one after another (exact; gate/up 35 ms, down 24 ms: the serial slots
+cut the memory parallelism); the same with each block holding up to eight
+slots' partial sums at once (gate/up 56 ms, and not bitwise: rejected);
+slots fastest in the gate/up grid (44 ms: blocks jump between experts
+rather than stream one expert's rows).
+
+Server, DFly2 in every arm, fresh server each, ABBA, base `18ca509`
+(tok/s, mean of two arms; replies and drafts identical in all four):
+
+| prompt | base | E27 | change |
+| --- | --- | --- | --- |
+| code | 25.9 | 29.7 | +14.6% |
+| prose | 17.3 | 18.4 | +6.3% |
+| list | 20.7 | 22.5 | +8.7% |
+| long context (4,192-token prompt) | 19.2 | 20.7 | +7.9% |
+
+Plain one-token decoding keeps the vendored launches. Retained.

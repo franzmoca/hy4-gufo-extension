@@ -21,3 +21,9 @@ This copy comes from `ds41-gufo-extension` at `eb8ece9`
 ([UPSTREAM.md](../../../UPSTREAM.md)). When importing upstream changes,
 retain the HIP implementation and check the result with the KL gate in
 [QUALITY.md](../../../docs/QUALITY.md).
+
+Local additions: `hy4_mmvq_moe_shared` (end of `mmvq.hip.cpp`) runs a
+multi-token pass's routed experts in one launch with the slots ordered by
+expert; each slot repeats `mul_mat_vec_q<type, 1>` or
+`mul_mat_vec_q_moe<type, 2>` exactly, so results equal one-token launches
+bitwise (`kernels_test` checks it).
