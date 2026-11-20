@@ -615,6 +615,8 @@ public:
                                           sampling::SamplerState& sampler) const override {
     DecodePlan plan =
         PrepareDecode(state, max_tokens, sampler, Session::kTapRows);
+    DecodePlan* drafting = &plan;
+    DraftPlans(std::span(&drafting, 1));
     if (!plan.tokens.empty()) {
       std::string error;
       Session* session = &plan.hy4->session();
@@ -643,6 +645,22 @@ public:
             std::max<std::size_t>(1, Session::kTapRows / decodes.size()));
       } catch (...) {
         steps[i].failure = std::current_exception();
+      }
+    }
+    {
+      std::vector<DecodePlan*> drafting;
+      for (auto& plan : plans)
+        if (plan)
+          drafting.push_back(&*plan);
+      try {
+        DraftPlans(drafting);
+      } catch (...) {
+        for (std::size_t i = 0; i < decodes.size(); ++i) {
+          if (plans[i] && plans[i]->draft_count != 0) {
+            steps[i].failure = std::current_exception();
+            plans[i].reset();
+          }
+        }
       }
     }
     std::size_t next = 0;
@@ -723,6 +741,7 @@ private:
     std::vector<std::int32_t> proposals;
     lookup::PromptLookup<std::int32_t>::Match copy{};
     bool sampled = false;  // the anchor was drawn
+    std::uint32_t draft_count = 0;  // DFly2 drafts to ask for (DraftPlans)
     bool plain = false;    // the anchor alone: a one-token step
     std::size_t width = 1;
     std::chrono::steady_clock::time_point t0, t1, t2;
@@ -773,21 +792,45 @@ private:
     work.Accept(anchor.token);
     plan.step.selections.push_back(std::move(anchor));
 
-    std::string error;
-    plan.t0 = std::chrono::steady_clock::now();
-    if (draft) {
-      const auto count = static_cast<std::uint32_t>(
+    if (draft)
+      plan.draft_count = static_cast<std::uint32_t>(
           std::min<std::size_t>(draft_tokens_, room));
-      if (!drafter_->Draft(session, anchor_token, count, min_accept_,
-                           &plan.proposals, &error)) {
-        throw std::runtime_error("Hy4 draft failed: " + error);
-      }
-    }
-    plan.t1 = std::chrono::steady_clock::now();
     plan.tokens = {anchor_token};
     plan.tokens.insert(plan.tokens.end(), plan.proposals.begin(),
                        plan.proposals.end());
     return plan;
+  }
+
+  // DFly2's drafts for the plans that draft, in one drafter pass for all of
+  // them, appended to their tokens.
+  void DraftPlans(std::span<DecodePlan* const> plans) const {
+    std::vector<const Session*> sessions;
+    std::vector<std::int32_t> anchors;
+    std::vector<std::uint32_t> counts;
+    std::vector<std::vector<std::int32_t>*> drafts;
+    for (DecodePlan* plan : plans) {
+      if (plan->draft_count == 0)
+        continue;
+      sessions.push_back(&plan->hy4->session());
+      anchors.push_back(plan->tokens.front());
+      counts.push_back(plan->draft_count);
+      drafts.push_back(&plan->proposals);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!sessions.empty()) {
+      std::string error;
+      if (!drafter_->DraftBatch(sessions, anchors, counts, min_accept_, drafts,
+                                &error))
+        throw std::runtime_error("Hy4 draft failed: " + error);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    for (DecodePlan* plan : plans) {
+      plan->t0 = t0;
+      plan->t1 = t1;
+      if (plan->draft_count != 0)
+        plan->tokens.insert(plan->tokens.end(), plan->proposals.begin(),
+                            plan->proposals.end());
+    }
   }
 
   // Keep the proposals the target's own draws agree with. A disagreeing

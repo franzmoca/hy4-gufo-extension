@@ -1,0 +1,108 @@
+{
+ "setup": "four concurrent replays of the recorded 53-request coding-agent session (seeds 1-4), gufo serve -c 32768 --sessions 4, fresh server per arm in the order E49 DFly2, E48 DFly2, E49 no drafter, E49 DFly2; all 212 replies identical across arms (tool-call ids aside)",
+ "arms": {
+  "new1": "E49 DFly2",
+  "e48": "E48 DFly2",
+  "ar": "E49 no drafter",
+  "new2": "E49 DFly2"
+ },
+ "runs": [
+  {
+   "arm": "new1",
+   "users": 4,
+   "wall_s": 419.6,
+   "tokens": 15001,
+   "drafts": 12361,
+   "accepted": 9368,
+   "decode_s_per_user": [
+    374.1,
+    330.2,
+    337.6,
+    347.7
+   ],
+   "prefill_s_per_user": [
+    3.4,
+    19.2,
+    7.4,
+    0.9
+   ],
+   "decode_tps_all": 40.09
+  },
+  {
+   "arm": "e48",
+   "users": 4,
+   "wall_s": 465.2,
+   "tokens": 15001,
+   "drafts": 12388,
+   "accepted": 9345,
+   "decode_s_per_user": [
+    419.8,
+    372.4,
+    382.0,
+    390.9
+   ],
+   "prefill_s_per_user": [
+    3.1,
+    19.6,
+    7.5,
+    1.3
+   ],
+   "decode_tps_all": 35.73
+  },
+  {
+   "arm": "ar",
+   "users": 4,
+   "wall_s": 478.2,
+   "tokens": 15001,
+   "drafts": 1677,
+   "accepted": 1575,
+   "decode_s_per_user": [
+    438.6,
+    375.1,
+    376.1,
+    389.7
+   ],
+   "prefill_s_per_user": [
+    0.6,
+    22.4,
+    6.4,
+    0.2
+   ],
+   "decode_tps_all": 34.2
+  },
+  {
+   "arm": "new2",
+   "users": 4,
+   "wall_s": 420.4,
+   "tokens": 15001,
+   "drafts": 12362,
+   "accepted": 9367,
+   "decode_s_per_user": [
+    375.1,
+    331.8,
+    339.2,
+    348.6
+   ],
+   "prefill_s_per_user": [
+    0.3,
+    20.1,
+    9.6,
+    0.6
+   ],
+   "decode_tps_all": 39.99
+  }
+ ],
+ "prose_4_users_tok_s": {
+  "E48 DFly2": 35.07,
+  "E49 DFly2": [
+   38.57,
+   37.44
+  ],
+  "no drafter": 39.31
+ },
+ "drafter_ms_per_round_4_users": {
+  "E48": 25.4,
+  "E49": 11.2
+ },
+ "single_session_agent_replay": "53/53 replies, 3,355 drafts, decode 108.9 s in all four ABBA arms against E48"
+}

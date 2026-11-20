@@ -24,6 +24,8 @@ namespace gufo::models::hy4_flash {
 class Drafter {
 public:
   static constexpr std::uint32_t kBlock = 8;
+  /// Sessions one DraftBatch drafts for.
+  static constexpr std::uint32_t kMaxSessions = 8;
 
   ~Drafter();
   Drafter(const Drafter&) = delete;
@@ -45,6 +47,15 @@ public:
   /// Needs the session's taps (TapsReady). May draft nothing.
   [[nodiscard]] bool Draft(const Session& session, std::int32_t anchor, std::uint32_t count, float min_accept,
                            std::vector<std::int32_t>* drafts, std::string* error);
+  /// Draft for up to kMaxSessions distinct sessions at once: their blocks
+  /// share one pass through the drafter's layers and each slot's
+  /// correction and LM head, and each session drafts what Draft gives it
+  /// alone, up to rounding in the layers' wider matrix products.
+  [[nodiscard]] bool DraftBatch(
+      std::span<const Session* const> sessions,
+      std::span<const std::int32_t> anchors,
+      std::span<const std::uint32_t> counts, float min_accept,
+      std::span<std::vector<std::int32_t>* const> drafts, std::string* error);
 
 private:
   struct LayerWeights;
@@ -62,16 +73,27 @@ private:
   Tensor head_;
   // Drafts score the head's first head_rows_ rows (the BPE's earlier, more
   // frequent tokens) and a table of the later rows whose tokens the session
-  // holds (SyncTable), in head_rows_ + table_ids_.size() logits.
+  // holds (SyncTable), in head_rows_ + ids.size() logits. Each drafting
+  // session has its own table, up to kMaxSessions of them.
+  struct Table {
+    void* rows = nullptr;           // [table_capacity_] head rows
+    std::vector<std::int32_t> ids;  // token of each table row
+    std::vector<std::uint8_t> in;   // [n_vocab]
+    std::size_t synced = 0;         // history tokens the table covers
+    const Session* session = nullptr;
+    std::uint64_t used = 0;  // the last DraftBatch that used it
+  };
   std::uint32_t head_rows_ = 0;
   std::uint64_t row_bytes_ = 0;
   std::uint32_t table_capacity_ = 0;
-  void* table_ = nullptr;                // [table_capacity_] head rows
-  std::vector<std::int32_t> table_ids_;  // token of each table row
-  std::vector<std::uint8_t> in_table_;   // [n_vocab]
-  std::size_t table_synced_ = 0;         // history tokens the table covers
-  const Session* table_session_ = nullptr;
-  [[nodiscard]] bool SyncTable(const Session& session, std::string* error);
+  std::vector<Table> tables_;
+  std::uint64_t batches_ = 0;
+  // The session's table: its own, else a new one, else the least recently
+  // used one not in this batch, reset; null when every table is in it.
+  [[nodiscard]] Table* TableFor(const Session& session);
+  [[nodiscard]] bool AddTable();
+  [[nodiscard]] bool SyncTable(Table& table, const Session& session,
+                               std::string* error);
   float confidence_b_ = 0.0f;
   std::int32_t mask_token_ = 0;
   std::unique_ptr<Buffers> buf_;

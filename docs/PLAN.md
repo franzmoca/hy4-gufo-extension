@@ -616,8 +616,9 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   yields (the host yields only decode rounds today).
 
 - **Batched decoding** (E48). Up to eight sessions share a decode pass of
-  16 rows. Open: more rows per pass (the decode kernels' 16-row limit) for
-  wider DFly2 batches, and batching the drafters' passes.
+  16 rows, and their DFly2 drafts share one drafter pass (E49). Open: more
+  rows per pass (the decode kernels' 16-row limit) for wider DFly2 batches,
+  and a faster batched path for the drafter's 24-64-row products.
 
 ## Open questions
 

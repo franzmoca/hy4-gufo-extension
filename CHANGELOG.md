@@ -95,6 +95,9 @@
   tok/s)
   ([E45](docs/EXPERIMENTS.md#e45-cache-checkpoints-inside-a-prefill-pass-2026-11-20),
   [E46](docs/EXPERIMENTS.md#e46-engram-rows-read-directly-beside-the-layers-2026-11-20)).
+- DFly2 drafts for concurrent requests in one drafter pass: four coding-agent
+  sessions finish in 420 s instead of 465 s, with the same replies
+  ([E49](docs/EXPERIMENTS.md#e49-several-sessions-drafts-in-one-drafter-pass-2026-11-20)).
 - Concurrent requests decode together in one pass: four requests generate
   39 tokens per second in all (16.5 before), 35 with DFly2 (17.6), with the
   same replies; a single request is unchanged

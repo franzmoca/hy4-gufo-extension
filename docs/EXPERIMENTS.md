@@ -54,6 +54,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E46 | Engram rows read directly, beside the layers | retained |
 | E47 | Decode rounds between a prompt pass's layer groups | retained |
 | E48 | Several sessions' decoding in one pass | retained |
+| E49 | Several sessions' drafts in one drafter pass | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1180,3 +1181,39 @@ Concurrent chat requests, 256 tokens each, four sessions, tok/s in all
 
 DFly2 gains less: its sessions already verify several rows per pass, and
 rows from different sessions name more distinct experts.
+
+## E49: Several sessions' drafts in one drafter pass (2026-11-20)
+
+With E48, four DFly2 sessions decoding together each still ran the drafter
+alone, one after another: 25 ms of every round for four sessions, so on
+prose four users got 35.1 tok/s with DFly2 against 39.3 without it.
+`Drafter::DraftBatch` now drafts for up to eight sessions at once: their
+blocks share one pass through the drafter's five layers (32 rows for four
+sessions), each session attends to its own target rows, and the sessions
+still drafting share each slot's correction, confidence head and LM head
+prefix. Each session keeps its own table of later head rows, so sessions no
+longer evict each other's. Four sessions draft in 11.2 ms per round (block
+layers 7.7 ms, attention 1.4 ms, slots 1.6 ms, against 5.1, 0.6 and 0.8 ms
+for one).
+
+A session drafting alone runs the same kernels as before: the recorded agent
+session replays with the same 53 replies, 3,355 drafts and 108.9 s of
+decoding in all four ABBA arms against E48. In a batch of three or more,
+the layers' 24+ rows take the batched matrix path, so a session's drafts
+can differ by rounding from its drafts alone; replies cannot, since the
+target verifies every draft. Every reply below matched across arms, and the
+suites pass as in E48
+([artifact](artifacts/2026-11-20-batched-decode/batched-drafts.json)).
+
+| workload, 4 users | no drafter | E48 DFly2 | E49 DFly2 |
+| --- | --- | --- | --- |
+| prose stories, 256 tokens each (tok/s in all) | 39.3 | 35.1 | 38.6, 37.4 |
+| coding-agent session ×4, decode time per user (s) | 375-439 | 372-420 | 330-374 |
+| coding-agent session ×4, wall (s) | 478 | 465 | 420, 420 |
+
+On prose the drafts barely pay (0.25 accepted per session and round), so
+DFly2 now matches plain decoding there instead of costing 11%; on the agent
+session it decodes 12% faster than E48 and 14% faster than plain decoding.
+Open: the drafter's 32-row products run at 7.7 ms where the weights alone
+need about 3 ms, and each of four sessions may propose only 3 drafts in a
+shared 16-row verify pass.
