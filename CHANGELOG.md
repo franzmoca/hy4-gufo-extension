@@ -89,6 +89,9 @@
   ([E33](docs/EXPERIMENTS.md#e33-prompt-lookup-2026-11-20)); greedy requests
   verify up to 15 copied tokens per pass
   ([E34](docs/EXPERIMENTS.md#e34-16-token-verify-passes-for-copies-2026-11-20)).
+- A prompt longer than 2,048 tokens gives the same reply after a
+  prompt-cache restore as served cold, wherever the restore splits it
+  ([E36](docs/EXPERIMENTS.md#e36-prefill-attention-below-position-2048-independent-of-the-pass-2026-11-20)).
 - DFly2 drafts score the LM head's 65,536 most frequent rows and the rows of
   the request's own tokens: decoding with DFly2 1.3% faster on chat prompts
   and 1.6% on an agent session, with the same replies

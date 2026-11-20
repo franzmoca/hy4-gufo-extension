@@ -57,8 +57,10 @@ not invariant to the history: a prompt-cache restore moves the prefill pass
 boundaries. Since
 [E18](EXPERIMENTS.md#e18-prompt-passes-on-the-batched-kernels-at-any-size-2026-11-20)
 a prompt gives identical logits however it is split into passes
-(`--chunkcheck` at tails of 800 down to 1 token), so a reply after a restore
-matches the same request served cold. Before E17 every split changed results
+(`--chunkcheck` at tails of 800 down to 1 token, and since
+[E36](EXPERIMENTS.md#e36-prefill-attention-below-position-2048-independent-of-the-pass-2026-11-20)
+at splits below 2,048 in longer prompts), so a reply after a restore matches
+the same request served cold. Before E17 every split changed results
 from the first layer on (KL 0.006, 2% of greedy tokens flipped;
 [E6](EXPERIMENTS.md#e6-prefill-results-against-the-pass-split-2026-11-19)).
 

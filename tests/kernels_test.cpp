@@ -714,7 +714,7 @@ void TestMlaPrefill() {
                        const std::vector<int32_t>* sel, uint32_t n_sel,
                        bool sink,
                        const std::vector<std::vector<int32_t>>& want_keys,
-                       const std::string& what) {
+                       const std::string& what) -> std::vector<uint16_t> {
     auto* out = Device(std::vector<uint16_t>(n * heads * dv));
     Expect(hy4_mla_prefill(dq, dc, ring_used, lo, dp, window,
                            sel ? Device(*sel) : nullptr, n_sel,
@@ -729,14 +729,19 @@ void TestMlaPrefill() {
          MlaReference(q, cache, ring_used, want_keys,
                       sink ? sinks.data() : nullptr, scale, heads, dk, dv),
          4e-3, what);
+    return bits;
   };
+  std::vector<uint16_t> causal_sinks;
   for (bool sink : {true, false}) {
     std::vector<std::vector<int32_t>> keys(n);
     for (uint32_t t = 0; t < n; ++t)
       for (int32_t k = 0; k <= pos[t]; ++k)
         keys[t].push_back(k);
-    run(ring, 0, 0, nullptr, 0, sink, keys,
-        std::string("mla_prefill causal") + (sink ? " sinks" : ""));
+    const auto bits =
+        run(ring, 0, 0, nullptr, 0, sink, keys,
+            std::string("mla_prefill causal") + (sink ? " sinks" : ""));
+    if (sink)
+      causal_sinks = bits;
   }
   {
     // Window 64 from position 20 (positions below 20 are never read: token 0
@@ -762,10 +767,22 @@ void TestMlaPrefill() {
           continue;  // empty slot
         const int32_t k = any(g_rng);
         sel[t * n_sel + i] = k;
-        if (k <= pos[t])
+        if (k <= pos[t] && pos[t] >= (int32_t)n_sel)
           keys[t].push_back(k);  // a future key is skipped
       }
-    run(ring, 0, 0, &sel, n_sel, true, keys, "mla_prefill selection");
+    // A token below position n_sel selects every earlier position, so it
+    // reads them in causal order whatever its selection row holds.
+    for (uint32_t t = 0; t < n; ++t)
+      for (int32_t k = 0; pos[t] < (int32_t)n_sel && k <= pos[t]; ++k)
+        keys[t].push_back(k);
+    const auto bits =
+        run(ring, 0, 0, &sel, n_sel, true, keys, "mla_prefill selection");
+    int differ = 0;
+    for (uint32_t t = 0; t < n; ++t)
+      for (uint32_t i = 0; pos[t] < (int32_t)n_sel && i < heads * dv; ++i)
+        differ += bits[t * heads * dv + i] != causal_sinks[t * heads * dv + i];
+    Expect(differ == 0, "mla_prefill selection below n_sel matches causal (" +
+                            std::to_string(differ) + ")");
   }
   Expect(hy4_mla_prefill(dq, dc, ring, 0, dp, 0, nullptr, 0, ds, scale, nullptr,
                          n, 24, dk, dv, nullptr) != 0,

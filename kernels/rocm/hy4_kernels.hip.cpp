@@ -1420,8 +1420,13 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
 
   const int32_t p = pos[t];
   const int32_t lo_t = window ? max(lo, p - (int32_t)window + 1) : lo;
-  const int32_t* sel_t = sel ? sel + (uint64_t)t * n_sel : nullptr;
-  const uint32_t count = sel         ? n_sel
+  // A selection has n_sel = (top + 1) kpool slots, so a token below
+  // position n_sel sees at most top groups and selects every earlier
+  // position: it reads them in causal order, as in a pass with no selection,
+  // so that its result does not depend on the pass it is in.
+  const int32_t* sel_t =
+      sel && p >= (int32_t)n_sel ? sel + (uint64_t)t * n_sel : nullptr;
+  const uint32_t count = sel_t       ? n_sel
                          : p >= lo_t ? (uint32_t)(p - lo_t + 1)
                                      : 0u;
 

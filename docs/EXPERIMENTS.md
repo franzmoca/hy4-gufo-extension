@@ -41,6 +41,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E33 | Prompt lookup | retained |
 | E34 | 16-token verify passes for copies | retained |
 | E35 | A smaller draft head: the frequent rows and the request's own | retained |
+| E36 | Prefill attention below position 2,048 independent of the pass | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -882,3 +883,24 @@ Gufo's `conversation`, `long-context` and `cache` suites pass every case.
 Scripts and per-request numbers:
 [artifacts/2026-11-20-draft-vocab/](artifacts/2026-11-20-draft-vocab/).
 Retained.
+
+## E36: Prefill attention below position 2,048 independent of the pass (2026-11-20)
+
+A pass whose last token sees more than 511 pooled groups runs the indexer's
+selection for every token, and `MlaPrefill` read each token's keys in the
+selection's order. A token below position 2,048 selects every earlier
+position, which in a pass without selection it read in causal order: the
+same keys summed in another order, so its result depended on the pass it was
+in. `hy4_eval_probe --chunkcheck 1000` on a 2,100-token prompt: first
+difference at layer 0 (1.9e-5), 1,062 of 1,100 same top, mean KL 0.0062; on
+the 3,712-token document 2,577 of 2,712. E18's checks split prompts that
+stayed below 2,048 tokens, or only their last tokens. A prompt-cache restore
+that moves a boundary below 2,048 in a longer prompt could flip a greedy near
+tie.
+
+`MlaPrefill` now reads such a token's keys in causal order whatever its
+selection row holds (the decode path's key list was already sorted).
+`--chunkcheck` is exact at 999, 1,000 and 2,049 on the 3,712-token document
+and at 1,000 on the 2,100-token prompt; KL 0.08424 (unchanged: its passes
+put no token below 2,048 beside a selection). The kernel test now checks the
+case bitwise, and fails without the fix. Retained.
