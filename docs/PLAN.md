@@ -494,7 +494,7 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   5.355 s (E20); the gate in `wv_b`'s stores, binary16 `attv`: 5.16 s
   (E21); the post-mix in the next pre-mix: 5.07 s (E23); binary16 normed
   inputs and expert latent: 4.86 s (E24); indexer scores by thread: 4.71 s
-  (E25).
+  (E25); kpool selection by radix select: 4.62 s (E26).
 
 - **Prefill profile after E17** (3,712 tokens, 5.35 s of kernels): dense
   FP16 projections 1.87 s (27-33 TFLOPS standalone; `wo` and `attn_gate` are

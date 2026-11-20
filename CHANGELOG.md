@@ -44,7 +44,7 @@
   after a prompt-cache restore matches the reply to the same prompt served
   cold; short prompt passes are faster
   ([E18](docs/EXPERIMENTS.md#e18-prompt-passes-on-the-batched-kernels-at-any-size-2026-11-20)).
-- Prefill about 790 tok/s on 3,712 tokens: the attention's output and its
+- Prefill about 800 tok/s on 3,712 tokens: the attention's output and its
   gated values pass between kernels in binary16, and the router runs on its
   own FP32 GEMM
   ([E19](docs/EXPERIMENTS.md#e19-prefill-attention-output-in-binary16-2026-11-20),
@@ -57,3 +57,7 @@
   ([E24](docs/EXPERIMENTS.md#e24-binary16-activations-for-the-fp16-projections-normed-inputs-and-the-expert-latent-2026-11-20)),
   and the sparse attention's indexer scores take a thread per group
   ([E25](docs/EXPERIMENTS.md#e25-indexer-scores-with-a-thread-per-group-2026-11-20)).
+- Decode no longer slows with the context in the sparse layers' top-k
+  selection: 13.75 → 15.18 tok/s after a 3,712-token prompt, about 33 ms per
+  token less at 32K
+  ([E26](docs/EXPERIMENTS.md#e26-kpool-selection-by-radix-select-and-sort-2026-11-20)).

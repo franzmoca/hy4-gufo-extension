@@ -31,6 +31,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E23 | Hyper-connection post-mix folded into the next pre-mix | retained |
 | E24 | Binary16 activations for the FP16 projections: normed inputs and the expert latent | retained |
 | E25 | Indexer scores with a thread per group | retained |
+| E26 | Kpool selection by radix select and sort | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -480,3 +481,19 @@ identical (1.9 M scores in a standalone comparison; KL 0.08424, PPL
 a block takes one token instead of four, which keeps 3- to 8-token verify
 passes at short contexts no slower. 3,712-token prefill 4.86 → 4.70, 4.72 s
 (788 tok/s). Retained.
+
+## E26: Kpool selection by radix select and sort (2026-11-20)
+
+`KpoolSelect` picked each token's 511 groups in 511 rounds of block argmax
+over its visible groups, in every sparse layer, for decode as for prefill.
+`KpoolSelectSort` finds the 511th-largest key (score made unsigned-
+orderable, the complemented group below it, so that keys are distinct and
+the lower group wins a tie) with a byte-wise radix select, collects the
+keys at or above it and sorts them in LDS: the same groups in the same
+order (bitwise identical in a standalone comparison with ties and zeros;
+KL 0.08424, `--passcheck 8` and `--chunkcheck` 517 and 999 exact).
+Standalone per token: 0.27 → 0.014 ms at 300 groups (1.2K context), 2.9 →
+0.08 ms at 8,192 (32K), 10.4 → 0.18 ms at 32,768; a 2,048-token pass
+7.7 → 0.44 ms. Decode of 64 tokens after the 3,712-token prompt: 13.75 →
+15.18 tok/s, identical tokens; prefill 4.70 → 4.62 s (804 tok/s).
+The gain grows with the context (about 33 ms per token at 32K). Retained.

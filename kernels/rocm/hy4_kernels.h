@@ -197,8 +197,9 @@ int hy4_indexer_score(const float* q, const float* w, const float* pooled, const
 /* Converts logits rows to the top-k selection of positions: for token t the
  * k highest finite scores' groups g expand to positions g*kpool + j, then
  * the token's own group positions (pos[t] - pos[t] % kpool .. pos[t]); the
- * rest of sel[t, 0:n_sel] is -1. n_sel = (k + 1) * kpool. The picked scores
- * are overwritten with -inf. */
+ * rest of sel[t, 0:n_sel] is -1. n_sel = (k + 1) * kpool. Groups are listed
+ * by descending score, the lower group first among equal scores. For
+ * k > 512 the picked scores are overwritten with -inf. */
 int hy4_kpool_select(const float* score, const int32_t* n_pool, uint32_t n_pool_max, const int32_t* pos,
                      uint32_t k, uint32_t kpool, int32_t* sel, uint32_t n, hipStream_t stream);
 

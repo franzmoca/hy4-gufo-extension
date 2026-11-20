@@ -740,8 +740,8 @@ __global__ void __launch_bounds__(kBlock)
   }
 }
 
-// One block per token: k rounds of block argmax over the visible groups.
-// TODO(perf): a radix select instead of k argmax rounds.
+// One block per token: k rounds of block argmax over the visible groups
+// (kept for k > kSelMax; KpoolSelectSort gives the same selection).
 __global__ void KpoolSelect(float* score, const int32_t* n_pool, uint32_t n_pool_max, const int32_t* pos,
                             uint32_t k, uint32_t kpool, int32_t* sel, uint32_t n_sel) {
   __shared__ float scratch[32];
@@ -777,6 +777,104 @@ __global__ void KpoolSelect(float* score, const int32_t* n_pool, uint32_t n_pool
   }
 }
 
+constexpr uint32_t kSelMax = 512;
+// KpoolSelect's selection in its order without its k argmax rounds: the
+// take-th largest key by a byte-wise radix select, then the keys at or above
+// it sorted in LDS. One block per token.
+//
+// Descending order of (score, -group): the score's bits made unsigned-
+// orderable (-0 as +0, as the argmax's comparisons treat them), the group
+// complemented below them, so that keys are distinct and a lower group sorts
+// first among equal scores.
+__device__ __forceinline__ uint64_t SelKey(float v, uint32_t g) {
+  uint32_t u = __float_as_uint(v == 0.0f ? 0.0f : v);
+  u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  return (uint64_t)u << 32 | (0xffffffffu - g);
+}
+__global__ void __launch_bounds__(kBlock)
+    KpoolSelectSort(const float* score, const int32_t* n_pool,
+                    uint32_t n_pool_max, const int32_t* pos, uint32_t k,
+                    uint32_t kpool, int32_t* sel, uint32_t n_sel) {
+  static_assert(kBlock == 256, "a histogram bin per thread");
+  __shared__ uint32_t hist[256];
+  __shared__ uint64_t keys[kSelMax];
+  __shared__ uint64_t prefix_s;
+  __shared__ uint32_t want_s, count_s;
+  const uint32_t t = blockIdx.x;
+  const float* row = score + (uint64_t)t * n_pool_max;
+  int32_t* out = sel + (uint64_t)t * n_sel;
+  const uint32_t visible = (uint32_t)n_pool[t];
+  const uint32_t take = visible < k ? visible : k;
+  for (uint32_t i = threadIdx.x; i < n_sel; i += blockDim.x)
+    out[i] = -1;
+  // The take-th largest key, a byte at a time from the top.
+  uint64_t prefix = 0, mask = 0;
+  if (take < visible) {
+    if (threadIdx.x == 0)
+      want_s = take;
+    for (int shift = 56; shift >= 0; shift -= 8) {
+      hist[threadIdx.x] = 0;
+      __syncthreads();
+      for (uint32_t g = threadIdx.x; g < visible; g += blockDim.x) {
+        const uint64_t key = SelKey(row[g], g);
+        if ((key & mask) == prefix)
+          atomicAdd(&hist[(key >> shift) & 0xff], 1u);
+      }
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        uint32_t want = want_s, b = 255;
+        for (;; --b) {
+          if (hist[b] >= want)
+            break;
+          want -= hist[b];
+        }
+        want_s = want;
+        prefix_s = prefix | (uint64_t)b << shift;
+      }
+      __syncthreads();
+      prefix = prefix_s;
+      mask |= (uint64_t)0xff << shift;
+    }
+  }
+  // Collect the keys at or above it (all of them when every group is taken).
+  if (threadIdx.x == 0)
+    count_s = 0;
+  for (uint32_t i = threadIdx.x; i < kSelMax; i += blockDim.x)
+    keys[i] = 0;
+  __syncthreads();
+  for (uint32_t g = threadIdx.x; g < visible; g += blockDim.x) {
+    const uint64_t key = SelKey(row[g], g);
+    if (take == visible || key >= prefix)
+      keys[atomicAdd(&count_s, 1u)] = key;
+  }
+  __syncthreads();
+  // Bitonic sort, descending; the zero padding sorts last.
+  for (uint32_t size = 2; size <= kSelMax; size <<= 1)
+    for (uint32_t stride = size / 2; stride > 0; stride >>= 1) {
+      for (uint32_t i = threadIdx.x; i < kSelMax; i += blockDim.x) {
+        const uint32_t j = i ^ stride;
+        if (j > i) {
+          const bool desc = (i & size) == 0;
+          const uint64_t a = keys[i], b = keys[j];
+          if (desc ? a < b : a > b) {
+            keys[i] = b;
+            keys[j] = a;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  for (uint32_t i = threadIdx.x; i < take * kpool; i += blockDim.x) {
+    const int32_t g = (int32_t)(0xffffffffu - (uint32_t)keys[i / kpool]);
+    out[i] = g * (int32_t)kpool + (int32_t)(i % kpool);
+  }
+  const int32_t p = pos[t];
+  const int32_t first = p - p % (int32_t)kpool;
+  if (threadIdx.x < kpool) {
+    const int32_t at = first + (int32_t)threadIdx.x;
+    out[k * kpool + threadIdx.x] = at <= p ? at : -1;
+  }
+}
 // One block per row (t, h).
 __global__ void AttnSoftmax(float* scores, uint32_t heads, uint32_t n_keys, int32_t key_pos0, const int32_t* pos,
                             uint32_t window, const float* mask, const float* sinks) {
@@ -1631,7 +1729,12 @@ int hy4_indexer_score(const float* q, const float* w, const float* pooled, const
 int hy4_kpool_select(const float* score, const int32_t* n_pool, uint32_t n_pool_max, const int32_t* pos, uint32_t k,
                      uint32_t kpool, int32_t* sel, uint32_t n, hipStream_t stream) {
   if (n == 0) return 0;
-  KpoolSelect<<<n, kBlock, 0, stream>>>((float*)score, n_pool, n_pool_max, pos, k, kpool, sel, (k + 1) * kpool);
+  if (k <= kSelMax)
+    KpoolSelectSort<<<n, kBlock, 0, stream>>>(score, n_pool, n_pool_max, pos, k,
+                                              kpool, sel, (k + 1) * kpool);
+  else
+    KpoolSelect<<<n, kBlock, 0, stream>>>((float*)score, n_pool, n_pool_max,
+                                          pos, k, kpool, sel, (k + 1) * kpool);
   return Status();
 }
 
