@@ -27,8 +27,6 @@ namespace {
 
 // The reference Engram norms leave eps unset: the FP32 machine epsilon.
 constexpr float kEngramEps = 1.1920929e-07f;
-// Attention scores per batched pass ([query rows][keys] floats).
-constexpr std::size_t kScoreFloats = std::size_t{64} << 20;
 
 bool Fail(std::string* error, const std::string& what) {
   if (error) *error = what;
@@ -227,10 +225,8 @@ bool Model::AllocScratch(std::string* error) {
       DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
       DeviceAlloc(&s.logits, std::size_t{n} * c.n_vocab, owned) &&
       HostAlloc(&s.host_h, std::size_t{n} * c.hc * c.n_embd, owned);
-  const bool ok2 =
-      ok &&
-      DeviceAlloc(&s.keys, std::size_t{c.swa_window + kVecMax} * dk, owned) &&
-      DeviceAlloc(&s.scores, kScoreFloats, owned);
+  s.attn_work_floats = hy4_mla_attention_work(kVecMax, hmax, c.idx_top_k);
+  const bool ok2 = ok && DeviceAlloc(&s.attn_work, s.attn_work_floats, owned);
   if (!ok2) return Fail(error, "hy4: scratch allocation failed");
   hipblasHandle_t blas = nullptr;
   if (hipblasCreate(&blas) != HIPBLAS_STATUS_SUCCESS || hipblasSetStream(blas, stream_) != HIPBLAS_STATUS_SUCCESS) {
@@ -287,8 +283,6 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::st
   }
   const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
   ok = ok &&
-       DeviceAlloc(&s->mask_, std::size_t{kVecMax} * max_context,
-                   &s->allocations_) &&
        DeviceAlloc(&s->keys_half_, std::size_t{max_context} * dk,
                    &s->allocations_) &&
        DeviceAlloc(&s->score_, std::size_t{kMaxChunk} * pools,
@@ -619,7 +613,6 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   hipStream_t st = m.stream_;
   const Exec ex{st, m.blas_, prompt_pass_};
   const bool batched = n > Model::kVecMax || prompt_pass_;
-  auto* blas = static_cast<hipblasHandle_t>(m.blas_);
   const std::uint32_t heads = c.n_head[il];
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::uint32_t nope = c.head_k - c.n_rot;
@@ -678,63 +671,32 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
     }
   }
 
-  // Scores over every key the pass can see, as GEMMs over (token, head)
-  // rows: MLA here is MQA over one latent row per key, so each key row is
-  // read once per pass rather than once per head.
-  const std::uint32_t window = c.is_swa[il] ? c.swa_window : 0;
-  const std::int32_t last = static_cast<std::int32_t>(Position() + n - 1);
-  std::int32_t lo = 0;
-  const float* keys = cache_[il];
-  if (window)
-    lo = std::max<std::int32_t>(0, static_cast<std::int32_t>(Position()) - static_cast<std::int32_t>(window) + 1);
-  const std::uint32_t n_keys = static_cast<std::uint32_t>(last - lo + 1);
-  if (batched) {
-    // Prefill reads binary16 keys, converted once per pass.
-    HY4_CHECK(hy4_gather_rows_half(cache_[il], ring_[il], lo, n_keys, dk,
-                                   keys_half_, st));
-  } else if (window) {
-    HY4_CHECK(
-        hy4_gather_rows(cache_[il], ring_[il], lo, n_keys, dk, s.keys, st));
-    keys = s.keys;
-  }
-  if (sel && !batched)
-    HY4_CHECK(hy4_selection_mask(sel, n_sel, mask_, n, n_keys, st));
   const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_k));
-  const float zero = 0.0f;
-  const float one = 1.0f;
-  if (!batched) {
-    // Each token over exactly the keys a one-token pass would see, so a
-    // verify pass computes what decoding its tokens one by one would.
-    for (std::uint32_t t = 0; t < n; ++t) {
-      const std::int32_t p = static_cast<std::int32_t>(Position() + t);
-      const std::int32_t lo_t = window ? std::max<std::int32_t>(0, p - static_cast<std::int32_t>(window) + 1) : 0;
-      const auto keys_t = static_cast<std::uint32_t>(p - lo_t + 1);
-      const float* k = keys + std::size_t(lo_t - lo) * dk;
-      const int rows = static_cast<int>(heads);
-      if (hipblasSgemm(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(keys_t), rows, static_cast<int>(dk), &scale,
-                       k, static_cast<int>(dk), s.qfull + std::size_t{t} * heads * dk, static_cast<int>(dk), &zero,
-                       s.scores, static_cast<int>(keys_t)) != HIPBLAS_STATUS_SUCCESS) {
-        return Fail(error, "hy4: attention score gemm failed");
-      }
-      HY4_CHECK(hy4_attn_softmax(s.scores, 1, heads, keys_t, lo_t, s.pos + t, window,
-                                 sel ? mask_ + std::size_t{t} * n_keys + (lo_t - lo) : nullptr, l.attn_sinks.f32(),
-                                 st));
-      if (hipblasSgemm(blas, HIPBLAS_OP_N, HIPBLAS_OP_N, static_cast<int>(c.kv_lora), rows, static_cast<int>(keys_t),
-                       &one, k, static_cast<int>(dk), s.scores, static_cast<int>(keys_t), &zero,
-                       s.att + std::size_t{t} * heads * c.kv_lora,
-                       static_cast<int>(c.kv_lora)) != HIPBLAS_STATUS_SUCCESS) {
-        return Fail(error, "hy4: attention value gemm failed");
-      }
-    }
-  }
   // Prefill attention output as binary16 bits in att's storage.
   auto* att_half = reinterpret_cast<std::uint16_t*>(s.att);
   if (batched) {
-    // Prefill: each token over exactly its own keys on the matrix cores, so a
-    // token's result does not depend on how its span was cut into passes.
+    // Prefill reads binary16 keys, converted once per pass, and runs each
+    // token over exactly its own keys on the matrix cores, so a token's
+    // result does not depend on how its span was cut into passes.
+    const std::uint32_t window = c.is_swa[il] ? c.swa_window : 0;
+    const std::int32_t last = static_cast<std::int32_t>(Position() + n - 1);
+    std::int32_t lo = 0;
+    if (window)
+      lo = std::max<std::int32_t>(0, static_cast<std::int32_t>(Position()) -
+                                         static_cast<std::int32_t>(window) + 1);
+    const auto n_keys = static_cast<std::uint32_t>(last - lo + 1);
+    HY4_CHECK(hy4_gather_rows_half(cache_[il], ring_[il], lo, n_keys, dk,
+                                   keys_half_, st));
     HY4_CHECK(hy4_mla_prefill(qh, keys_half_, lo, s.pos, window, sel, n_sel,
                               l.attn_sinks.f32(), scale, att_half, n, heads, dk,
                               c.kv_lora, st));
+  } else {
+    // Decoding and verify passes: each token over exactly the keys a
+    // one-token pass would see.
+    HY4_CHECK(hy4_mla_attention(
+        s.qfull, cache_[il], ring_[il], s.pos, c.is_swa[il] ? c.swa_window : 0,
+        sel, n_sel, l.attn_sinks.f32(), scale, s.att, n, heads, dk, c.kv_lora,
+        s.attn_work, s.attn_work_floats, st));
   }
   if (batched) {
     // The gate first, so that wv_b's stores apply it and round the gated

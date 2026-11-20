@@ -10,6 +10,7 @@
 #include <cstring>
 #include <numeric>
 #include <random>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -558,58 +559,125 @@ std::vector<double> MlaReference(const std::vector<float>& q,
   return out;
 }
 
+// Decode attention at Hy4's shape against the reference: spans of one key,
+// of a split boundary and of more than 2,048 keys (larger splits), windows
+// wrapping the ring, and selections with empty, future and repeated slots.
+// A token's result is bitwise the same alone or in a pass, and selecting
+// every visible key gives the causal result bitwise.
 void TestMlaAttention() {
-  const uint32_t heads = 4, dk = 96, dv = 64, ring = 40;
-  const float scale = 0.125f;
-  const auto cache = Random(ring * dk, -2, 2);
-  const auto sinks = Random(heads, -1, 1);
-  const std::vector<int32_t> pos{5, 39, 57};
-  const uint32_t n = (uint32_t)pos.size();
-  const auto q = Random(n * heads * dk, -2, 2);
-  auto* dq = Device(q);
-  auto* dc = Device(cache);
-  auto* dp = Device(pos);
-  auto* ds = Device(sinks);
-  for (uint32_t window : {0u, 16u}) {
+  const uint32_t dk = 576, dv = 512, ring = 2600;
+  const float scale = 1.0f / 16.0f;
+  const auto cache = Random(ring * dk, -1, 1);
+  float* dc = Device(cache);
+  auto run = [&](const std::vector<float>& q, const std::vector<int32_t>& pos,
+                 uint32_t ring_used, uint32_t window,
+                 const std::vector<int32_t>& sel, uint32_t n_sel,
+                 const std::vector<float>& sinks, uint32_t heads) {
+    const uint32_t n = (uint32_t)pos.size();
+    const uint64_t work = hy4_mla_attention_work(n, heads, n_sel);
+    float* dw = Device(std::vector<float>(work));
+    float* out = Device(std::vector<float>(n * heads * dv));
+    Expect(hy4_mla_attention(Device(q), dc, ring_used, Device(pos), window,
+                             sel.empty() ? nullptr : Device(sel), n_sel,
+                             sinks.empty() ? nullptr : Device(sinks), scale,
+                             out, n, heads, dk, dv, dw, work, nullptr) == 0,
+           "mla_attention status");
+    return Host(out, n * heads * dv);
+  };
+  auto alone = [&](const std::vector<float>& q, const std::vector<int32_t>& pos,
+                   uint32_t ring_used, uint32_t window,
+                   const std::vector<int32_t>& sel, uint32_t n_sel,
+                   const std::vector<float>& sinks, uint32_t heads) {
+    std::vector<float> all;
+    for (std::size_t t = 0; t < pos.size(); ++t) {
+      const std::vector<float> qt(q.begin() + t * heads * dk,
+                                  q.begin() + (t + 1) * heads * dk);
+      const std::vector<int32_t> st =
+          sel.empty() ? sel
+                      : std::vector<int32_t>(sel.begin() + t * n_sel,
+                                             sel.begin() + (t + 1) * n_sel);
+      const auto o =
+          run(qt, {pos[t]}, ring_used, window, st, n_sel, sinks, heads);
+      all.insert(all.end(), o.begin(), o.end());
+    }
+    return all;
+  };
+  for (uint32_t window : {0u, 512u}) {
+    const uint32_t heads = window ? 64 : 32;
+    const uint32_t ring_used = window ? 700 : ring;
+    const std::vector<int32_t> pos =
+        window ? std::vector<int32_t>{0, 40, 1500, 2899}
+               : std::vector<int32_t>{0, 31, 32, 2500};
+    const uint32_t n = (uint32_t)pos.size();
+    const auto q = Random(n * heads * dk, -1, 1);
+    const auto sinks = Random(heads, -1, 1);
     for (bool sink : {true, false}) {
-      // Window 0 has no lower bound: its spans stay inside the ring.
-      const std::vector<int32_t> use =
-          window ? pos : std::vector<int32_t>{5, 30, 39};
+      const std::vector<float> sk = sink ? sinks : std::vector<float>{};
       std::vector<std::vector<int32_t>> keys(n);
       for (uint32_t t = 0; t < n; ++t)
-        for (int32_t p = window ? std::max(0, use[t] - (int32_t)window + 1) : 0;
-             p <= use[t]; ++p)
+        for (int32_t p = window ? std::max(0, pos[t] - (int32_t)window + 1) : 0;
+             p <= pos[t]; ++p)
           keys[t].push_back(p);
-      float* out = Device(std::vector<float>(n * heads * dv));
-      Expect(hy4_mla_attention(dq, dc, ring, Device(use), window, nullptr, 0,
-                               sink ? ds : nullptr, scale, out, n, heads, dk,
-                               dv, nullptr) == 0,
-             "mla_attention status");
-      Near(Host(out, n * heads * dv),
-           MlaReference(q, cache, ring, keys, sink ? sinks.data() : nullptr,
-                        scale, heads, dk, dv),
-           1e-5,
-           "mla_attention window " + std::to_string(window) +
-               (sink ? " sinks" : ""));
+      const auto got = run(q, pos, ring_used, window, {}, 0, sk, heads);
+      const std::string what = "mla_attention window " +
+                               std::to_string(window) + (sink ? " sinks" : "");
+      Near(got,
+           MlaReference(q, cache, ring_used, keys,
+                        sink ? sinks.data() : nullptr, scale, heads, dk, dv),
+           1e-5, what);
+      Expect(got == alone(q, pos, ring_used, window, {}, 0, sk, heads),
+             what + " equals one-token calls");
     }
   }
-  // Selection: listed positions (wrapping the ring), -1 slots skipped.
-  const uint32_t n_sel = 8;
-  const std::vector<int32_t> sel{0,  3,  -1, 5,  -1, -1, -1, -1,  //
-                                 39, 12, 20, 21, 22, 23, -1, 38,  //
-                                 57, 56, -1, 41, 50, -1, -1, -1};
+  // Selections: shuffled positions with -1, future and repeated slots; the
+  // last token selects every key at or below its position.
+  const uint32_t heads = 32, n_sel = 2048;
+  const std::vector<int32_t> pos{100, 2000, 2400};
+  const uint32_t n = (uint32_t)pos.size();
+  std::vector<int32_t> sel(n * n_sel, -1);
   std::vector<std::vector<int32_t>> keys(n);
-  for (uint32_t t = 0; t < n; ++t)
-    for (uint32_t i = 0; i < n_sel; ++i)
-      if (sel[t * n_sel + i] >= 0)
-        keys[t].push_back(sel[t * n_sel + i]);
-  float* out = Device(std::vector<float>(n * heads * dv));
-  Expect(hy4_mla_attention(dq, dc, ring, dp, 0, Device(sel), n_sel, ds, scale,
-                           out, n, heads, dk, dv, nullptr) == 0,
-         "mla_attention selection status");
-  Near(Host(out, n * heads * dv),
+  for (uint32_t t = 0; t < n; ++t) {
+    std::vector<int32_t> pick;
+    if (t + 1 < n) {
+      for (int32_t p = 0; p <= pos[t] + 20; p += 3)
+        pick.push_back(p);
+      pick.push_back(pos[t]);
+      pick.push_back(6);  // repeated
+    } else {
+      for (int32_t p = pos[t] - (int32_t)n_sel + 1; p <= pos[t]; ++p)
+        pick.push_back(p);
+    }
+    std::shuffle(pick.begin(), pick.end(), g_rng);
+    pick.resize(std::min<std::size_t>(pick.size(), n_sel - 10));
+    for (std::size_t i = 0; i < pick.size(); ++i)
+      sel[t * n_sel + i] = pick[i];
+    std::set<int32_t> uniq;
+    for (int32_t p : pick)
+      if (p <= pos[t])
+        uniq.insert(p);
+    keys[t].assign(uniq.begin(), uniq.end());
+  }
+  const auto q = Random(n * heads * dk, -1, 1);
+  const auto sinks = Random(heads, -1, 1);
+  const auto got = run(q, pos, ring, 0, sel, n_sel, sinks, heads);
+  Near(got,
        MlaReference(q, cache, ring, keys, sinks.data(), scale, heads, dk, dv),
        1e-5, "mla_attention selection");
+  Expect(got == alone(q, pos, ring, 0, sel, n_sel, sinks, heads),
+         "mla_attention selection equals one-token calls");
+  // Selecting every visible key equals no selection (positions 0 .. pos).
+  const std::vector<int32_t> p1{1000};
+  std::vector<int32_t> every(n_sel, -1);
+  for (int32_t p = 0; p <= p1[0]; ++p)
+    every[(p * 7) % 1003] = p;  // shuffled slots
+  const std::vector<float> q1(q.begin(), q.begin() + heads * dk);
+  Expect(run(q1, p1, ring, 0, every, n_sel, sinks, heads) ==
+             run(q1, p1, ring, 0, {}, 0, sinks, heads),
+         "mla_attention selecting every key equals the causal span");
+  Expect(hy4_mla_attention(nullptr, dc, ring, nullptr, 0, nullptr, 0, nullptr,
+                           scale, nullptr, 1, heads, 96, 64, nullptr, 0,
+                           nullptr) != 0,
+         "mla_attention rejects other shapes");
 }
 
 // The matrix-core prefill attention against the same reference, at Hy4's
@@ -1084,16 +1152,12 @@ void TestAttnSoftmax() {
   const auto sinks = Random(heads);
   // Selection mask: token 0 sees nothing selected (only the sink).
   const std::vector<int32_t> sel{-1, -1, -1, 3, 5, 6, 20, 23, -1};
-  float* mask = Device(std::vector<float>(n * n_keys, 1.0f));
-  Expect(hy4_selection_mask(Device(sel), 3, mask, n, n_keys, nullptr) == 0,
-         "selection_mask status");
-  std::vector<double> want_mask(n * n_keys, -INFINITY);
+  std::vector<float> mask_host(n * n_keys, -INFINITY);
   for (uint32_t t = 0; t < n; ++t)
     for (uint32_t i = 0; i < 3; ++i)
       if (sel[t * 3 + i] >= 0)
-        want_mask[t * n_keys + sel[t * 3 + i]] = 0.0;
-  const auto mask_host = Host(mask, n * n_keys);
-  Near(mask_host, want_mask, 0, "selection_mask");
+        mask_host[t * n_keys + sel[t * 3 + i]] = 0.0f;
+  float* mask = Device(mask_host);
 
   for (uint32_t window : {0u, 6u}) {
     for (bool masked : {false, true}) {

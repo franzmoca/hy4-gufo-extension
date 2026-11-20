@@ -69,3 +69,8 @@
   GEMVs compute four rows per warp, with the same results as one-token
   decoding
   ([E28](docs/EXPERIMENTS.md#e28-verify-passes-four-rows-per-warp-in-the-float-and-grouped-gemvs-2026-11-20)).
+- Decode no longer slows with the context in the sparse and sliding-window
+  layers: attention reads only each token's own keys in one fused kernel,
+  15.3 → 16.2 tok/s after a 3,712-token prompt and 13.2 → 16.1 after 14,849
+  tokens; with DFly2, 15% faster after a 4,192-token prompt
+  ([E29](docs/EXPERIMENTS.md#e29-fused-decode-attention-over-each-tokens-own-keys-2026-11-20)).

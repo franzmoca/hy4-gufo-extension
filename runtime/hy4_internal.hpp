@@ -49,8 +49,8 @@ struct Model::Scratch {
   float* att = nullptr;   // [chunk][heads][kv_lora]
   float* attv = nullptr;  // [chunk][heads][head_v]
   float* gate = nullptr;  // [chunk][heads][head_v]
-  float* keys = nullptr;    // [swa_window + chunk][kv_lora + n_rot], SWA keys in order
-  float* scores = nullptr;  // attention scores, kScoreFloats
+  float* attn_work = nullptr;  // decode attention, hy4_mla_attention_work
+  std::uint64_t attn_work_floats = 0;
   // Indexer.
   float* ik = nullptr;     // [chunk][idx_dim]
   float* ivg = nullptr;    // [chunk][2 idx_dim]

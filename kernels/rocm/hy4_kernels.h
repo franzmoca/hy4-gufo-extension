@@ -113,10 +113,18 @@ int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
  * row pos % ring. Token t at position pos[t] attends to positions
  * max(0, pos[t] - window + 1) .. pos[t] (window 0: no lower bound), or to
  * sel[t, 0:n_sel] (positions, -1 for an empty slot) when sel is not NULL.
- * out[t, h, 0:dv] = softmax(scale * q.k, sink[h]) . latent. */
-int hy4_mla_attention(const float* q, const float* cache, uint32_t ring, const int32_t* pos,
-                      uint32_t window, const int32_t* sel, uint32_t n_sel, const float* sinks,
-                      float scale, float* out, uint32_t n, uint32_t heads, uint32_t dk, uint32_t dv,
+ * out[t, h, 0:dv] = softmax(scale * q.k, sink[h]) . latent. Positions
+ * above pos[t] and repeated selections are skipped. Each token's result
+ * depends only on its own query and keys, so a verify pass computes what
+ * one-token passes would. Hy4's shape only: dk 576, dv 512, heads a multiple
+ * of 4. `work` holds hy4_mla_attention_work(n, heads, n_sel)
+ * floats (n_sel 0 without a selection). */
+uint64_t hy4_mla_attention_work(uint32_t n, uint32_t heads, uint32_t n_sel);
+int hy4_mla_attention(const float* q, const float* cache, uint32_t ring,
+                      const int32_t* pos, uint32_t window, const int32_t* sel,
+                      uint32_t n_sel, const float* sinks, float scale,
+                      float* out, uint32_t n, uint32_t heads, uint32_t dk,
+                      uint32_t dv, float* work, uint64_t work_floats,
                       hipStream_t stream);
 
 /* hy4_mla_attention for prefill on the matrix cores (binary16 operands, FP32
@@ -210,12 +218,9 @@ int hy4_kpool_select(const float* score, const int32_t* n_pool, uint32_t n_pool_
  * sees (key position <= pos[t], within `window` when non-zero, and, with a
  * mask [n][n_keys], where it is 0), with the head's sink in the denominator.
  * Masked keys get probability 0. */
-int hy4_attn_softmax(float* scores, uint32_t n, uint32_t heads, uint32_t n_keys, int32_t key_pos0,
-                     const int32_t* pos, uint32_t window, const float* mask, const float* sinks,
-                     hipStream_t stream);
-/* mask [n][n_keys] = 0 at the selected positions sel [n][n_sel] (-1 unused), -inf elsewhere. */
-int hy4_selection_mask(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t n, uint32_t n_keys,
-                       hipStream_t stream);
+int hy4_attn_softmax(float* scores, uint32_t n, uint32_t heads, uint32_t n_keys,
+                     int32_t key_pos0, const int32_t* pos, uint32_t window,
+                     const float* mask, const float* sinks, hipStream_t stream);
 /* dst [count][dim] = rows of the positions first .. first + count - 1 of a ring. */
 int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t count, uint32_t dim, float* dst,
                     hipStream_t stream);

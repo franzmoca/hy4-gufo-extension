@@ -270,8 +270,8 @@ These are judgment calls made without the maintainer; revisit any of them.
     the routed gate and up projections run one token per launch (the vendored
     launcher's multi-token MoE kernel sums in another order; it reuses no
     weight row across tokens, so this costs only launches), and attention runs
-    each token's two GEMMs over exactly the keys its own step sees (hipBLAS
-    picks kernels by shape). Batched prefill passes (n > 8) keep their GEMMs.
+    each token over exactly the keys its own step sees (since E29 in one
+    fused kernel for the whole pass). Batched prefill passes (n > 8) keep their GEMMs.
     Before this, verify passes differed from one-token steps by KL 0.0018, and
     two greedy requests could diverge after a near tie depending on how their
     tokens had been grouped into passes, which Gufo's `reasoning-budget` suite
@@ -539,14 +539,13 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   lower-bit attention quant (half the bytes per token), a model-format
   choice rather than a kernel one.
 
-- **Verify passes** (E27-E28, 2026-11-20). A 4-token verify pass costs about
-  94 ms of kernels against 56 ms for a one-token step (400-token prompt).
-  The experts are read once per pass where tokens share them (E27), and the
+- **Verify passes** (E27-E29, 2026-11-20). A 4-token verify pass costs about
+  90 ms of kernels against 56 ms for a one-token step (400-token prompt).
+  The experts are read once per pass where tokens share them (E27), the
   float and grouped GEMVs load each token's activations once per four rows
-  (E28). The pass still grows in the per-token attention GEMMs (6.6 ms
-  against 1.7). Sparse-layer decode attention also scores every cached key
-  before masking to the selection, which grows with the context: a fused
-  decode attention over the selected keys is the next decode item.
+  (E28), and attention runs all the pass's tokens in three launches per
+  layer (E29). The difference is now mostly the routed experts (43 ms against
+  14): four tokens name about 2.6 times as many distinct experts as one.
 
 - **Prefill batch invariance** (done, E17-E18). A token's result depended
   on the passes its span was cut into, so a restore re-prefilling a gap in
@@ -556,10 +555,13 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   at every split, and the `cache` suite passes. Decoding and verify passes
   keep the single-token kernels, which `--passcheck` holds exact.
 
-- Sparse layers score every earlier key and mask all but the 2,048 selected
-  (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per
-  token, and a verify pass now reads it once per token. Gathering only the
-  selected rows (as the drafter does) cuts both.
+- **Decode attention** (done, E29). Decoding and verify passes read only
+  each token's own keys (the selection in sparse layers, the window in SWA
+  layers) in a fused kernel, so attention no longer slows with the context
+  (only the indexer's pool scores grow with it): 16.2 tok/s after 3,712 tokens and 16.1
+  after 14,849. The kernel is bound by FP32 arithmetic (about 1.5 ms per
+  token); binary16 operands on the matrix cores, as in prefill, would cut
+  that but change decode's numerics.
 
 - **Vision tower projections.** hipBLAS picks a non-WMMA kernel
   (`MT64x32x8`, about 5.6 TFLOPS) for the binary16 projections: 2.4 s of a

@@ -426,77 +426,253 @@ __global__ void Rope(float* x, const int32_t* pos, const int32_t* pos_hw,
 
 // ---------------------------------------------------------------- attention
 
-constexpr uint32_t kMaxKeys = 4096;
+// Decode attention: each token over its own keys in splits of whole
+// 32-key chunks, a warp holding kAttnHpw heads' queries in registers. Lane
+// l owns latent columns 128 i + 4 l .. + 3 (i < 4) and rope columns
+// 512 + 2 l, 2 l + 1. A split keeps a running max, denominator and value
+// sum per head; MlaCombine merges the splits with the sink. A token's split
+// size depends only on its own key count, so its result does not depend on
+// the other tokens of the pass.
+constexpr uint32_t kAttnDk = 576, kAttnDv = 512;
+constexpr uint32_t kAttnHpw = 4, kAttnWarps = 4, kAttnUnroll = 4,
+                   kAttnHeadsPerBlock = kAttnHpw * kAttnWarps;
+constexpr uint32_t kAttnChunk = 32, kAttnSplits = 32;
 
-// One block per (token, head). Keys are scored one warp per key.
-__global__ void MlaAttention(const float* q, const float* cache, uint32_t ring, const int32_t* pos,
-                             uint32_t window, const int32_t* sel, uint32_t n_sel, const float* sinks, float scale,
-                             float* out, uint32_t heads, uint32_t dk, uint32_t dv) {
-  extern __shared__ float smem[];
-  __shared__ float scratch[32];
-  float* qs = smem;          // dk
-  float* sc = smem + dk;     // keys
-  int32_t* kp = (int32_t*)(sc + kMaxKeys);  // key positions
+__device__ __forceinline__ uint32_t AttnSplitKeys(uint32_t count) {
+  constexpr uint32_t per = kAttnChunk * kAttnSplits;
+  return kAttnChunk * ((count + per - 1) / per);
+}
 
-  const uint32_t t = blockIdx.x;
-  const uint32_t h = blockIdx.y;
-  const float* qr = q + ((uint64_t)t * heads + h) * dk;
-  for (uint32_t i = threadIdx.x; i < dk; i += blockDim.x) qs[i] = qr[i];
-
-  // The key positions this token attends to.
-  uint32_t n_keys = 0;
+// The token's keys: list[t] when selected, else first .. first + count - 1.
+__device__ __forceinline__ uint32_t AttnKeys(const int32_t* pos,
+                                             uint32_t window,
+                                             const uint32_t* list_count,
+                                             uint32_t t, int32_t* first) {
   const int32_t p = pos[t];
-  if (sel) {
-    if (threadIdx.x == 0) {
-      for (uint32_t i = 0; i < n_sel && n_keys < kMaxKeys; ++i) {
-        const int32_t s = sel[(uint64_t)t * n_sel + i];
-        if (s >= 0) kp[n_keys++] = s;
-      }
-      sc[0] = (float)n_keys;  // passed through shared memory below
+  *first = window ? max(0, p - (int32_t)window + 1) : 0;
+  return list_count ? list_count[t] : (uint32_t)(p - *first + 1);
+}
+
+// One block per token: the selected positions <= pos[t], ascending and
+// without repeats, so that selecting every key gives the plain causal order.
+// Positions are marked in an LDS bitmap kKeyTile at a time, then each
+// thread writes its words' positions after a block scan of their counts.
+constexpr uint32_t kKeyListThreads = 1024, kKeyTileWords = 2 * kKeyListThreads;
+constexpr uint32_t kKeyTile = 32 * kKeyTileWords;
+
+__global__ void __launch_bounds__(kKeyListThreads)
+    AttnKeyList(const int32_t* sel, uint32_t n_sel, const int32_t* pos,
+                int32_t* list, uint32_t* count) {
+  __shared__ uint32_t bits[kKeyTileWords];
+  __shared__ uint32_t warp_total[kKeyListThreads / 32];
+  const uint32_t t = blockIdx.x;
+  const int32_t p = pos[t];
+  const int32_t* st = sel + (uint64_t)t * n_sel;
+  int32_t* out = list + (uint64_t)t * n_sel;
+  const uint32_t lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
+  uint32_t written = 0;
+  for (int32_t tile = 0; tile <= p; tile += (int32_t)kKeyTile) {
+    for (uint32_t w = threadIdx.x; w < kKeyTileWords; w += blockDim.x)
+      bits[w] = 0;
+    __syncthreads();
+    for (uint32_t i = threadIdx.x; i < n_sel; i += blockDim.x) {
+      const int32_t s = st[i];
+      if (s >= tile && s <= p && s - tile < (int32_t)kKeyTile)
+        atomicOr(&bits[(uint32_t)(s - tile) / 32],
+                 1u << ((uint32_t)(s - tile) % 32));
     }
     __syncthreads();
-    n_keys = (uint32_t)sc[0];
+    // Thread x owns words 2x and 2x + 1.
+    const uint32_t w0 = bits[2 * threadIdx.x], w1 = bits[2 * threadIdx.x + 1];
+    const uint32_t mine = __popc(w0) + __popc(w1);
+    uint32_t incl = mine;
+    for (uint32_t o = 1; o < (uint32_t)warpSize; o <<= 1) {
+      const uint32_t x = __shfl_up(incl, o);
+      if (lane >= o)
+        incl += x;
+    }
+    if (lane == (uint32_t)warpSize - 1)
+      warp_total[warp] = incl;
     __syncthreads();
-  } else {
-    const int32_t lo = window ? max(0, p - (int32_t)window + 1) : 0;
-    n_keys = (uint32_t)(p - lo + 1);
-    if (n_keys > kMaxKeys) n_keys = kMaxKeys;  // callers keep spans below this
-    const int32_t first = p - (int32_t)n_keys + 1;
-    for (uint32_t i = threadIdx.x; i < n_keys; i += blockDim.x) kp[i] = first + (int32_t)i;
+    uint32_t before = 0, total = 0;
+    for (uint32_t w = 0; w < blockDim.x / warpSize; ++w) {
+      if (w < warp)
+        before += warp_total[w];
+      total += warp_total[w];
+    }
+    uint32_t at = written + before + incl - mine;
+    const int32_t base = tile + (int32_t)(64 * threadIdx.x);
+    for (uint32_t v = w0; v; v &= v - 1)
+      out[at++] = base + __ffs(v) - 1;
+    for (uint32_t v = w1; v; v &= v - 1)
+      out[at++] = base + 32 + __ffs(v) - 1;
+    written += total;
+    __syncthreads();
   }
-  __syncthreads();
+  if (threadIdx.x == 0)
+    count[t] = written;
+}
 
-  const uint32_t lane = threadIdx.x % warpSize;
-  const uint32_t warp = threadIdx.x / warpSize;
-  const uint32_t warps = blockDim.x / warpSize;
-  for (uint32_t j = warp; j < n_keys; j += warps) {
-    const float* kr = cache + (uint64_t)((uint32_t)kp[j] % ring) * dk;
-    float d = 0.0f;
-    for (uint32_t i = lane; i < dk; i += warpSize) d += qs[i] * kr[i];
-    d = WarpSum(d);
-    if (lane == 0) sc[j] = d * scale;
+__global__ void __launch_bounds__(kAttnWarps * 32)
+    MlaDecode(const float* q, const float* cache, uint32_t ring,
+              const int32_t* pos, uint32_t window, const int32_t* list,
+              const uint32_t* list_count, uint32_t list_stride, float scale,
+              float* part_ml, float* part_acc, uint32_t heads) {
+  const uint32_t split = blockIdx.x, t = blockIdx.z;
+  int32_t first;
+  const uint32_t count = AttnKeys(pos, window, list_count, t, &first);
+  const uint32_t keys = AttnSplitKeys(count);
+  const uint32_t begin = split * keys;
+  if (begin >= count)
+    return;
+  const uint32_t end = min(count, begin + keys);
+  const uint32_t lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
+  const uint32_t h0 = blockIdx.y * kAttnHeadsPerBlock + warp * kAttnHpw;
+  if (h0 >= heads)
+    return;
+
+  float4 qv[kAttnHpw][4];
+  float2 qt[kAttnHpw];
+  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+    const float* qh = q + ((uint64_t)t * heads + h0 + h) * kAttnDk;
+    for (uint32_t i = 0; i < 4; ++i)
+      qv[h][i] = *(const float4*)(qh + 128 * i + 4 * lane);
+    qt[h] = *(const float2*)(qh + kAttnDv + 2 * lane);
   }
-  __syncthreads();
+  float m[kAttnHpw], l[kAttnHpw];
+  float4 acc[kAttnHpw][4];
+  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+    m[h] = -INFINITY;
+    l[h] = 0.0f;
+    for (uint32_t i = 0; i < 4; ++i)
+      acc[h][i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  const int32_t* lt = list ? list + (uint64_t)t * list_stride : nullptr;
+  auto row = [&](uint32_t j) {
+    const int32_t kp = lt ? lt[j] : first + (int32_t)j;
+    return cache + (uint64_t)((uint32_t)kp % ring) * kAttnDk;
+  };
+  for (uint32_t c0 = begin; c0 < end; c0 += kAttnChunk) {
+    const uint32_t nk = min(kAttnChunk, end - c0);
+    // Lane j keeps key c0 + j's scores. kAttnUnroll keys at a time, their
+    // loads issued together; keys past the chunk repeat its last key and
+    // are dropped.
+    float sc[kAttnHpw];
+    for (uint32_t h = 0; h < kAttnHpw; ++h)
+      sc[h] = -INFINITY;
+    for (uint32_t j = 0; j < nk; j += kAttnUnroll) {
+      float4 kv[kAttnUnroll][4];
+      float2 kt[kAttnUnroll];
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u) {
+        const float* kr = row(c0 + min(j + u, nk - 1));
+        for (uint32_t i = 0; i < 4; ++i)
+          kv[u][i] = *(const float4*)(kr + 128 * i + 4 * lane);
+        kt[u] = *(const float2*)(kr + kAttnDv + 2 * lane);
+      }
+      float d[kAttnUnroll][kAttnHpw];
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        for (uint32_t h = 0; h < kAttnHpw; ++h) {
+          float x = qt[h].x * kt[u].x;
+          x = fmaf(qt[h].y, kt[u].y, x);
+          for (uint32_t i = 0; i < 4; ++i) {
+            x = fmaf(qv[h][i].x, kv[u][i].x, x);
+            x = fmaf(qv[h][i].y, kv[u][i].y, x);
+            x = fmaf(qv[h][i].z, kv[u][i].z, x);
+            x = fmaf(qv[h][i].w, kv[u][i].w, x);
+          }
+          d[u][h] = x;
+        }
+      for (int o = warpSize / 2; o > 0; o >>= 1)
+#pragma unroll
+        for (uint32_t u = 0; u < kAttnUnroll; ++u)
+          for (uint32_t h = 0; h < kAttnHpw; ++h)
+            d[u][h] += __shfl_xor(d[u][h], o);
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        for (uint32_t h = 0; h < kAttnHpw; ++h)
+          if (lane == j + u && j + u < nk)
+            sc[h] = d[u][h] * scale;
+    }
+    float e[kAttnHpw];
+    for (uint32_t h = 0; h < kAttnHpw; ++h) {
+      const float mx = fmaxf(m[h], WarpMax(sc[h]));
+      const float alpha = expf(m[h] - mx);
+      e[h] = lane < nk ? expf(sc[h] - mx) : 0.0f;
+      l[h] = l[h] * alpha + WarpSum(e[h]);
+      m[h] = mx;
+      for (uint32_t i = 0; i < 4; ++i) {
+        acc[h][i].x *= alpha;
+        acc[h][i].y *= alpha;
+        acc[h][i].z *= alpha;
+        acc[h][i].w *= alpha;
+      }
+    }
+    for (uint32_t j = 0; j < nk; j += kAttnUnroll) {
+      float4 kv[kAttnUnroll][4];
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u) {
+        const float* kr = row(c0 + min(j + u, nk - 1));
+        for (uint32_t i = 0; i < 4; ++i)
+          kv[u][i] = *(const float4*)(kr + 128 * i + 4 * lane);
+      }
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        for (uint32_t h = 0; h < kAttnHpw; ++h) {
+          // Lanes past the chunk hold e = 0.
+          const float pj = __shfl(e[h], min(j + u, kAttnChunk - 1));
+          if (j + u >= nk)
+            continue;
+          for (uint32_t i = 0; i < 4; ++i) {
+            acc[h][i].x = fmaf(pj, kv[u][i].x, acc[h][i].x);
+            acc[h][i].y = fmaf(pj, kv[u][i].y, acc[h][i].y);
+            acc[h][i].z = fmaf(pj, kv[u][i].z, acc[h][i].z);
+            acc[h][i].w = fmaf(pj, kv[u][i].w, acc[h][i].w);
+          }
+        }
+    }
+  }
+  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+    const uint64_t r = ((uint64_t)t * kAttnSplits + split) * heads + h0 + h;
+    if (lane == 0) {
+      part_ml[2 * r] = m[h];
+      part_ml[2 * r + 1] = l[h];
+    }
+    for (uint32_t i = 0; i < 4; ++i)
+      *(float4*)(part_acc + r * kAttnDv + 128 * i + 4 * lane) = acc[h][i];
+  }
+}
 
+// One block per (head, token), a float4 of the output per thread.
+__global__ void __launch_bounds__(kAttnDv / 4)
+    MlaCombine(const float* part_ml, const float* part_acc, const int32_t* pos,
+               uint32_t window, const uint32_t* list_count, const float* sinks,
+               float* out, uint32_t heads) {
+  const uint32_t h = blockIdx.x, t = blockIdx.y;
+  int32_t first;
+  const uint32_t count = AttnKeys(pos, window, list_count, t, &first);
+  const uint32_t keys = AttnSplitKeys(count);
+  const uint32_t splits = keys ? (count + keys - 1) / keys : 0;
+  const uint64_t r0 = (uint64_t)t * kAttnSplits * heads + h;
   float mx = sinks ? sinks[h] : -INFINITY;
-  for (uint32_t j = threadIdx.x; j < n_keys; j += blockDim.x) mx = fmaxf(mx, sc[j]);
-  mx = BlockMax(mx, scratch);
-  float den = 0.0f;
-  for (uint32_t j = threadIdx.x; j < n_keys; j += blockDim.x) {
-    const float e = expf(sc[j] - mx);
-    sc[j] = e;
-    den += e;
+  for (uint32_t s = 0; s < splits; ++s)
+    mx = fmaxf(mx, part_ml[2 * (r0 + (uint64_t)s * heads)]);
+  float den = sinks ? expf(sinks[h] - mx) : 0.0f;
+  float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  for (uint32_t s = 0; s < splits; ++s) {
+    const uint64_t r = r0 + (uint64_t)s * heads;
+    const float w = expf(part_ml[2 * r] - mx);
+    den = fmaf(part_ml[2 * r + 1], w, den);
+    const float4 a = *(const float4*)(part_acc + r * kAttnDv + 4 * threadIdx.x);
+    o.x = fmaf(a.x, w, o.x);
+    o.y = fmaf(a.y, w, o.y);
+    o.z = fmaf(a.z, w, o.z);
+    o.w = fmaf(a.w, w, o.w);
   }
-  den = BlockSum(den, scratch);
-  if (sinks) den += expf(sinks[h] - mx);
-  __syncthreads();
-  const float inv = 1.0f / den;
-  float* orow = out + ((uint64_t)t * heads + h) * dv;
-  for (uint32_t c = threadIdx.x; c < dv; c += blockDim.x) {
-    float acc = 0.0f;
-    for (uint32_t j = 0; j < n_keys; ++j) acc += sc[j] * cache[(uint64_t)((uint32_t)kp[j] % ring) * dk + c];
-    orow[c] = acc * inv;
-  }
+  const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+  *(float4*)(out + ((uint64_t)t * heads + h) * kAttnDv + 4 * threadIdx.x) =
+      make_float4(o.x * inv, o.y * inv, o.z * inv, o.w * inv);
 }
 
 __global__ void StoreRows(const float* src, uint64_t src_stride, float* dst, uint32_t ring, const int32_t* pos,
@@ -942,20 +1118,6 @@ __global__ void AttnSoftmax(float* scores, uint32_t heads, uint32_t n_keys, int3
   if (sinks) den += expf(sinks[h] - mx);
   const float inv = den > 0.0f ? 1.0f / den : 0.0f;
   for (uint32_t j = threadIdx.x; j < n_keys; j += blockDim.x) row[j] *= inv;
-}
-
-__global__ void SelectionFill(float* mask, uint32_t n_keys) {
-  const uint32_t t = blockIdx.y;
-  float* row = mask + (uint64_t)t * n_keys;
-  for (uint32_t j = blockIdx.x * blockDim.x + threadIdx.x; j < n_keys; j += gridDim.x * blockDim.x) row[j] = -INFINITY;
-}
-
-__global__ void SelectionMaskSet(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t n_keys) {
-  const uint32_t t = blockIdx.y;
-  for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n_sel; i += gridDim.x * blockDim.x) {
-    const int32_t s = sel[(uint64_t)t * n_sel + i];
-    if (s >= 0 && (uint32_t)s < n_keys) mask[(uint64_t)t * n_keys + s] = 0.0f;
-  }
 }
 
 __global__ void GatherRows(const float* src, uint32_t ring, int32_t first, uint32_t dim, float* dst) {
@@ -1679,13 +1841,39 @@ int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
   return Status();
 }
 
-int hy4_mla_attention(const float* q, const float* cache, uint32_t ring, const int32_t* pos, uint32_t window,
-                      const int32_t* sel, uint32_t n_sel, const float* sinks, float scale, float* out, uint32_t n,
-                      uint32_t heads, uint32_t dk, uint32_t dv, hipStream_t stream) {
+uint64_t hy4_mla_attention_work(uint32_t n, uint32_t heads, uint32_t n_sel) {
+  const uint64_t lists = ((uint64_t)n * n_sel + n + 63) / 64 * 64;
+  return lists + (uint64_t)n * kAttnSplits * heads * (2 + kAttnDv);
+}
+
+int hy4_mla_attention(const float* q, const float* cache, uint32_t ring,
+                      const int32_t* pos, uint32_t window, const int32_t* sel,
+                      uint32_t n_sel, const float* sinks, float scale,
+                      float* out, uint32_t n, uint32_t heads, uint32_t dk,
+                      uint32_t dv, float* work, uint64_t work_floats,
+                      hipStream_t stream) {
   if (n == 0) return 0;
-  const size_t shared = (dk + kMaxKeys) * sizeof(float) + kMaxKeys * sizeof(int32_t);
-  MlaAttention<<<dim3(n, heads), kBlock, shared, stream>>>(q, cache, ring, pos, window, sel, n_sel, sinks, scale,
-                                                           out, heads, dk, dv);
+  if (dk != kAttnDk || dv != kAttnDv || heads % kAttnHpw != 0 ||
+      work_floats < hy4_mla_attention_work(n, heads, sel ? n_sel : 0))
+    return 1;
+  int32_t* list = nullptr;
+  uint32_t* count = nullptr;
+  float* part = work;
+  if (sel) {
+    list = reinterpret_cast<int32_t*>(work);
+    count = reinterpret_cast<uint32_t*>(work + (uint64_t)n * n_sel);
+    part = work + ((uint64_t)n * n_sel + n + 63) / 64 * 64;
+    AttnKeyList<<<n, kKeyListThreads, 0, stream>>>(sel, n_sel, pos, list,
+                                                   count);
+  }
+  float* part_ml = part;
+  float* part_acc = part + (uint64_t)n * kAttnSplits * heads * 2;
+  const uint32_t groups = (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock;
+  MlaDecode<<<dim3(kAttnSplits, groups, n), kAttnWarps * 32, 0, stream>>>(
+      q, cache, ring, pos, window, list, count, n_sel, scale, part_ml, part_acc,
+      heads);
+  MlaCombine<<<dim3(heads, n), kAttnDv / 4, 0, stream>>>(
+      part_ml, part_acc, pos, window, count, sinks, out, heads);
   return Status();
 }
 
@@ -1804,14 +1992,6 @@ int hy4_attn_softmax(float* scores, uint32_t n, uint32_t heads, uint32_t n_keys,
                      hipStream_t stream) {
   if (n == 0 || n_keys == 0) return 0;
   AttnSoftmax<<<n * heads, kBlock, 0, stream>>>(scores, heads, n_keys, key_pos0, pos, window, mask, sinks);
-  return Status();
-}
-
-int hy4_selection_mask(const int32_t* sel, uint32_t n_sel, float* mask, uint32_t n, uint32_t n_keys,
-                       hipStream_t stream) {
-  if (n == 0) return 0;
-  SelectionFill<<<dim3(Blocks(n_keys, 64), n), kBlock, 0, stream>>>(mask, n_keys);
-  SelectionMaskSet<<<dim3(Blocks(n_sel, 16), n), kBlock, 0, stream>>>(sel, n_sel, mask, n_keys);
   return Status();
 }
 

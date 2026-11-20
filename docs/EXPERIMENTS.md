@@ -34,6 +34,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E26 | Kpool selection by radix select and sort | retained |
 | E27 | Verify passes: routed experts in one launch, slots ordered by expert | retained |
 | E28 | Verify passes: four rows per warp in the float and grouped GEMVs | retained |
+| E29 | Fused decode attention over each token's own keys | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -565,5 +566,66 @@ Server, DFly2 in every arm, fresh server each, ABBA, base `0f5b506`
 | prose | 18.4 | 18.9 | +3.1% |
 | list | 22.5 | 23.5 | +4.3% |
 | long context (4,192-token prompt) | 20.7 | 21.5 | +3.9% |
+
+Retained.
+
+## E29: Fused decode attention over each token's own keys (2026-11-20)
+
+Decoding and verify passes ran attention as two hipBLAS SGEMMs per token
+and layer (scores over every visible key, then values) with a softmax
+between them. The sparse layers scored every cached key and masked all but
+the 2,048 selected ones afterwards, so their cost grew with the context:
+4.2 ms of GEMMs per token after a 3,712-token prompt, plus 0.5 ms of
+softmax, mask and window gathers. A 4-token verify pass ran its tokens'
+GEMMs one after another.
+
+`hy4_mla_attention` now does it in three launches per layer for all the
+pass's tokens. A sparse layer first turns each token's selection into its
+positions, ascending and without repeats, through an LDS bitmap. `MlaDecode`
+then splits each token's keys into runs of 32-key chunks (at most 32 runs).
+Each warp holds four heads' queries in registers and keeps a running max,
+denominator and value sum for them, reading the cached FP32 key rows
+directly from the ring. `MlaCombine` merges the runs with the sink. A
+token's run size depends only on its own key count, so a verify pass
+computes what one-token passes would (unit test: alone against in a pass,
+and selecting every key against no selection; `--passcheck` 4 and 8
+exact). The results match a double-precision reference within 1e-5.
+Decoding against prefill (`--passcheck 16`, 128 tokens) gives mean KL
+0.00097 with 124/128 same top, against 0.0016 and 126/128 before: within
+the run-to-run spread of greedy trajectories. The prefill KL is unchanged
+(0.08424).
+
+Attention kernels per token, 3,712-token prompt: 4.7 → 1.45 ms (`MlaDecode`
+1.15, `MlaCombine` 0.26, key lists 0.04). The kernels are bound by FP32
+arithmetic (about 2 TFMA/s): every head reads every key it scores.
+Decode, `hy4_eval_probe`, ABBA:
+
+| prompt | before | E29 | change |
+| --- | --- | --- | --- |
+| 3,712 tokens | 15.31 | 16.19 | +5.7% |
+| 14,849 tokens | 13.20 | 16.12 | +22.1% |
+
+4-token verify pass (400-token prompt): 94.0 → 89.7 ms of kernels, 2,916 →
+2,466 launches.
+
+Not retained, from a micro-benchmark of the three kernels at the decode
+shapes: one block over all heads staging each 16-key chunk in LDS (slower
+at every heads-per-warp and heads-per-block setting: 25-60% more time);
+eight keys per unrolled step (up to twice as slow); 64 or 16 runs per token
+instead of 32 (the partial sums' traffic, or too few blocks); unrolled
+loads in `MlaCombine` (no change: its reads are bandwidth-bound); a bitonic
+sort for the key lists (17 µs a layer against 4 µs).
+
+Server, DFly2 in every arm, fresh server each, ABBA, base `3d115f1`
+(tok/s, mean of two arms). Decode's numerics changed, so replies differ from
+the base where a near tie flipped (prose, list and long context; identical
+within each build), which also moves the draft acceptance:
+
+| prompt | base | E29 | change | accepted drafts, base → E29 |
+| --- | --- | --- | --- | --- |
+| code | 31.5 | 32.0 | +1.6% | 181/249 → 180/258 |
+| prose | 18.9 | 18.6 | -2.0% | 86/167 → 81/182 |
+| list | 23.5 | 24.7 | +5.3% | 110/168 → 98/147 |
+| long context (4,192-token prompt) | 21.5 | 24.7 | +14.7% | 179/258 → 188/275 |
 
 Retained.

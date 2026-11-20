@@ -357,8 +357,6 @@ private:
   // The last Verify: its first position and logits [n][n_vocab].
   std::uint32_t pass_pos0_ = 0;
   std::vector<float> pass_logits_;
-  // Attention selection mask of the verify-pass path [kVecMax][max_context].
-  float* mask_ = nullptr;
   // A prefill pass's visible key rows as binary16, for hy4_mla_prefill.
   std::uint16_t* keys_half_ = nullptr;
   std::vector<void*> allocations_;
