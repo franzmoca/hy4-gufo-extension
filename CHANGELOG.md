@@ -89,6 +89,15 @@
   ([E33](docs/EXPERIMENTS.md#e33-prompt-lookup-2026-11-20)); greedy requests
   verify up to 15 copied tokens per pass
   ([E34](docs/EXPERIMENTS.md#e34-16-token-verify-passes-for-copies-2026-11-20)).
+- Prompt-cache checkpoints are captured inside a prefill pass instead of
+  ending it, and Engram rows are read directly from the drive while the
+  layers run: served prefill of new prompts 32-37% faster (653-694 → 890-910
+  tok/s)
+  ([E45](docs/EXPERIMENTS.md#e45-cache-checkpoints-inside-a-prefill-pass-2026-11-20),
+  [E46](docs/EXPERIMENTS.md#e46-engram-rows-read-directly-beside-the-layers-2026-11-20)).
+- Other sessions keep decoding while a prompt prefills, between its layer
+  groups
+  ([E47](docs/EXPERIMENTS.md#e47-decode-rounds-between-a-prompt-passs-layer-groups-2026-11-20)).
 - Prefill evaluates 8,192 tokens per pass when the context is at most 256K
   tokens: 3% faster on prompts over 4,096 tokens
   ([E43](docs/EXPERIMENTS.md#e43-8192-token-prefill-passes-for-contexts-up-to-256k-2026-11-20)).

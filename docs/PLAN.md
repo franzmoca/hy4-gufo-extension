@@ -608,6 +608,14 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   4.8 s encode at 2048². A WMMA GEMM could halve the encode; the text prefill
   of the same image (about 20 s for 4,193 tokens) is the larger cost.
 
+- **Served prefill** (E45-E47). Measure prefill through `gufo serve` with
+  new prompts and the page cache dropped: the probe repeats prompts, so its
+  Engram rows are cached. The Engram table bounds cold prompts by the
+  drive's random reads (0.15 s per pass on the KIOXIA, 0.045 s on the 990
+  PRO). Open: start a short arrival's prefill inside a long prompt's layer
+  yields (the host yields only decode rounds today), and batched decoding
+  across sessions.
+
 ## Open questions
 
 - What does `reasoning_effort` `max` render? It is in the Xylolabs template only.

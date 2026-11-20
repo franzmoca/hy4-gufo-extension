@@ -1,0 +1,245 @@
+{
+ "setup": "gufo serve, -c 40960, DFly2, prompt cache on, one fresh server per arm, page cache dropped before each; three cache-miss chat prompts; order ABBA",
+ "arms": [
+  {
+   "arm": "final",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 7260.094392,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 4,
+     "tps": 653.0
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 14299.573886,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 6,
+     "tps": 704.9
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 26758.553180000003,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 6144,
+     "captures": 6,
+     "tps": 694.5
+    }
+   ],
+   "build": "before E36 (2,048-token passes)"
+  },
+  {
+   "arm": "wide",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 7120.569359,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 4,
+     "tps": 665.8
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 13817.924351000001,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 6,
+     "tps": 729.5
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 24442.527469,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 6144,
+     "captures": 6,
+     "tps": 760.3
+    }
+   ],
+   "build": "E43"
+  },
+  {
+   "arm": "engK",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 5207.120986,
+     "prefill_chunks": 1,
+     "max_prefill_chunk_tokens": 4741,
+     "captures": 4,
+     "tps": 910.5
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 11149.197232,
+     "prefill_chunks": 2,
+     "max_prefill_chunk_tokens": 8032,
+     "captures": 6,
+     "tps": 904.1
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 20866.157025,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 6295,
+     "captures": 6,
+     "tps": 890.6
+    }
+   ],
+   "build": "E45-E46, Engram table on the KIOXIA drive"
+  },
+  {
+   "arm": "eng990",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 5123.797517,
+     "prefill_chunks": 1,
+     "max_prefill_chunk_tokens": 4741,
+     "captures": 4,
+     "tps": 925.3
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 10969.514108000001,
+     "prefill_chunks": 2,
+     "max_prefill_chunk_tokens": 8032,
+     "captures": 6,
+     "tps": 918.9
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 20745.630871,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 6295,
+     "captures": 6,
+     "tps": 895.8
+    }
+   ],
+   "build": "E45-E46, Engram table on the Samsung 990 PRO"
+  },
+  {
+   "arm": "eng990",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 5115.005455,
+     "prefill_chunks": 1,
+     "max_prefill_chunk_tokens": 4741,
+     "captures": 4,
+     "tps": 926.9
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 10981.370740999999,
+     "prefill_chunks": 2,
+     "max_prefill_chunk_tokens": 8032,
+     "captures": 6,
+     "tps": 917.9
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 20738.921658,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 6295,
+     "captures": 6,
+     "tps": 896.0
+    }
+   ],
+   "build": "E45-E46, Engram table on the Samsung 990 PRO"
+  },
+  {
+   "arm": "engK",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 5209.953845,
+     "prefill_chunks": 1,
+     "max_prefill_chunk_tokens": 4741,
+     "captures": 4,
+     "tps": 910.0
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 11095.31884,
+     "prefill_chunks": 2,
+     "max_prefill_chunk_tokens": 8032,
+     "captures": 6,
+     "tps": 908.5
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 20875.648933999997,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 6295,
+     "captures": 6,
+     "tps": 890.2
+    }
+   ],
+   "build": "E45-E46, Engram table on the KIOXIA drive"
+  },
+  {
+   "arm": "wide",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 7114.344471,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 4,
+     "tps": 666.4
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 13824.710057,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 6,
+     "tps": 729.1
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 24399.35884,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 6144,
+     "captures": 6,
+     "tps": 761.6
+    }
+   ],
+   "build": "E43"
+  },
+  {
+   "arm": "final",
+   "requests": [
+    {
+     "prefill_tokens": 4741,
+     "prefill_ms": 7264.393126,
+     "prefill_chunks": 4,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 4,
+     "tps": 652.6
+    },
+    {
+     "prefill_tokens": 10080,
+     "prefill_ms": 14332.77454,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 2048,
+     "captures": 6,
+     "tps": 703.3
+    },
+    {
+     "prefill_tokens": 18583,
+     "prefill_ms": 26779.759683,
+     "prefill_chunks": 6,
+     "max_prefill_chunk_tokens": 6144,
+     "captures": 6,
+     "tps": 693.9
+    }
+   ],
+   "build": "before E36 (2,048-token passes)"
+  }
+ ]
+}

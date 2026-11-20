@@ -68,6 +68,7 @@ endif()
 gufo_extension_target(
   NAME gufo_hy4flash_hip
   SOURCES
+    runtime/hy4_engram.cpp
     runtime/hy4_model.cpp
     runtime/hy4_dfly.cpp
     runtime/hy4_forward.cpp

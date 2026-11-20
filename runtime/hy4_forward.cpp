@@ -1,9 +1,8 @@
 // Hy4 Flash evaluation: one chunk of up to Model::MaxChunk() tokens through
 // the 42-layer iHC stack, following llama.cpp's hy_v4_flash graph.
 
-#include <gufo/ext/experimental/managed_alloc.hpp>
-
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 
 #include <algorithm>
 #include <chrono>
@@ -11,13 +10,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <gufo/ext/experimental/managed_alloc.hpp>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <hipblas/hipblas.h>
-
 #include "kernels/rocm/hy4_kernels.h"
 #include "kernels/rocm/mmq/hy4_mmq.h"
+#include "runtime/hy4_engram.hpp"
 #include "runtime/hy4_internal.hpp"
 #include "runtime/hy4_runtime.hpp"
 
@@ -167,10 +167,8 @@ bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
          MatVec(w2, x, y2, m2, k, n, ex, error, xh);
 }
 
-bool Model::AllocScratch(std::string* error) {
-  if (hy4_mmq_init(0) != 0) return Fail(error, "hy4: mmq init failed");
+bool Model::AllocScratchRows(Scratch& s, std::uint32_t n) {
   const Config& c = config_;
-  const std::uint32_t n = max_chunk_;
   const std::uint32_t hmax = *std::max_element(c.n_head.begin(), c.n_head.end());
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::uint32_t modules = static_cast<std::uint32_t>(c.engram_layers.size());
@@ -180,8 +178,6 @@ bool Model::AllocScratch(std::string* error) {
                                                     std::max(c.n_ff_exp, c.n_latent));
   const std::size_t slots = std::size_t{c.n_expert_used} * n;
   const std::size_t plan = slots + c.n_expert + 1 + slots / 128 + c.n_expert;
-  scratch_ = std::make_unique<Scratch>();
-  Scratch& s = *scratch_;
   auto* owned = &allocations_;
   const bool ok =
       DeviceAlloc(&s.tokens, n, owned) && DeviceAlloc(&s.pos, n, owned) &&
@@ -233,8 +229,21 @@ bool Model::AllocScratch(std::string* error) {
       DeviceAlloc(&s.logits, std::size_t{n} * c.n_vocab, owned) &&
       HostAlloc(&s.host_h, std::size_t{n} * c.hc * c.n_embd, owned);
   s.attn_work_floats = hy4_mla_attention_work(kVecMax, hmax, c.idx_top_k);
-  const bool ok2 = ok && DeviceAlloc(&s.attn_work, s.attn_work_floats, owned);
-  if (!ok2) return Fail(error, "hy4: scratch allocation failed");
+  return ok && DeviceAlloc(&s.attn_work, s.attn_work_floats, owned);
+}
+
+bool Model::AllocScratch(std::string* error) {
+  if (hy4_mmq_init(0) != 0)
+    return Fail(error, "hy4: mmq init failed");
+  // Prompt passes take the wide scratch; decode passes (up to kVecMax rows)
+  // their own, so a decode round can run while a prompt pass is paused
+  // between layer groups (Session::SetPrefillYield).
+  scratch_ = std::make_unique<Scratch>();
+  decode_scratch_ = std::make_unique<Scratch>();
+  if (!AllocScratchRows(*scratch_, max_chunk_) ||
+      !AllocScratchRows(*decode_scratch_, kVecMax))
+    return Fail(error, "hy4: scratch allocation failed");
+  auto* owned = &allocations_;
   hipblasHandle_t blas = nullptr;
   if (hipblasCreate(&blas) != HIPBLAS_STATUS_SUCCESS || hipblasSetStream(blas, stream_) != HIPBLAS_STATUS_SUCCESS) {
     return Fail(error, "hy4: hipblas init failed");
@@ -329,6 +338,26 @@ bool Session::Evaluate(std::span<const std::int32_t> tokens,
   return true;
 }
 
+bool Session::PromptThrough(std::span<const std::int32_t> tokens,
+                            std::span<const std::uint32_t> rows,
+                            std::vector<std::vector<float>>* row_logits,
+                            std::string* error) {
+  if (tokens.size() > model_->MaxChunk() || !row_logits ||
+      (!rows.empty() && rows.back() + 1 >= tokens.size()))
+    return Fail(error, "hy4: invalid in-pass logits rows");
+  row_logits->assign(rows.size(), {});
+  through_rows_ = rows;
+  through_logits_ = row_logits;
+  struct Clear {
+    Session& s;
+    ~Clear() {
+      s.through_rows_ = {};
+      s.through_logits_ = nullptr;
+    }
+  } clear{*this};
+  return Prompt(tokens, error);
+}
+
 bool Session::Verify(std::span<const std::int32_t> tokens, std::string* error) {
   if (tokens.empty() || tokens.size() > kTapRows)
     return Fail(error, "hy4: verify takes 1 to 16 tokens");
@@ -409,12 +438,29 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   Model& m = *model_;
   const Config& c = m.config_;
   const Weights& w = m.weights_;
-  Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
   const Exec ex{st, m.blas_, prompt_pass_};
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t pos0 = Position();
   if (n == 0) return true;
+  // Decode passes take their own scratch; a prompt pass the wide one, which
+  // a paused prompt pass holds (only decode rounds run in its yields).
+  const bool wide = prompt_pass_ || n > Model::kVecMax;
+  if (wide && m.prompt_paused_)
+    return Fail(error, "hy4: a paused prompt pass holds the prefill scratch");
+  scratch_ = wide ? m.scratch_.get() : m.decode_scratch_.get();
+  Model::Scratch& s = *scratch_;
+  // Layers after which a prompt pass yields to the host's decode rounds.
+  std::vector<std::uint32_t> yield_after;
+  if (prompt_pass_ && yield_ && yield_groups_ > 1) {
+    for (std::size_t k = 1; k < yield_groups_; ++k) {
+      const auto layer =
+          static_cast<std::uint32_t>(k * c.n_layer / yield_groups_) - 1;
+      if (layer + 1 < c.n_layer &&
+          (yield_after.empty() || yield_after.back() != layer))
+        yield_after.push_back(layer);
+    }
+  }
   if (pos0 + n > max_context_) return Fail(error, "hy4: context full");
   for (const std::int32_t t : tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.n_vocab) return Fail(error, "hy4: token out of range");
@@ -491,24 +537,60 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   // Engram rows for every module, gathered on the host from the mapping.
   const std::uint32_t modules = static_cast<std::uint32_t>(c.engram_layers.size());
   const std::uint32_t cols = modules ? c.EngramCols() : 0;
-  if (modules) {
-    const auto g0 = std::chrono::steady_clock::now();
-    m.EngramGather(history_, tokens, pos0, s.engram_host, s.engram_valid_host);
-    engram_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - g0).count();
-    for (std::uint32_t e = 0; e < modules; ++e) {
-      for (std::uint32_t i = 0; i < n; ++i) {
-        float any = 0.0f;
-        for (std::uint32_t col = 0; col < cols; ++col) any += s.engram_valid_host[(e * n + i) * cols + col];
-        s.engram_any_host[e * n + i] = any > 0.0f ? 1.0f : 0.0f;
-      }
+  // Each module's rows are read from the table by the Engram readers while
+  // the layers before it run, and copied to the device just before its
+  // layer: a new prompt's rows are mostly read from the drive.
+  std::vector<std::uint64_t> engram_ids(std::size_t{modules} * n * cols);
+  std::vector<std::shared_ptr<EngramReader::Gather>> gathers;
+  struct WaitAll {
+    EngramReader* reader;
+    std::vector<std::shared_ptr<EngramReader::Gather>>& gathers;
+    ~WaitAll() {
+      for (auto& g : gathers)
+        if (g)
+          (void)reader->Wait(*g);
     }
-    HY4_CHECK(hipMemcpyAsync(s.engram_rows, s.engram_host, std::size_t{modules} * n * cols * c.engram_dim,
-                             hipMemcpyHostToDevice, st));
-    HY4_CHECK(hipMemcpyAsync(s.engram_valid, s.engram_valid_host, std::size_t{modules} * n * cols * sizeof(float),
-                             hipMemcpyHostToDevice, st));
-    HY4_CHECK(hipMemcpyAsync(s.engram_any, s.engram_any_host, std::size_t{modules} * n * sizeof(float),
-                             hipMemcpyHostToDevice, st));
+  } wait_all{modules ? &m.Engram() : nullptr, gathers};
+  for (std::uint32_t e = 0; e < modules; ++e) {
+    const std::size_t at = std::size_t{e} * n * cols;
+    m.EngramRows(history_, tokens, pos0, e, engram_ids.data() + at,
+                 s.engram_valid_host + at);
+    for (std::uint32_t i = 0; i < n; ++i) {
+      float any = 0.0f;
+      for (std::uint32_t col = 0; col < cols; ++col)
+        any += s.engram_valid_host[at + std::size_t{i} * cols + col];
+      s.engram_any_host[e * n + i] = any > 0.0f ? 1.0f : 0.0f;
+    }
+    // A decode pass's rows go before a paused prompt pass's queued reads.
+    gathers.push_back(m.Engram().Start(
+        std::span(engram_ids).subspan(at, std::size_t{n} * cols),
+        s.engram_host + at * c.engram_dim, !prompt_pass_));
   }
+  const auto engram_ready = [&](std::uint32_t e) -> hipError_t {
+    const auto g0 = std::chrono::steady_clock::now();
+    const bool read = m.Engram().Wait(*gathers[e]);
+    gathers[e].reset();
+    engram_seconds_ +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
+            .count();
+    if (!read)
+      return hipErrorFileNotFound;
+    const std::size_t rows = std::size_t{e} * n * cols;
+    hipError_t rc = hipMemcpyAsync(s.engram_rows + rows * c.engram_dim,
+                                   s.engram_host + rows * c.engram_dim,
+                                   std::size_t{n} * cols * c.engram_dim,
+                                   hipMemcpyHostToDevice, st);
+    if (rc == hipSuccess)
+      rc = hipMemcpyAsync(s.engram_valid + rows, s.engram_valid_host + rows,
+                          std::size_t{n} * cols * sizeof(float),
+                          hipMemcpyHostToDevice, st);
+    if (rc == hipSuccess)
+      rc = hipMemcpyAsync(s.engram_any + std::size_t{e} * n,
+                          s.engram_any_host + std::size_t{e} * n,
+                          std::size_t{n} * sizeof(float), hipMemcpyHostToDevice,
+                          st);
+    return rc;
+  };
 
   HY4_CHECK(hy4_embed_q8_0(w.tok_embd.data, s.tokens, n, c.n_embd, s.x, st));
   for (std::size_t k = 0; k < copies.size(); ++k) {
@@ -552,6 +634,7 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
       post_pending = false;
     }
     if (e >= 0) {
+      HY4_CHECK(engram_ready(static_cast<std::uint32_t>(e)));
       const std::uint32_t width = cols * c.engram_dim;
       HY4_CHECK(hy4_engram_rows(s.engram_rows + std::size_t(e) * n * width, s.engram_valid + std::size_t(e) * n * cols,
                                 l.engram_lookup_norm.f32(), s.engram_normed, n, cols, c.engram_dim, kEngramEps, st));
@@ -585,6 +668,17 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
       HY4_CHECK(hipStreamSynchronize(st));
       probe_(probe_user_, static_cast<int>(il), s.host_h, n);
     }
+    if (std::ranges::binary_search(yield_after, il)) {
+      // The queued layers finish first: the host's decode round syncs the
+      // stream and must not wait behind them mid-round.
+      HY4_CHECK(hipStreamSynchronize(st));
+      m.prompt_paused_ = true;
+      struct Resume {
+        Model& m;
+        ~Resume() { m.prompt_paused_ = false; }
+      } resume{m};
+      yield_();
+    }
   }
 
   // Head: reduce the streams, norm, project.
@@ -598,6 +692,19 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
     tap_rows_ = r;
     tap_row_ = r - 1;
     tap_ready_ = true;
+  }
+  // In-pass checkpoints' logits: each row through the head as a pass's last
+  // row is (one row per product).
+  for (std::size_t i = 0; through_logits_ && i < through_rows_.size(); ++i) {
+    const std::uint32_t r = through_rows_[i];
+    if (!MatVec(w.output, s.cur + std::size_t{r} * c.n_embd, s.logits,
+                c.n_vocab, c.n_embd, 1, ex, error)) {
+      return false;
+    }
+    auto& out = (*through_logits_)[i];
+    out.resize(c.n_vocab);
+    HY4_CHECK(hipMemcpyAsync(out.data(), s.logits, out.size() * sizeof(float),
+                             hipMemcpyDeviceToHost, st));
   }
   if (logits) {
     const std::uint32_t first = all_logits ? 0 : n - 1;
@@ -619,7 +726,7 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   Model& m = *model_;
   const Config& c = m.config_;
   const Layer& l = m.weights_.layers[il];
-  Model::Scratch& s = *m.scratch_;
+  Model::Scratch& s = *scratch_;
   hipStream_t st = m.stream_;
   const Exec ex{st, m.blas_, prompt_pass_};
   const bool batched = n > Model::kVecMax || prompt_pass_;
@@ -742,7 +849,7 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   Model& m = *model_;
   const Config& c = m.config_;
   const Layer& l = m.weights_.layers[il];
-  Model::Scratch& s = *m.scratch_;
+  Model::Scratch& s = *scratch_;
   hipStream_t st = m.stream_;
   const Exec ex{st, m.blas_, prompt_pass_};
   const std::uint32_t d = c.idx_dim;
@@ -836,7 +943,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   Model& m = *model_;
   const Config& c = m.config_;
   const Layer& l = m.weights_.layers[il];
-  Model::Scratch& s = *m.scratch_;
+  Model::Scratch& s = *scratch_;
   hipStream_t st = m.stream_;
   const Exec ex{st, m.blas_, prompt_pass_};
   const std::uint16_t* cur_half =

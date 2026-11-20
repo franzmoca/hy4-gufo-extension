@@ -42,12 +42,24 @@ public:
                       std::vector<std::uint32_t> tap_layers = {});
   ~ContinuationAdapter() override;
   [[nodiscard]] Session& GetSession(cache::Slot&);
+  /// An in-pass checkpoint: until EndView the slot reads as the state after
+  /// its first `tokens` tokens, with `logits` after the last of them. A pass
+  /// ending later has written their rows, and keeps the rings' rows before
+  /// `tokens` (a ring holds a window and a pass); the pass held no image, so
+  /// the rope offset is the same.
+  void ViewAt(cache::Slot&, cache::Rows tokens, std::vector<float>* logits);
+  void EndView(cache::Slot&);
   [[nodiscard]] std::vector<cache::BackingClass> BackingPlan(std::size_t ram_bytes) const override;
   [[nodiscard]] cache::Capabilities GetCapabilities() const override;
   [[nodiscard]] std::span<const cache::ComponentDescriptor> Components() const override;
   [[nodiscard]] cache::Identity CompatibilityIdentity() const override;
   [[nodiscard]] std::unique_ptr<cache::Slot> CreateSlot(cache::MutationGuard&) override;
   [[nodiscard]] std::vector<cache::ComponentPosition> Positions(const cache::Slot&) const override;
+  // An in-pass checkpoint at `boundary` holds the frontier positions of a
+  // state after `boundary` tokens (ViewAt).
+  [[nodiscard]] std::vector<cache::ComponentPosition>
+  PrefillCheckpointPositions(const cache::Slot&,
+                             cache::Rows boundary) const override;
   [[nodiscard]] std::vector<cache::Rows> PlanPrefill(const cache::Slot&, cache::Rows first,
                                                      cache::Rows end) const override;
   void BeginRestore(cache::Slot&, std::span<const cache::ComponentPosition>) override;

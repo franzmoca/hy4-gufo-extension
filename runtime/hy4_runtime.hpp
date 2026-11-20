@@ -10,12 +10,15 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
 #include <vector>
 
 namespace gufo::models::hy4_flash {
+
+class EngramReader;
 
 struct Config {
   std::uint32_t n_layer = 0;
@@ -171,10 +174,14 @@ public:
   [[nodiscard]] std::uint32_t KvRing(std::uint32_t layer, std::uint32_t max_context) const;
 
   /// Hashes `tokens` (positions pos0..) against `history` (the tokens before
-  /// them) and copies their FP8 Engram rows into `rows` [module][token][col][d];
-  /// `valid` [module][token][col].
-  void EngramGather(std::span<const std::int32_t> history, std::span<const std::int32_t> tokens,
-                    std::uint32_t pos0, std::uint8_t* rows, float* valid) const;
+  /// them) for Engram module `module`: its table rows `rows` [token][col] and
+  /// `valid` [token][col].
+  void EngramRows(std::span<const std::int32_t> history,
+                  std::span<const std::int32_t> tokens, std::uint32_t pos0,
+                  std::uint32_t module, std::uint64_t* rows,
+                  float* valid) const;
+  /// Reads the FP8 Engram table's rows (EngramRows).
+  [[nodiscard]] EngramReader& Engram() const { return *engram_reader_; }
   /// The image row token: Engram treats it as padding, and a session takes
   /// its rows' embeddings from ImageInputs.
   void SetImageToken(std::int32_t token) { image_token_ = token; }
@@ -195,14 +202,17 @@ private:
   std::uint32_t max_chunk_ = 4096;
   hipStream_t stream_ = nullptr;
   void* blas_ = nullptr;  // hipblasHandle_t
-  const std::uint8_t* engram_table_ = nullptr;  // host mapping, FP8 rows
-  std::uint64_t engram_bytes_ = 0;
+  std::unique_ptr<EngramReader> engram_reader_;  // FP8 rows, direct reads
   std::int32_t image_token_ = -1;
 
   // Scratch for one evaluation of up to MaxChunk() tokens (device unless
   // noted).
   struct Scratch;
-  std::unique_ptr<Scratch> scratch_;
+  bool AllocScratchRows(Scratch& s, std::uint32_t rows);
+  std::unique_ptr<Scratch> scratch_;         // prompt passes, MaxChunk() rows
+  std::unique_ptr<Scratch> decode_scratch_;  // other passes, kVecMax rows
+  // A prompt pass is paused between layer groups and holds scratch_.
+  bool prompt_paused_ = false;
 };
 
 /// One sequence's state: KV rows, indexer pools and token history.
@@ -233,6 +243,14 @@ public:
                             std::string* error) {
     return Evaluate(tokens, &last_logits_, false, error, true);
   }
+  /// Prompt for one pass (at most Model::MaxChunk() tokens) that also keeps,
+  /// in row_logits[i], the logits after token rows[i] (ascending, before the
+  /// last): those a pass ending after that token keeps, bit for bit, since a
+  /// pass's rows do not depend on where it ends.
+  [[nodiscard]] bool PromptThrough(std::span<const std::int32_t> tokens,
+                                   std::span<const std::uint32_t> rows,
+                                   std::vector<std::vector<float>>* row_logits,
+                                   std::string* error);
 
   /// Evaluates `tokens` (at most kTapRows) and keeps every one's logits
   /// (PassLogits) until Keep.
@@ -242,6 +260,14 @@ public:
   /// Keeps the first `tokens` (>= 1) tokens of the last Verify and forgets
   /// the rest; LastLogits and the taps then follow the last kept token.
   void Keep(std::uint32_t tokens);
+
+  /// Prompt passes from now on pause after about every n_layer / `groups`
+  /// layers and call `yield` (no pause with groups < 2 or no yield). The
+  /// yield may run other sessions' decode passes, never a prompt pass.
+  void SetPrefillYield(std::size_t groups, std::function<void()> yield) {
+    yield_groups_ = yield ? groups : 1;
+    yield_ = std::move(yield);
+  }
 
   /// Draft taps: each evaluation leaves its last kTapRows tokens' final
   /// hidden (after the output norm) and the indexer selections of the tapped
@@ -315,6 +341,7 @@ public:
   }
   [[nodiscard]] std::uint32_t MaxContext() const { return max_context_; }
   /// Host seconds spent gathering Engram rows since creation.
+  /// Time evaluations waited for Engram rows (gathered beside the layers).
   [[nodiscard]] double EngramSeconds() const { return engram_seconds_; }
   [[nodiscard]] const std::vector<std::int32_t>& History() const { return history_; }
 
@@ -360,6 +387,14 @@ private:
   std::int32_t* sel_ = nullptr;
   // Draft taps (EnableTaps): rows [kTapRows][n_embd] and, per tapped layer,
   // selections [kTapRows][tap_sel_count_]; tap_row_ is the frontier's row.
+  // The scratch of the pass being evaluated (Model::scratch_ or
+  // decode_scratch_), and SetPrefillYield's groups and yield.
+  Model::Scratch* scratch_ = nullptr;
+  std::size_t yield_groups_ = 1;
+  std::function<void()> yield_;
+  // PromptThrough's rows and their logits for the pass being evaluated.
+  std::span<const std::uint32_t> through_rows_;
+  std::vector<std::vector<float>>* through_logits_ = nullptr;
   std::vector<std::uint32_t> tap_layers_;
   std::vector<int> tap_index_;  // per layer: its tap, or -1
   float* tap_hidden_ = nullptr;

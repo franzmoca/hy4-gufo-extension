@@ -143,6 +143,34 @@ public:
   }
 };
 
+// Boundaries one prefill step captures in place (the cache plans at most
+// four grid checkpoints and the prompt targets).
+constexpr std::size_t kMaxInPassCheckpoints = 4;
+// A lone prompt's pass while another session could still be admitted: an
+// arrival waits for one such pass (~2.3 s). With no session free, a prompt
+// takes Model::MaxChunk()-token passes.
+constexpr std::size_t kSharedPassTokens = 2048;
+// Layer groups a prompt pass may yield between, for other sessions' decode
+// rounds (about five layers each).
+constexpr std::size_t kMaxPrefillLayerGroups = 8;
+
+// Arms the session's yields from the host's for one prefill step.
+class PrefillYieldScope {
+public:
+  PrefillYieldScope(Session& session, const TextRunnerState& state)
+      : session_(session) {
+    if (state.prefill_yield_groups() > 1)
+      session_.SetPrefillYield(state.prefill_yield_groups(),
+                               [&state] { state.YieldPrefill(); });
+  }
+  ~PrefillYieldScope() { session_.SetPrefillYield(1, {}); }
+  PrefillYieldScope(const PrefillYieldScope&) = delete;
+  PrefillYieldScope& operator=(const PrefillYieldScope&) = delete;
+
+private:
+  Session& session_;
+};
+
 class Hy4TextRunnerState final : public TextRunnerState {
 public:
   Hy4TextRunnerState(Session& session, cache::Adapter& adapter, cache::Slot& slot)
@@ -155,6 +183,8 @@ public:
   }
 
   [[nodiscard]] Session& session() const { return *session_; }
+  [[nodiscard]] cache::Adapter& adapter() const { return *adapter_; }
+  [[nodiscard]] cache::Slot& slot() const { return *slot_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
   [[nodiscard]] const std::shared_ptr<ImageSource>& images() const {
@@ -272,10 +302,13 @@ public:
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0u,
                 .prefix_reuse = true,
+                .in_pass_checkpoint = true,
+                .max_in_pass_checkpoints = kMaxInPassCheckpoints,
             },
         .sampling_defaults = SamplingDefaults(),
-        .scheduling = {.pass_tokens = model_->MaxChunk(),
-                       .max_layer_groups = 1u,
+        .scheduling = {.pass_tokens = std::min<std::size_t>(model_->MaxChunk(),
+                                                            kSharedPassTokens),
+                       .max_layer_groups = kMaxPrefillLayerGroups,
                        .max_yield_decode_width = 1u},
     };
   }
@@ -421,17 +454,14 @@ public:
     RequireState(state).lookup().BeginRequest();
   }
 
-  [[nodiscard]] TextPrefillStep Prefill(TextRunnerState& state, std::span<const TextRunnerToken> prompt,
-                                        std::size_t offset, std::size_t max_input_tokens) const override {
-    auto& hy4 = RequireState(state);
-    if (offset != hy4.position() || offset != hy4.session().Position()) {
-      throw std::logic_error("Hy4 prefill offset does not match retained state");
-    }
-    if (offset >= prompt.size()) throw std::logic_error("Hy4 prefill has no remaining input");
+  // The tokens a step from `offset` takes: at most max_input_tokens, never
+  // ending inside an image (it stops before the image, or takes the whole
+  // image when it starts there).
+  [[nodiscard]] static std::size_t StepTokens(
+      const Hy4TextRunnerState& hy4, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) {
     std::size_t consumed =
         std::min<std::size_t>(max_input_tokens, prompt.size() - offset);
-    // A step never ends inside an image: it stops before the image, or takes
-    // the whole image when it starts there.
     if (const auto& images = hy4.images()) {
       for (const auto& span : images->Spans()) {
         const std::size_t end = offset + consumed;
@@ -439,13 +469,109 @@ public:
           consumed = (span.first > offset ? span.first : span.End()) - offset;
       }
     }
+    return consumed;
+  }
+
+  // The end of a step that can expose in-pass checkpoints: one pass with no
+  // image in it (an image moves the rope offset within the pass).
+  [[nodiscard]] std::optional<std::size_t> InPassEnd(
+      const Hy4TextRunnerState& hy4, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget) const {
+    if (offset >= prompt.size() || offset != hy4.position())
+      return std::nullopt;
+    const std::size_t end = offset + StepTokens(hy4, prompt, offset, budget);
+    if (end - offset > model_->MaxChunk())
+      return std::nullopt;
+    if (const auto& images = hy4.images()) {
+      for (const auto& span : images->Spans())
+        if (span.first < end && span.End() > offset)
+          return std::nullopt;
+    }
+    return end;
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& hy4 = RequireState(state);
+    if (offset != hy4.position() || offset != hy4.session().Position()) {
+      throw std::logic_error(
+          "Hy4 prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size())
+      throw std::logic_error("Hy4 prefill has no remaining input");
+    const std::size_t consumed =
+        StepTokens(hy4, prompt, offset, max_input_tokens);
     const auto tokens = EngineTokens(prompt.subspan(offset, consumed));
     hy4.lookup().BeginRequest();
     std::string error;
+    const PrefillYieldScope yields(hy4.session(), state);
     if (!hy4.session().Prompt(tokens, &error))
       throw std::runtime_error("Hy4 prefill failed: " + error);
     hy4.set_position(offset + consumed);
     return {.consumed_tokens = consumed, .decode_ready = offset + consumed == prompt.size()};
+  }
+
+  // A boundary inside the step's pass is captured in place: the slot reads
+  // as the state there (ContinuationAdapter::ViewAt), so it needs no memory
+  // of its own.
+  [[nodiscard]] std::optional<std::size_t> PrefillCheckpointBytes(
+      const TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget,
+      std::size_t boundary) const override {
+    const auto end = InPassEnd(RequireState(state), prompt, offset, budget);
+    if (!end || boundary <= offset || boundary >= *end)
+      return std::nullopt;
+    return 0;
+  }
+
+  // One pass to the step's end, which also keeps the logits at each
+  // boundary; the cache then reads each boundary's state in turn. Every
+  // capture equals what a pass ending at its boundary leaves (E45).
+  [[nodiscard]] TextPrefillStep PrefillThrough(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t budget,
+      std::span<const std::size_t> boundaries,
+      const InPassConsumer& consume) const override {
+    auto& hy4 = RequireState(state);
+    if (offset != hy4.session().Position())
+      throw std::logic_error(
+          "Hy4 prefill offset does not match retained state");
+    const auto end = InPassEnd(hy4, prompt, offset, budget);
+    if (!consume || !end || boundaries.empty() ||
+        boundaries.size() > kMaxInPassCheckpoints ||
+        boundaries.front() <= offset || boundaries.back() >= *end ||
+        std::ranges::adjacent_find(boundaries, std::ranges::greater_equal{}) !=
+            boundaries.end())
+      throw std::logic_error("invalid Hy4 in-pass checkpoint request");
+    std::vector<std::uint32_t> rows;
+    for (const auto b : boundaries)
+      rows.push_back(static_cast<std::uint32_t>(b - offset - 1));
+    std::vector<std::vector<float>> logits;
+    const auto tokens = EngineTokens(prompt.subspan(offset, *end - offset));
+    hy4.lookup().BeginRequest();
+    std::string error;
+    const PrefillYieldScope yields(hy4.session(), state);
+    if (!hy4.session().PromptThrough(tokens, rows, &logits, &error))
+      throw std::runtime_error("Hy4 prefill failed: " + error);
+    hy4.set_position(*end);
+    auto& adapter = dynamic_cast<ContinuationAdapter&>(hy4.adapter());
+    const auto started = std::chrono::steady_clock::now();
+    for (std::size_t i = 0; i < boundaries.size(); ++i) {
+      adapter.ViewAt(hy4.slot(), boundaries[i], &logits[i]);
+      struct End {
+        ContinuationAdapter& adapter;
+        cache::Slot& slot;
+        ~End() { adapter.EndView(slot); }
+      } end_view{adapter, hy4.slot()};
+      consume(i);
+    }
+    const double capture_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count();
+    return {.consumed_tokens = *end - offset,
+            .decode_ready = *end == prompt.size(),
+            .checkpoint_ms = capture_ms};
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(TextRunnerState& state,

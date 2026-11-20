@@ -1,23 +1,22 @@
 // Hy4 Flash GGUF loading: configuration, resident weights and the Engram
 // table mapping.
 
-#include <gufo/ext/experimental/managed_alloc.hpp>
-#include <gufo/ext/experimental/weight_upload.hpp>
-#include <gufo/ext/gguf_reader.hpp>
-
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <gufo/ext/experimental/managed_alloc.hpp>
+#include <gufo/ext/experimental/weight_upload.hpp>
+#include <gufo/ext/gguf_reader.hpp>
 #include <string>
 #include <variant>
 
-#include <sys/mman.h>
-#include <unistd.h>
-
+#include "runtime/hy4_engram.hpp"
 #include "runtime/hy4_internal.hpp"
 #include "runtime/hy4_runtime.hpp"
 
@@ -216,13 +215,26 @@ std::unique_ptr<Model> Model::Load(const std::string& trunk_path,
       *error = "Engram table is smaller than its hash ranges";
       return nullptr;
     }
-    m->engram_table_ = static_cast<const std::uint8_t*>(t->data);
-    m->engram_bytes_ = t->dimensions[1] * c.engram_dim;
-    // Rows are read at random: no readahead around each fault.
-    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
-    const auto begin = reinterpret_cast<std::uintptr_t>(m->engram_table_) & ~(page - 1);
-    const auto end = reinterpret_cast<std::uintptr_t>(m->engram_table_) + m->engram_bytes_;
-    (void)madvise(reinterpret_cast<void*>(begin), end - begin, MADV_RANDOM);
+    // The table's rows are read from its shard file, not through the mapping.
+    const auto* data = static_cast<const std::uint8_t*>(t->data);
+    const core::GgufMappedRegion* shard = nullptr;
+    for (const auto& region : r.GetMappedRegions()) {
+      const auto* first = static_cast<const std::uint8_t*>(region.data);
+      if (first && data >= first &&
+          data + t->dimensions[1] * c.engram_dim <= first + region.size)
+        shard = &region;
+    }
+    if (!shard || !platform::FileValid(shard->file_descriptor)) {
+      *error = "hy4: the Engram table's shard has no file to read";
+      return nullptr;
+    }
+    m->engram_reader_ = EngramReader::Open(
+        shard->file_descriptor,
+        static_cast<std::uint64_t>(
+            data - static_cast<const std::uint8_t*>(shard->data)),
+        t->dimensions[1], c.engram_dim, error);
+    if (!m->engram_reader_)
+      return nullptr;
   }
 
   if (hipStreamCreateWithFlags(&m->stream_, hipStreamNonBlocking) != hipSuccess) {
@@ -342,13 +354,14 @@ std::unique_ptr<Model> Model::Load(const std::string& trunk_path,
   return m;
 }
 
-void Model::EngramGather(std::span<const std::int32_t> history, std::span<const std::int32_t> tokens,
-                         std::uint32_t pos0, std::uint8_t* rows, float* valid) const {
+void Model::EngramRows(std::span<const std::int32_t> history,
+                       std::span<const std::int32_t> tokens, std::uint32_t pos0,
+                       std::uint32_t module, std::uint64_t* rows,
+                       float* valid) const {
   const Config& c = config_;
   const std::uint32_t n_gram = c.engram_ngram;
   const std::uint32_t n_head = c.engram_heads_per_ngram;
   const std::uint32_t cols = c.EngramCols();
-  const std::uint32_t d = c.engram_dim;
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   constexpr std::int64_t kDead = -1;
   auto cid = [&](std::int64_t t) -> std::int64_t {
@@ -361,46 +374,37 @@ void Model::EngramGather(std::span<const std::int32_t> history, std::span<const 
   const std::int64_t pad = c.engram_token_map[c.engram_pad];
   // The token at absolute position p, from the history or this chunk.
   auto token_at = [&](std::int64_t p) -> std::int64_t {
-    if (p < pos0) return history[static_cast<std::size_t>(p)];
+    if (p < pos0)
+      return history[static_cast<std::size_t>(p)];
     return tokens[static_cast<std::size_t>(p - pos0)];
   };
-  // Row offsets first, so every page read is issued before the first copy
-  // waits on one.
-  const std::size_t total = c.engram_layers.size() * n * cols;
-  std::vector<std::uint64_t> offsets(total);
   std::vector<std::uint64_t> toks(n_gram);
-  for (std::size_t e = 0; e < c.engram_layers.size(); ++e) {
-    const std::uint64_t* mult = c.engram_mult.data() + e * n_gram;
-    const std::uint32_t* primes = c.engram_primes.data() + e * cols;
-    const std::uint32_t* offs = c.engram_offsets.data() + e * cols;
-    for (std::uint32_t i = 0; i < n; ++i) {
-      const std::int64_t p = static_cast<std::int64_t>(pos0) + i;
-      std::int64_t id = cid(tokens[i]);
-      const bool dead = id == kDead;
-      toks[0] = static_cast<std::uint64_t>(dead ? pad : id);
-      for (std::uint32_t s = 1; s < n_gram; ++s) {
-        id = p - s < 0 ? kDead : cid(token_at(p - s));
-        toks[s] = static_cast<std::uint64_t>(id == kDead ? pad : id);
-      }
-      std::uint64_t rolling = toks[0] * mult[0];
-      for (std::uint32_t o = 1; o < n_gram; ++o) {
-        rolling ^= toks[o] * mult[o];
-        for (std::uint32_t h = 0; h < n_head; ++h) {
-          const std::uint32_t col = (o - 1) * n_head + h;
-          const std::size_t at = (e * n + i) * cols + col;
-          offsets[at] = (rolling % primes[col] + offs[col]) * d;
-          valid[at] = dead ? 0.0f : 1.0f;
-        }
+  const std::uint64_t* mult =
+      c.engram_mult.data() + std::size_t{module} * n_gram;
+  const std::uint32_t* primes =
+      c.engram_primes.data() + std::size_t{module} * cols;
+  const std::uint32_t* offs =
+      c.engram_offsets.data() + std::size_t{module} * cols;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    const std::int64_t p = static_cast<std::int64_t>(pos0) + i;
+    std::int64_t id = cid(tokens[i]);
+    const bool dead = id == kDead;
+    toks[0] = static_cast<std::uint64_t>(dead ? pad : id);
+    for (std::uint32_t s = 1; s < n_gram; ++s) {
+      id = p - s < 0 ? kDead : cid(token_at(p - s));
+      toks[s] = static_cast<std::uint64_t>(id == kDead ? pad : id);
+    }
+    std::uint64_t rolling = toks[0] * mult[0];
+    for (std::uint32_t o = 1; o < n_gram; ++o) {
+      rolling ^= toks[o] * mult[o];
+      for (std::uint32_t h = 0; h < n_head; ++h) {
+        const std::uint32_t col = (o - 1) * n_head + h;
+        const std::size_t at = std::size_t{i} * cols + col;
+        rows[at] = rolling % primes[col] + offs[col];
+        valid[at] = dead ? 0.0f : 1.0f;
       }
     }
   }
-  const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
-  for (const std::uint64_t off : offsets) {
-    const auto first = reinterpret_cast<std::uintptr_t>(engram_table_ + off) & ~(page - 1);
-    const auto last = reinterpret_cast<std::uintptr_t>(engram_table_ + off + d - 1) & ~(page - 1);
-    (void)madvise(reinterpret_cast<void*>(first), last - first + page, MADV_WILLNEED);
-  }
-  for (std::size_t at = 0; at < total; ++at) std::memcpy(rows + at * d, engram_table_ + offsets[at], d);
 }
 
 }  // namespace gufo::models::hy4_flash

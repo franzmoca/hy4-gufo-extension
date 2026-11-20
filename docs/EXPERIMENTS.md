@@ -50,6 +50,9 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E42 | Prefill attention: interleaved score chains | retained |
 | E43 | 8,192-token prefill passes for contexts up to 256K | retained |
 | E44 | Rope angles shared across heads | rejected |
+| E45 | Cache checkpoints inside a prefill pass | retained |
+| E46 | Engram rows read directly, beside the layers | retained |
+| E47 | Decode rounds between a prompt pass's layer groups | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1073,3 +1076,74 @@ dense and routed FP16 GEMMs (about 60% of the time, at 60-65% of the
 matrix cores' peak, no phase dominant) and the attention's barriers and
 softmax; closing the gap to 1,000 tok/s needs a GEMM redesign (deeper K
 stages or a different wave layout) rather than another local fix.
+
+## E45: Cache checkpoints inside a prefill pass (2026-11-20)
+
+The probe's prefill figures (E37-E43) were not what the server gave. Through
+`gufo serve` with the prompt cache on, a cache-miss prompt ran at 650-760
+tok/s: the cache plans a checkpoint every 2,048 tokens and the prompt
+snapshot target, and a runner without in-pass checkpoints ends a pass at each
+of them, so prompts ran as 2,048-token passes whatever the pass width.
+
+The runner now declares `in_pass_checkpoint` (up to four per pass).
+`PrefillCheckpointBytes` claims a boundary inside a pass that holds no image;
+`PrefillThrough` runs the pass once, keeping the logits after each
+boundary's last token (`Session::PromptThrough`: one LM head row each), and
+the continuation adapter exposes the slot as the state at each boundary in
+turn (`ViewAt`: frontier and logits; the rows before it are written, and the
+rings keep a window plus a pass). A capture equals what a pass ending there
+leaves, as passes do not depend on where they end (E18, E36). Greedy replies
+after restores from in-pass checkpoints at 4,096 and 2,048 tokens of a
+6,996-token pass equal those of a server without the cache; the `cache`
+suites pass. A 4,741-token prompt runs as one pass instead of four.
+
+## E46: Engram rows read directly, beside the layers (2026-11-20)
+
+The other server gap was the Engram table (63.4 GB of FP8 E4M3 rows of 96
+bytes, the second GGUF shard). Rows were copied from the mapping, a page
+fault per row, before the pass started: about 0.75-0.95 s for 4,000 tokens
+of new text (the probe's repeated prompts found them in the page cache).
+Threads per module did not help.
+
+As Qwen3.8 Flash Next reads its n-gram table: `EngramReader` reads rows with
+direct I/O on 128 resident readers, reading a gather's repeated rows once,
+in file order, with a 128 MiB cache of rows. Each module's rows are read
+while the layers before it run; a pass waits only at that module's layer
+(modules at layers 1, 11, 21, 31). On new text the wait is 0.15 s per pass,
+all at module 0. Probe logits are identical bit for bit; new text runs at
+913 tok/s against 770-820 before, repeated text at 930.
+
+The drive bounds the cold reads. Random 4 KiB reads of the shard, 128
+threads: 230K/s direct and 247K/s buffered on the KIOXIA EXCERIA BASIC
+(btrfs; the shard holds no compressed extents, so direct reads stay direct),
+657K/s on the Samsung 990 PRO. With the shard on the 990 PRO the wait is
+0.045 s and new text runs at 929 tok/s (ABBA, page cache dropped per arm).
+
+Server, cache-miss prompts with DFly2 and the prompt cache, tok/s, ABBA
+(both halves within 0.5%;
+[artifact](artifacts/2026-11-20-server-prefill/abba.json)):
+
+| build | 4,741 tokens | 10,080 | 18,583 |
+| --- | --- | --- | --- |
+| before E36 | 653 | 704 | 694 |
+| E43 | 666 | 729 | 761 |
+| E45-E46 | 910 | 906 | 890 |
+| E45-E46, table on the 990 PRO | 926 | 918 | 896 |
+
+## E47: Decode rounds between a prompt pass's layer groups (2026-11-20)
+
+With E45 a prompt is one wide pass, so another session's decoding and an
+arriving request waited for it (`prefill-scheduling` failed). As Qwen3.8
+Flash Next does, the profile allows eight layer groups: a prompt pass pauses
+after about every n_layer / groups layers (`Session::SetPrefillYield`) and
+the host runs other sessions' decode rounds. Decode passes take a scratch of
+their own (16 rows), so the paused pass keeps its buffers, and their Engram
+reads go before the paused pass's queued ones. The scheduling profile's pass
+size, which bounds how long an arrival waits for a lone prompt while a
+session is free, is 2,048 tokens (about 2.3 s; Qwen3.8 Flash Next's 4,096
+take about 2 s); with no session free a prompt keeps `MaxChunk()`-token
+passes. A short request beside a 4,410-token prompt gives its first token at
+4,096 tokens (4.6 s; E43: 4,405). Probe logits are identical bit for bit;
+`conversation`, `long-context`, `cache`, `prefill-scheduling` and
+`image-inputs` pass at a 32,768-token context with four sessions (the
+measurement check reports DFly2 drafts on AR requests, as at E37).

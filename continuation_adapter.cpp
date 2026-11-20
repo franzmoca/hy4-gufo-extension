@@ -62,7 +62,12 @@ public:
     BeforeRelease();
     session->SetWriteHook(nullptr, nullptr);
   }
-  [[nodiscard]] Rows Tokens() const { return session->Position(); }
+  [[nodiscard]] Rows Tokens() const {
+    return view_tokens ? view_tokens : session->Position();
+  }
+  // ViewAt's frontier and logits (0: the session's own).
+  Rows view_tokens = 0;
+  std::vector<float>* view_logits = nullptr;
   bool IsValid() const noexcept override { return !restoring && !failed; }
   void RequireIdle() const {
     if (!IsValid() || pending) throw std::logic_error("Hy4 slot is not ready for execution");
@@ -207,6 +212,25 @@ Session& ContinuationAdapter::GetSession(cache::Slot& slot) {
   state.RequireIdle();
   return *state.session;
 }
+std::vector<cache::ComponentPosition>
+ContinuationAdapter::PrefillCheckpointPositions(const cache::Slot&,
+                                                Rows boundary) const {
+  return PositionsAt(boundary);
+}
+void ContinuationAdapter::ViewAt(cache::Slot& slot, Rows tokens,
+                                 std::vector<float>* logits) {
+  auto& state = As(slot);
+  if (!tokens || tokens >= state.session->Position() || !logits ||
+      logits->size() != model_->config().n_vocab)
+    throw std::invalid_argument("invalid Hy4 in-pass checkpoint");
+  state.view_tokens = tokens;
+  state.view_logits = logits;
+}
+void ContinuationAdapter::EndView(cache::Slot& slot) {
+  auto& state = As(slot);
+  state.view_tokens = 0;
+  state.view_logits = nullptr;
+}
 Rows ContinuationAdapter::Capacity(const ContinuationComponent& c) const { return context_ / c.ratio + 1; }
 std::vector<cache::ComponentPosition> ContinuationAdapter::PositionsAt(Rows tokens) const {
   std::vector<cache::ComponentPosition> positions;
@@ -310,7 +334,8 @@ std::vector<ContinuationAdapter::Piece> ContinuationAdapter::PrivateRegion(State
       break;
     }
     case ContinuationPart::kLogits: {
-      auto& logits = state.session->LastLogits();
+      auto& logits =
+          state.view_logits ? *state.view_logits : state.session->LastLogits();
       if (logits.size() != cfg.n_vocab) logits.assign(cfg.n_vocab, 0.0f);
       add(logits.data(), total, true);
       break;
