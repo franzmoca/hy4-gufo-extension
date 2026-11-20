@@ -25,6 +25,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E17 | FP16 matrix-core projections and routed experts instead of MMQ | retained |
 | E18 | Prompt passes on the batched kernels at any size | retained |
 | E19 | Prefill attention output in binary16 | retained |
+| E20 | FP32 GEMM for the router instead of hipBLAS | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -378,3 +379,20 @@ for bit. KL against llama.cpp 0.0828 ± 0.0085, same top 91.6%, PPL 14.978
 `--passcheck 8` and `--chunkcheck` at 517 and 999 exact; the
 `conversation`, `long-context` and `cache` suites pass every case.
 3,712-token prefill 5.52 → 5.43 s (684 tok/s; both runs). Retained.
+
+## E20: FP32 GEMM for the router instead of hipBLAS (2026-11-20)
+
+The batched FP32 projections (the router, 512 x 3,072, and the indexer's
+small FP32 matrices) ran on hipBLAS, which picked a 32 x 32 macro-tile kernel
+for this layout: 2.6 ms per 2,048-token router pass (2.5 TFLOPS, 0.2 s of
+the 3,712-token prefill). `hy4_sgemm_nt` takes 64 tokens x 128 rows per
+block, 4 x 8 outputs per thread, K in steps of 32 through LDS transposed for
+float4 reads, with the next step's global loads issued before the current
+step's products: 2.28 ms without that prefetch, 1.05 ms with it (6.1 TFLOPS).
+Products and sums stay FP32; each output sums its k products in order, so a
+token's row does not depend on the pass (`hy4flash.kernels` checks 5 against
+70 tokens bit for bit), and E18's 16-row padding of small prompt passes is
+gone. The sum order differs from hipBLAS's: KL 0.0842 ± 0.0081, same top
+91.9%, PPL 15.117 (E19: 0.0828 ± 0.0085); `--passcheck 8` and `--chunkcheck`
+at 517 and 999 exact. 3,712-token prefill 5.43 → 5.355 s (693 tok/s; both
+runs). Retained.

@@ -490,7 +490,8 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   binary16 once per pass, a routed tile width per expert: 8.24 → 7.18 s.
   FP16 matrix-core kernels for every quantized projection and the routed
   experts instead of MMQ: 7.18 → 5.58 s (E17); coalesced dense stores and
-  binary16 attention output: 5.43 s (E18, E19).
+  binary16 attention output: 5.43 s (E18, E19); the router's FP32 GEMM:
+  5.355 s (E20).
 
 - **Prefill profile after E17** (3,712 tokens, 5.35 s of kernels): dense
   FP16 projections 1.87 s (27-33 TFLOPS standalone; `wo` and `attn_gate` are
@@ -542,7 +543,7 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   on the passes its span was cut into, so a restore re-prefilling a gap in
   other pass shapes could flip a greedy near tie. E17's FP16 kernels made
   batched passes row-independent, and E18 runs prompt passes of any size on
-  them (with the hipBLAS FP32 GEMM held to 16 rows): `--chunkcheck` is exact
+  them (and since E20 the FP32 projections on a row-independent GEMM): `--chunkcheck` is exact
   at every split, and the `cache` suite passes. Decoding and verify passes
   keep the single-token kernels, which `--passcheck` holds exact.
 

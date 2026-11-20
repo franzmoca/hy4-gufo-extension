@@ -220,6 +220,11 @@ int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64
 /* out [blocks * 32] = dequantized Q8_0 blocks. */
 int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t stream);
 int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream);
+/* y [n][m] = x [n][k] w^T for w [m][k], all FP32; each output sums its k
+ * products in order, so a token's row does not depend on n. k must be a
+ * multiple of 32. */
+int hy4_sgemm_nt(const float* x, const float* w, float* y, uint32_t n,
+                 uint32_t m, uint32_t k, hipStream_t stream);
 
 /* Batched Q8_0, Q4_K and Q6_K projections on the FP16 matrix cores
  * (hy4_f16_mm.hip.cpp). For each group z < groups, out[t, z m + r] =

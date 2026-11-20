@@ -88,22 +88,9 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uin
   switch (w.type) {
     case HY4_TYPE_F32:
       if (batched) {
-        // Row-major y[n][m] = x[n][k] W^T, as column-major y^T = W^T x^T.
-        // Small prompt passes run as 16 rows (x and y are chunk scratch; the
-        // extra rows are ignored): hipBLAS takes another kernel for a single
-        // row, which would make a prompt's last token depend on its pass.
-        const float one = 1.0f;
-        const float zero = 0.0f;
-        const std::uint32_t rows =
-            ex.prompt ? std::max<std::uint32_t>(n, 16) : n;
-        if (hipblasSgemm(static_cast<hipblasHandle_t>(ex.blas_handle),
-                         HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(m),
-                         static_cast<int>(rows), static_cast<int>(k), &one,
-                         w.f32(), static_cast<int>(k), x, static_cast<int>(k),
-                         &zero, y,
-                         static_cast<int>(m)) != HIPBLAS_STATUS_SUCCESS) {
-          return Fail(error, "hy4: sgemm failed");
-        }
+        // Row-major y[n][m] = x[n][k] W^T; each row is summed in the same
+        // order at any n, so a prompt's results do not depend on its passes.
+        HY4_CHECK(hy4_sgemm_nt(x, w.f32(), y, n, m, k, stream));
         return true;
       }
       [[fallthrough]];

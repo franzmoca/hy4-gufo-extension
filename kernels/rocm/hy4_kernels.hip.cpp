@@ -788,6 +788,89 @@ __global__ void DequantQ8_0(const BlockQ8_0* src, uint64_t blocks, float* out) {
   }
 }
 
+// y[t][r] = sum_c x[t][c] w[r][c] in FP32 for batched passes (the router and
+// the indexer's FP32 projections). Block: 64 tokens x 128 rows, 256 threads
+// of 4 tokens x 8 rows; K in steps of 32 through LDS, transposed so each
+// thread reads its tokens and rows as float4. Every output sums c = 0 .. k-1
+// in order in one accumulator, so a token's result does not depend on the
+// pass or the other tokens. k must be a multiple of 32.
+constexpr uint32_t kSgTok = 64, kSgRows = 128, kSgK = 32;
+__global__ void __launch_bounds__(256)
+    SgemmNt(const float* __restrict__ x, const float* __restrict__ w,
+            float* __restrict__ y, uint32_t n, uint32_t m, uint32_t k) {
+  __shared__ __align__(16) float xs[kSgK][kSgTok + 4];
+  __shared__ __align__(16) float ws[kSgK][kSgRows + 4];
+  const uint32_t tid = threadIdx.x;
+  const uint32_t t0 = blockIdx.y * kSgTok, r0 = blockIdx.x * kSgRows;
+  const uint32_t tt = (tid % 16) * 4, rr = (tid / 16) * 8;
+  // Staging: thread tid loads values 4 (tid % 8) .. + 3 of tokens tid / 8
+  // and 32 + tid / 8, and of rows tid / 8 + 32 i; the next step's loads are
+  // issued before this step's products.
+  const uint32_t lrow = tid / 8, lcol = (tid % 8) * 4;
+  float4 xv[2], wv[4];
+  const auto load = [&](uint32_t c0) {
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+      const uint32_t t = t0 + lrow + 32 * i;
+      xv[i] = t < n ? *reinterpret_cast<const float4*>(x + (uint64_t)t * k +
+                                                       c0 + lcol)
+                    : make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+      const uint32_t r = r0 + lrow + 32 * i;
+      wv[i] = r < m ? *reinterpret_cast<const float4*>(w + (uint64_t)r * k +
+                                                       c0 + lcol)
+                    : make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+  };
+  float acc[4][8] = {};
+  load(0);
+  for (uint32_t c0 = 0; c0 < k; c0 += kSgK) {
+#pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+      xs[lcol][lrow + 32 * i] = xv[i].x;
+      xs[lcol + 1][lrow + 32 * i] = xv[i].y;
+      xs[lcol + 2][lrow + 32 * i] = xv[i].z;
+      xs[lcol + 3][lrow + 32 * i] = xv[i].w;
+    }
+#pragma unroll
+    for (uint32_t i = 0; i < 4; ++i) {
+      ws[lcol][lrow + 32 * i] = wv[i].x;
+      ws[lcol + 1][lrow + 32 * i] = wv[i].y;
+      ws[lcol + 2][lrow + 32 * i] = wv[i].z;
+      ws[lcol + 3][lrow + 32 * i] = wv[i].w;
+    }
+    __syncthreads();
+    if (c0 + kSgK < k)
+      load(c0 + kSgK);
+#pragma unroll 8
+    for (uint32_t c = 0; c < kSgK; ++c) {
+      const float4 a = *reinterpret_cast<const float4*>(&xs[c][tt]);
+      const float4 b0 = *reinterpret_cast<const float4*>(&ws[c][rr]);
+      const float4 b1 = *reinterpret_cast<const float4*>(&ws[c][rr + 4]);
+      const float av[4] = {a.x, a.y, a.z, a.w};
+      const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+      for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+          acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t t = t0 + tt + i;
+    if (t >= n)
+      continue;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+      if (r0 + rr + j < m)
+        y[(uint64_t)t * m + r0 + rr + j] = acc[i][j];
+  }
+}
+
 __global__ void Argmax(const float* x, uint32_t dim, int32_t* out) {
   __shared__ float scratch[32];
   __shared__ int32_t picked;
@@ -1490,6 +1573,17 @@ int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, int32_t lo,
       reinterpret_cast<const _Float16*>(q),
       reinterpret_cast<const _Float16*>(keys), lo, pos, window, sel, n_sel,
       sinks, scale, reinterpret_cast<_Float16*>(out), heads);
+  return Status();
+}
+
+int hy4_sgemm_nt(const float* x, const float* w, float* y, uint32_t n,
+                 uint32_t m, uint32_t k, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (k % kSgK != 0)
+    return 1;
+  SgemmNt<<<dim3((m + kSgRows - 1) / kSgRows, (n + kSgTok - 1) / kSgTok), 256,
+            0, stream>>>(x, w, y, n, m, k);
   return Status();
 }
 

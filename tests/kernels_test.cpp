@@ -1133,6 +1133,32 @@ std::vector<double> Dequant(int type, const std::vector<uint8_t>& v) {
 // FP16-rounded activations: rows past 256-row blocks, partial token tiles,
 // groups, pairs of different heights, FP16 inputs and outputs, and routed
 // experts with a bucket over one tile, an empty expert and the clamp.
+void TestSgemm() {
+  const uint32_t m = 150, k = 96, n = 70;
+  const auto x = Random(n * k), w = Random(m * k);
+  std::vector<double> want(n * m);
+  for (uint32_t t = 0; t < n; ++t)
+    for (uint32_t r = 0; r < m; ++r) {
+      double acc = 0;
+      for (uint32_t c = 0; c < k; ++c)
+        acc += (double)x[t * k + c] * w[r * k + c];
+      want[t * m + r] = acc;
+    }
+  auto* dx = Device(x);
+  auto* dw = Device(w);
+  float* dy = Device(std::vector<float>(n * m));
+  Expect(hy4_sgemm_nt(dx, dw, dy, n, m, k, nullptr) == 0, "sgemm_nt status");
+  const auto got = Host(dy, n * m);
+  Near(got, want, 1e-6, "sgemm_nt");
+  float* d5 = Device(std::vector<float>(5 * m));
+  Expect(hy4_sgemm_nt(dx, dw, d5, 5, m, k, nullptr) == 0, "sgemm_nt 5 status");
+  Expect(std::memcmp(Host(d5, 5 * m).data(), got.data(),
+                     5 * m * sizeof(float)) == 0,
+         "sgemm_nt rows independent of the pass");
+  Expect(hy4_sgemm_nt(dx, dw, dy, n, m, 100, nullptr) != 0,
+         "sgemm_nt rejects k % 32");
+}
+
 void TestF16Matmul() {
   const auto half_round = [](const std::vector<float>& x) {
     std::vector<double> r(x.size());
@@ -1345,6 +1371,7 @@ int main() {
   TestKpool();
   TestAttnSoftmax();
   TestF16Matmul();
+  TestSgemm();
   if (g_failures) {
     std::fprintf(stderr, "%d failures\n", g_failures);
     return 1;
