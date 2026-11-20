@@ -673,6 +673,73 @@ __global__ void IndexerScore(const float* q, const float* w, const float* pooled
   if (lane == 0) score[(uint64_t)t * n_pool_max + g] = total;
 }
 
+// IndexerScore with one thread per (token, group) for 128-wide rows: a block
+// takes 256 groups of kTok tokens, whose queries it shares in LDS, and
+// each thread keeps its group's row in registers. Each head's dot product is
+// summed as IndexerScore's warp sums it (lane l's partial over i = l + 32 j,
+// then the xor tree, pairs commute), so the scores are identical.
+constexpr uint32_t kIdxDim = 128, kIdxMaxHeads = 16;
+
+template<uint32_t kTok>
+__global__ void __launch_bounds__(kBlock)
+    IndexerScoreRows(const float* q, const float* w, const float* pooled,
+                     const int32_t* n_pool, uint32_t n_pool_max, float* score,
+                     uint32_t n, uint32_t heads) {
+  static_assert(kIdxDim == 4 * 32, "four values per lane partial");
+  __shared__ __align__(16) float qs[kTok * kIdxMaxHeads * kIdxDim];
+  __shared__ float ws[kTok * kIdxMaxHeads];
+  const uint32_t t0 = blockIdx.y * kTok;
+  const uint32_t nt = min(kTok, n - t0);
+  const float4* qt =
+      reinterpret_cast<const float4*>(q + (uint64_t)t0 * heads * kIdxDim);
+  for (uint32_t i = threadIdx.x; i < nt * heads * kIdxDim / 4; i += blockDim.x)
+    reinterpret_cast<float4*>(qs)[i] = qt[i];
+  if (threadIdx.x < nt * heads)
+    ws[threadIdx.x] = w[(uint64_t)t0 * heads + threadIdx.x];
+  __syncthreads();
+  const uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+  if (g >= n_pool_max)
+    return;
+  float k[kIdxDim];
+  const float4* kr =
+      reinterpret_cast<const float4*>(pooled + (uint64_t)g * kIdxDim);
+#pragma unroll
+  for (uint32_t i = 0; i < kIdxDim / 4; ++i) {
+    const float4 v = kr[i];
+    k[4 * i] = v.x;
+    k[4 * i + 1] = v.y;
+    k[4 * i + 2] = v.z;
+    k[4 * i + 3] = v.w;
+  }
+  for (uint32_t tt = 0; tt < nt; ++tt) {
+    const uint32_t t = t0 + tt;
+    float total = -INFINITY;
+    if ((int32_t)g < n_pool[t]) {
+      total = 0.0f;
+#pragma unroll 1
+      for (uint32_t h = 0; h < heads; ++h) {
+        const float* qh = qs + (tt * heads + h) * kIdxDim;
+        float p[32];
+#pragma unroll
+        for (uint32_t l = 0; l < 32; ++l) {
+          float d = 0.0f;
+#pragma unroll
+          for (uint32_t j = 0; j < kIdxDim / 32; ++j)
+            d += qh[l + 32 * j] * k[l + 32 * j];
+          p[l] = d;
+        }
+#pragma unroll
+        for (uint32_t o = 16; o > 0; o >>= 1)
+#pragma unroll
+          for (uint32_t l = 0; l < o; ++l)
+            p[l] = p[l] + p[l + o];
+        total += fmaxf(p[0], 0.0f) * ws[tt * heads + h];
+      }
+    }
+    score[(uint64_t)t * n_pool_max + g] = total;
+  }
+}
+
 // One block per token: k rounds of block argmax over the visible groups.
 // TODO(perf): a radix select instead of k argmax rounds.
 __global__ void KpoolSelect(float* score, const int32_t* n_pool, uint32_t n_pool_max, const int32_t* pos,
@@ -1541,6 +1608,19 @@ int hy4_indexer_score(const float* q, const float* w, const float* pooled, const
                       uint32_t n_pool_max, float* score, uint32_t n, uint32_t heads, uint32_t dim,
                       hipStream_t stream) {
   if (n == 0 || n_pool_max == 0) return 0;
+  if (dim == kIdxDim && heads <= kIdxMaxHeads) {
+    // Four tokens per block share their group rows' loads; with few blocks
+    // of groups (short contexts, verify passes) a token per block spreads
+    // the work.
+    const uint32_t blocks = (n_pool_max + kBlock - 1) / kBlock;
+    if (blocks * n >= 64)
+      IndexerScoreRows<4><<<dim3(blocks, (n + 3) / 4), kBlock, 0, stream>>>(
+          q, w, pooled, n_pool, n_pool_max, score, n, heads);
+    else
+      IndexerScoreRows<1><<<dim3(blocks, n), kBlock, 0, stream>>>(
+          q, w, pooled, n_pool, n_pool_max, score, n, heads);
+    return Status();
+  }
   const uint32_t per_block = RowsPerBlock();
   IndexerScore<<<dim3((n_pool_max + per_block - 1) / per_block, n), kBlock, 0, stream>>>(q, w, pooled, n_pool,
                                                                                          n_pool_max, score, heads,

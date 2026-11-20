@@ -989,6 +989,31 @@ void TestKpool() {
     }
   auto scores = Host(score, n * n_pool_max);
   Near(scores, want_score, 1e-5, "indexer_score");
+  {  // The model's 16 heads, several blocks of groups and of tokens.
+    const uint32_t n2 = 6, heads2 = 16, groups2 = 300;
+    const auto q2 = Random(n2 * heads2 * dim);
+    const auto w2 = Random(n2 * heads2, 0, 1);
+    const auto rows2 = Random(groups2 * dim);
+    const std::vector<int32_t> visible{1, 300, 257, 0, 120, 299};
+    float* score2 = Device(std::vector<float>(n2 * groups2));
+    Expect(hy4_indexer_score(Device(q2), Device(w2), Device(rows2),
+                             Device(visible), groups2, score2, n2, heads2, dim,
+                             nullptr) == 0,
+           "indexer_score 16 heads status");
+    std::vector<double> want2(n2 * groups2, -INFINITY);
+    for (uint32_t t = 0; t < n2; ++t)
+      for (int32_t g = 0; g < visible[t]; ++g) {
+        double total = 0;
+        for (uint32_t h = 0; h < heads2; ++h) {
+          double d = 0;
+          for (uint32_t i = 0; i < dim; ++i)
+            d += (double)q2[(t * heads2 + h) * dim + i] * rows2[g * dim + i];
+          total += std::max(d, 0.0) * w2[t * heads2 + h];
+        }
+        want2[t * groups2 + g] = total;
+      }
+    Near(Host(score2, n2 * groups2), want2, 1e-5, "indexer_score 16 heads");
+  }
 
   // Equal scores pick the lower group first.
   scores[1 * n_pool_max + 7] = scores[1 * n_pool_max + 3] = 1e3f;

@@ -30,6 +30,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E22 | `MlaPrefill` output staged through LDS for 16-byte stores | rejected |
 | E23 | Hyper-connection post-mix folded into the next pre-mix | retained |
 | E24 | Binary16 activations for the FP16 projections: normed inputs and the expert latent | retained |
+| E25 | Indexer scores with a thread per group | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -461,3 +462,21 @@ router keeps its FP32 input. Bit-identical (KL 0.08424, PPL 15.1167;
 copy with the rounded FP32 output bitwise). 3,712-token prefill 5.07 → 5.02 s
 with the binary16 latent alone, 4.85-4.87 s with both (763 tok/s).
 Retained.
+
+## E25: Indexer scores with a thread per group (2026-11-20)
+
+`IndexerScore` took a warp per (token, group) and summed each of the 16
+heads' 128-value dot products across the warp: four products per lane, then
+five shuffle steps. That was 14.4 ms per sparse layer pass of 2,048 tokens
+(0.17 s of the prefill) for 8 GFLOP. A thread per (token, group) now keeps
+its group's row in registers, reads the queries of its block's four tokens
+from LDS as broadcasts, and sums each head as the warp did: lane l's
+partial over values l + 32 j, then the xor tree's pairs (addition commutes,
+so every lane of the tree held the same sum). The scores are bitwise
+identical (1.9 M scores in a standalone comparison; KL 0.08424, PPL
+15.1167, `--passcheck 8` and `--chunkcheck` 517 and 999 exact). Standalone:
+2,048 tokens over 928 groups 12.8 → 1.7 ms; one-token decode 10 → 9 µs at
+250 groups and 57 → 18 µs at 8,192 (32K context). With few blocks of groups
+a block takes one token instead of four, which keeps 3- to 8-token verify
+passes at short contexts no slower. 3,712-token prefill 4.86 → 4.70, 4.72 s
+(788 tok/s). Retained.
