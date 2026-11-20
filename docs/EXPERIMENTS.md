@@ -24,6 +24,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E16 | Routed expert tile width per expert | retained |
 | E17 | FP16 matrix-core projections and routed experts instead of MMQ | retained |
 | E18 | Prompt passes on the batched kernels at any size | retained |
+| E19 | Prefill attention output in binary16 | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -362,3 +363,18 @@ the fastest grid index, so the workgroups in flight read and write
 neighbouring parts of the same token rows (4.96 → 4.13 ms). Same values.
 3,712-token prefill 5.58 → 5.52, 5.53 s. KL 0.0834 ± 0.0079 and
 `--passcheck 8` unchanged. Retained.
+
+## E19: Prefill attention output in binary16 (2026-11-20)
+
+`MlaPrefill` wrote its FP32 output (n x heads x 512) only for the `wv_b`
+projection, which rounds its input to binary16 as it stages it. It now
+stores binary16 and `wv_b` reads it as such, halving that write and read
+(268 MB per 2,048-token pass of a 64-head layer). Not bit-identical: the
+compiler turns the store's `(_Float16)(acc * inv)` into `v_fma_mix`, which
+rounds the exact product to binary16 once, where the FP32 store and the
+staging rounded it twice; the staging itself matches a pre-rounded input bit
+for bit. KL against llama.cpp 0.0828 ± 0.0085, same top 91.6%, PPL 14.978
+(was 0.0834 ± 0.0079, 92.1%, 15.388: within the run's error);
+`--passcheck 8` and `--chunkcheck` at 517 and 999 exact; the
+`conversation`, `long-context` and `cache` suites pass every case.
+3,712-token prefill 5.52 → 5.43 s (684 tok/s; both runs). Retained.

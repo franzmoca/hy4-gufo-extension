@@ -111,12 +111,14 @@ int hy4_mla_attention(const float* q, const float* cache, uint32_t ring, const i
  * pass it is in. Key position k is row k - lo of `keys` [rows][dk] (binary16
  * bits, from hy4_gather_rows_half); token t sees max(lo, pos[t] - window + 1)
  * .. pos[t] (lo without a window), or the positions of sel[t, 0:n_sel] in that
- * range. dk must be 576, dv 512 and heads a multiple of 32. */
+ * range. out [n][heads][dv] is binary16 bits (the rounding the wv_b
+ * projection applies to its input). dk must be 576, dv 512 and heads a
+ * multiple of 32. */
 int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, int32_t lo,
                     const int32_t* pos, uint32_t window, const int32_t* sel,
-                    uint32_t n_sel, const float* sinks, float scale, float* out,
-                    uint32_t n, uint32_t heads, uint32_t dk, uint32_t dv,
-                    hipStream_t stream);
+                    uint32_t n_sel, const float* sinks, float scale,
+                    uint16_t* out, uint32_t n, uint32_t heads, uint32_t dk,
+                    uint32_t dv, hipStream_t stream);
 
 /* Copies n rows of `dim` floats into a ring: dst row pos[t] % ring. */
 int hy4_store_rows(const float* src, uint64_t src_stride, float* dst, uint32_t ring, const int32_t* pos,

@@ -866,7 +866,7 @@ __device__ __forceinline__ int32_t MlaKey(const int32_t* sel_t, int32_t first,
 __global__ void __launch_bounds__(32 * kMlaWaves)
     MlaPrefill(const _Float16* q, const _Float16* keys, int32_t lo,
                const int32_t* pos, uint32_t window, const int32_t* sel,
-               uint32_t n_sel, const float* sinks, float scale, float* out,
+               uint32_t n_sel, const float* sinks, float scale, _Float16* out,
                uint32_t heads) {
   __shared__ __align__(16) _Float16 kt[kMlaTile * kMlaKtPitch];
   __shared__ __align__(16) _Float16 probs[kMlaHeads * kMlaProbPitch];
@@ -1008,11 +1008,11 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
     const uint32_t h = hg + 2 * i + half;
     const float l = l_s[h];
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
-    float* orow = out + ((uint64_t)t * heads + h0 + h) * kMlaDv +
-                  sub * (kMlaDv / kMlaSplit) + row;
+    _Float16* orow = out + ((uint64_t)t * heads + h0 + h) * kMlaDv +
+                     sub * (kMlaDv / kMlaSplit) + row;
 #pragma unroll
     for (uint32_t c = 0; c < kMlaPvTiles; ++c)
-      orow[c * 16] = acc[c][i] * inv;
+      orow[c * 16] = (_Float16)(acc[c][i] * inv);
   }
 }
 
@@ -1479,9 +1479,9 @@ int hy4_mla_absorb(const uint16_t* wq, const float* wd, const float* q,
 
 int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, int32_t lo,
                     const int32_t* pos, uint32_t window, const int32_t* sel,
-                    uint32_t n_sel, const float* sinks, float scale, float* out,
-                    uint32_t n, uint32_t heads, uint32_t dk, uint32_t dv,
-                    hipStream_t stream) {
+                    uint32_t n_sel, const float* sinks, float scale,
+                    uint16_t* out, uint32_t n, uint32_t heads, uint32_t dk,
+                    uint32_t dv, hipStream_t stream) {
   if (n == 0)
     return 0;
   if (dk != kMlaDk || dv != kMlaDv || heads % kMlaHeads != 0)
@@ -1489,7 +1489,7 @@ int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, int32_t lo,
   MlaPrefill<<<dim3(n, heads / kMlaHeads), 32 * kMlaWaves, 0, stream>>>(
       reinterpret_cast<const _Float16*>(q),
       reinterpret_cast<const _Float16*>(keys), lo, pos, window, sel, n_sel,
-      sinks, scale, out, heads);
+      sinks, scale, reinterpret_cast<_Float16*>(out), heads);
   return Status();
 }
 

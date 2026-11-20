@@ -579,12 +579,16 @@ void TestMlaPrefill() {
                        bool sink,
                        const std::vector<std::vector<int32_t>>& want_keys,
                        const std::string& what) {
-    float* out = Device(std::vector<float>(n * heads * dv));
+    auto* out = Device(std::vector<uint16_t>(n * heads * dv));
     Expect(hy4_mla_prefill(
                dq, keys, lo, dp, window, sel ? Device(*sel) : nullptr, n_sel,
                sink ? ds : nullptr, scale, out, n, heads, dk, dv, nullptr) == 0,
            what + " status");
-    Near(Host(out, n * heads * dv),
+    const auto bits = Host(out, n * heads * dv);
+    std::vector<float> got(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i)
+      got[i] = (float)HalfValue(bits[i]);
+    Near(got,
          MlaReference(q, cache, ring, want_keys, sink ? sinks.data() : nullptr,
                       scale, heads, dk, dv),
          4e-3, what);

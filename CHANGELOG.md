@@ -44,3 +44,6 @@
   after a prompt-cache restore matches the reply to the same prompt served
   cold; short prompt passes are faster
   ([E18](docs/EXPERIMENTS.md#e18-prompt-passes-on-the-batched-kernels-at-any-size-2026-11-20)).
+- Prefill 684 tok/s on 3,712 tokens: the prefill attention hands its output
+  to the value projection in binary16
+  ([E19](docs/EXPERIMENTS.md#e19-prefill-attention-output-in-binary16-2026-11-20)).

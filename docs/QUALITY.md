@@ -16,6 +16,7 @@ to 4,095, where the sparse layers' indexer selects pools).
 | llama.cpp, F32 cache against its F16 cache (noise floor) | 0.070 | 92.0% | 14.930 |
 | this engine (`hy4_eval_probe --kl`), first build | 0.096 ± 0.010 | 91.4% | 15.031 |
 | this engine after E17 (FP16 matrix-core projections) | 0.083 ± 0.008 | 92.1% | 15.388 |
+| this engine after E19 (binary16 attention output) | 0.083 ± 0.009 | 91.6% | 14.978 |
 
 llama.cpp's own PPL on the base run is 14.466. The model is chaotic under
 rounding past 2,048 tokens (near-tied pool and expert choices), so single
@@ -76,8 +77,8 @@ with DFly2 and the vision sidecar:
 
 After the prefill kernel work (E10-E16, 2026-11-20) and again after E17,
 `conversation`, `long-context` and `cache` gave the same results: all passed
-but the same `legacy-tool-cancel-disk` case. After E18 every case of the
-three suites passes.
+but the same `legacy-tool-cancel-disk` case. After E18 and E19 every case of
+the three suites passes.
 
 The harness marks drafter runs failed in its measurements ("AR request
 executed speculative drafts"): it knows only Gufo's own speculative backends.

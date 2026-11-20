@@ -681,16 +681,18 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
       }
     }
   }
+  // Prefill attention output as binary16 bits in att's storage.
+  auto* att_half = reinterpret_cast<std::uint16_t*>(s.att);
   if (batched) {
     // Prefill: each token over exactly its own keys on the matrix cores, so a
     // token's result does not depend on how its span was cut into passes.
     HY4_CHECK(hy4_mla_prefill(qh, keys_half_, lo, s.pos, window, sel, n_sel,
-                              l.attn_sinks.f32(), scale, s.att, n, heads, dk,
+                              l.attn_sinks.f32(), scale, att_half, n, heads, dk,
                               c.kv_lora, st));
   }
   if (batched) {
-    HY4_CHECK(hy4_f16_dense(l.wv_b.type, l.wv_b.data, s.att, s.attv, c.head_v,
-                            n, c.kv_lora, heads, 0, st));
+    HY4_CHECK(hy4_f16_dense(l.wv_b.type, l.wv_b.data, att_half, s.attv,
+                            c.head_v, n, c.kv_lora, heads, HY4_F16_X_HALF, st));
   } else {
     HY4_CHECK(hy4_gemv_q8_0_grouped(l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
                                     std::uint64_t{heads} * c.kv_lora, c.kv_lora, std::uint64_t{heads} * c.head_v,
