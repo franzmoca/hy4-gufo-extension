@@ -43,6 +43,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E35 | A smaller draft head: the frequent rows and the request's own | retained |
 | E36 | Prefill attention below position 2,048 independent of the pass | retained |
 | E37 | 4,096-token prefill passes | retained |
+| E38 | Fewer hyper-connection mix slices in prompt passes | rejected |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -935,3 +936,18 @@ so results do not change: KL 0.08424 (identical), `--chunkcheck` exact at
 8,192-token prompt (indexer slices). Gufo's `conversation`, `long-context`
 and `cache` suites pass every case. Retained at 4,096; 8,192 would suit
 servers with smaller contexts.
+
+## E38: Fewer hyper-connection mix slices in prompt passes (2026-11-20)
+
+The pre-mix (`HcMixTokens`) splits each token's 12,288 stream values over 48
+column slices, one value per thread, and spends most of its time in the
+reductions (220 ms of a 3,712-token prefill). Prompt passes with 12 slices
+(four values per thread) cut `HcMixTokens` by 21 ms, but `HcApply`, which
+sums the slices' partials, grew by 26 ms: one prefill of 3,712 tokens took
+4.169 s in both arms (ABBA, three runs each), 16,384 tokens 19.26 against
+19.33 s (0.3%). The summation order changes the logits (KL 0.08231 against
+0.08424), so prompt passes would also stop matching decoding passes bit for
+bit. Rejected.
+
+`hy4_eval_probe --kl` and `--ppl` now evaluate in prompt passes, as serving
+prefills text; at 48 slices the result is unchanged (KL 0.08424).

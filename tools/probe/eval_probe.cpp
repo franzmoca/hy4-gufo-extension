@@ -332,7 +332,8 @@ int main(int argc, char** argv) {
       for (std::size_t i = 0; i < n_ctx; i += hy4::Model::kMaxChunk) {
         const std::size_t n = std::min<std::size_t>(hy4::Model::kMaxChunk, n_ctx - i);
         const bool need = i + n > first;
-        if (!s->Evaluate(std::span<const std::int32_t>(ct + i, n), need ? &logits : nullptr, true, &error)) {
+        // Prompt passes, as serving prefills text.
+        if (!s->Evaluate(std::span<const std::int32_t>(ct + i, n), need ? &logits : nullptr, true, &error, true)) {
           std::fprintf(stderr, "kl failed: %s\n", error.c_str());
           return 1;
         }
@@ -402,7 +403,7 @@ int main(int argc, char** argv) {
         const std::size_t n = std::min<std::size_t>(hy4::Model::kMaxChunk, ppl - i);
         const std::span<const std::int32_t> part(prompt.data() + c0 + i, n);
         const bool need = i + n > ppl / 2;
-        if (!s->Evaluate(part, need ? &logits : nullptr, true, &error)) {
+        if (!s->Evaluate(part, need ? &logits : nullptr, true, &error, true)) {
           std::fprintf(stderr, "ppl failed: %s\n", error.c_str());
           return 1;
         }
