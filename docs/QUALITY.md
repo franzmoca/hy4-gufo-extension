@@ -78,6 +78,11 @@ with DFly2 and the vision sidecar:
 | `batch`, `prefill-scheduling` | passed (2026-11-20, after E48-E51) |
 | `tool-images` | passed but `tool_images_two_calls`: the model answers `red, blue` to "separated by a comma and no spaces" |
 
+Release 0.1.0 (2026-11-20), the `nix build` of this extension at Gufo
+`0a473ebf`, `--context 32768`: `conversation`, `long-context`, `cache`,
+`reasoning-budget`, `image-inputs`, `batch` and `prefill-scheduling` passed;
+`tools` and `tool-images` passed but the two cases above.
+
 After the prefill kernel work (E10-E16, 2026-11-20) and again after E17,
 `conversation`, `long-context` and `cache` gave the same results: all passed
 but the same `legacy-tool-cancel-disk` case. After E18 and E19 every case of

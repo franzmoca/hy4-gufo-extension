@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (2026-11-20)
+
+First release. Built on upstream Gufo `0a473ebf` (0.35.0 and later commits);
+needs extension API 0.3.29 or later.
 
 - Serve Tencent's Hy4 Flash (`hy_v4_flash`) from the Xylolabs Q4_K_M GGUF:
   chat, reasoning effort, tool calls and the prompt cache (RAM and disk). The
