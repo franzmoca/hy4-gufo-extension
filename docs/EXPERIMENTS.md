@@ -33,6 +33,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E25 | Indexer scores with a thread per group | retained |
 | E26 | Kpool selection by radix select and sort | retained |
 | E27 | Verify passes: routed experts in one launch, slots ordered by expert | retained |
+| E28 | Verify passes: four rows per warp in the float and grouped GEMVs | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -537,3 +538,32 @@ Server, DFly2 in every arm, fresh server each, ABBA, base `18ca509`
 | long context (4,192-token prompt) | 19.2 | 20.7 | +7.9% |
 
 Plain one-token decoding keeps the vendored launches. Retained.
+
+## E28: Verify passes: four rows per warp in the float and grouped GEMVs (2026-11-20)
+
+After E27 a 4-token verify pass spent 9.3 ms in the FP32 router and F16
+head GEMVs (`GemvFloat`) and 6.1 ms in the grouped Q8_0 `wk_b`/`wv_b` GEMV
+(`GemvQ8_0Grouped`), against 5.0 and 3.5 ms in a one-token step. Each warp
+computed one row for every token, so the pass reloaded the tokens'
+activations once per row. Unrolling the column loop alone gained nothing.
+
+With more than one token, a warp now computes four rows, loading each
+activation chunk once for all of them. Each row keeps its one-token
+arithmetic and reduction order, so results are bitwise those of one-token
+calls (unit tests for both kernels, multi-token against one-token calls;
+`--passcheck` 4 and 8 exact; KL unchanged). One-token decoding keeps one
+row per warp. 4-token pass (400-token prompt): head 5.0 → 3.4 ms, FP32
+GEMVs 4.3 → 2.1 ms, grouped GEMV 6.1 → 4.0 ms, 99.7 → 94.0 ms of kernels;
+the one-token step is unchanged at 56.3 ms.
+
+Server, DFly2 in every arm, fresh server each, ABBA, base `0f5b506`
+(tok/s, mean of two arms; replies and drafts identical in all four):
+
+| prompt | base | E28 | change |
+| --- | --- | --- | --- |
+| code | 29.7 | 31.5 | +5.9% |
+| prose | 18.4 | 18.9 | +3.1% |
+| list | 22.5 | 23.5 | +4.3% |
+| long context (4,192-token prompt) | 20.7 | 21.5 | +3.9% |
+
+Retained.

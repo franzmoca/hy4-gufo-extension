@@ -298,66 +298,103 @@ __device__ __forceinline__ void Load8<__half>(const __half* w, float* out) {
   }
 }
 
-
-// Warp per output row, all tokens (n <= kMaxTok) per weight read; k % 8 == 0
-// and rows 16-byte aligned.
-template <typename W>
-__global__ void GemvFloat(const W* w, const float* x, float* y, uint32_t m, uint32_t k, uint32_t n) {
+// R output rows per warp, all tokens (n <= kMaxTok) per weight read; k % 8 ==
+// 0 and rows 16-byte aligned. Each row sums as with R = 1; R > 1 shares each
+// activation load among R rows, which multi-token passes of a large matrix
+// (the LM head) are bound by.
+template<typename W, uint32_t R>
+__global__ void GemvFloat(const W* w, const float* x, float* y, uint32_t m,
+                          uint32_t k, uint32_t n) {
   const uint32_t lane = threadIdx.x % warpSize;
-  const uint32_t r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
-  if (r >= m) return;
-  const W* wr = w + (uint64_t)r * k;
-  float acc[kMaxTok];
-  for (uint32_t t = 0; t < kMaxTok; ++t) acc[t] = 0.0f;
+  const uint32_t r0 =
+      (blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize) * R;
+  if (r0 >= m)
+    return;
+  float acc[R][kMaxTok] = {};
   for (uint32_t i = lane * 8; i < k; i += warpSize * 8) {
-    float wv[8];
-    Load8<W>(wr + i, wv);
-    for (uint32_t t = 0; t < n; ++t) {
+    float wv[R][8];
+#pragma unroll
+    for (uint32_t j = 0; j < R; ++j)
+      Load8<W>(w + (uint64_t)min(r0 + j, m - 1) * k + i, wv[j]);
+#pragma unroll
+    for (uint32_t t = 0; t < kMaxTok; ++t) {
+      if (t >= n)
+        break;
       const float4 xa = *(const float4*)(x + (uint64_t)t * k + i);
       const float4 xb = *(const float4*)(x + (uint64_t)t * k + i + 4);
-      acc[t] += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w + wv[4] * xb.x + wv[5] * xb.y +
-                wv[6] * xb.z + wv[7] * xb.w;
+#pragma unroll
+      for (uint32_t j = 0; j < R; ++j)
+        acc[j][t] += wv[j][0] * xa.x + wv[j][1] * xa.y + wv[j][2] * xa.z +
+                     wv[j][3] * xa.w + wv[j][4] * xb.x + wv[j][5] * xb.y +
+                     wv[j][6] * xb.z + wv[j][7] * xb.w;
     }
   }
-  for (uint32_t t = 0; t < n; ++t) {
-    const float s = WarpSum(acc[t]);
-    if (lane == 0) y[(uint64_t)t * m + r] = s;
-  }
+#pragma unroll
+  for (uint32_t j = 0; j < R; ++j)
+#pragma unroll
+    for (uint32_t t = 0; t < kMaxTok; ++t) {
+      if (t >= n)
+        break;
+      const float s = WarpSum(acc[j][t]);
+      if (lane == 0 && r0 + j < m)
+        y[(uint64_t)t * m + r0 + j] = s;
+    }
 }
 
-// Warp per (row, group): each lane reads 4 quants (two 16-bit loads, the
-// quants sit at an even offset) so 8 lanes cover a Q8_0 block.
-__global__ void GemvQ8_0Grouped(const BlockQ8_0* w, const float* x, float* y, uint32_t m, uint32_t k,
-                                uint32_t n, uint64_t x_tok, uint64_t x_grp, uint64_t y_tok, uint64_t y_grp) {
+// R rows per warp of group blockIdx.y: each lane reads 4 quants (two 16-bit
+// loads, the quants sit at an even offset) so 8 lanes cover a Q8_0 block.
+// Each row sums as with R = 1; R > 1 shares the activation loads.
+template<uint32_t R>
+__global__ void GemvQ8_0Grouped(const BlockQ8_0* w, const float* x, float* y,
+                                uint32_t m, uint32_t k, uint32_t n,
+                                uint64_t x_tok, uint64_t x_grp, uint64_t y_tok,
+                                uint64_t y_grp) {
   const uint32_t lane = threadIdx.x % warpSize;
-  const uint32_t r = blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
+  const uint32_t r0 =
+      (blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize) * R;
   const uint32_t g = blockIdx.y;
-  if (r >= m) return;
+  if (r0 >= m)
+    return;
   const uint32_t nb = k / 32;
-  const BlockQ8_0* wr = w + ((uint64_t)g * m + r) * nb;
-  float acc[kMaxTok];
-  for (uint32_t t = 0; t < kMaxTok; ++t) acc[t] = 0.0f;
+  float acc[R][kMaxTok] = {};
   const uint32_t sub = lane % 8;          // 4-quant slice within a block
   for (uint32_t b = lane / 8; b < nb; b += warpSize / 8) {
-    const BlockQ8_0& blk = wr[b];
-    const float d = __half2float(blk.d);
-    const uint16_t* q16 = (const uint16_t*)blk.qs + sub * 2;
-    const uint16_t lo = q16[0];
-    const uint16_t hi = q16[1];
-    const float w0 = d * (float)(int8_t)(lo & 0xff);
-    const float w1 = d * (float)(int8_t)(lo >> 8);
-    const float w2 = d * (float)(int8_t)(hi & 0xff);
-    const float w3 = d * (float)(int8_t)(hi >> 8);
+    float wq[R][4];
+#pragma unroll
+    for (uint32_t j = 0; j < R; ++j) {
+      const BlockQ8_0& blk = w[((uint64_t)g * m + min(r0 + j, m - 1)) * nb + b];
+      const float d = __half2float(blk.d);
+      const uint16_t* q16 = (const uint16_t*)blk.qs + sub * 2;
+      const uint16_t lo = q16[0];
+      const uint16_t hi = q16[1];
+      wq[j][0] = d * (float)(int8_t)(lo & 0xff);
+      wq[j][1] = d * (float)(int8_t)(lo >> 8);
+      wq[j][2] = d * (float)(int8_t)(hi & 0xff);
+      wq[j][3] = d * (float)(int8_t)(hi >> 8);
+    }
     const uint32_t i = b * 32 + sub * 4;
-    for (uint32_t t = 0; t < n; ++t) {
+#pragma unroll
+    for (uint32_t t = 0; t < kMaxTok; ++t) {
+      if (t >= n)
+        break;
       const float* xt = x + t * x_tok + g * x_grp + i;
-      acc[t] += w0 * xt[0] + w1 * xt[1] + w2 * xt[2] + w3 * xt[3];
+      const float x0 = xt[0], x1 = xt[1], x2 = xt[2], x3 = xt[3];
+#pragma unroll
+      for (uint32_t j = 0; j < R; ++j)
+        acc[j][t] +=
+            wq[j][0] * x0 + wq[j][1] * x1 + wq[j][2] * x2 + wq[j][3] * x3;
     }
   }
-  for (uint32_t t = 0; t < n; ++t) {
-    const float s = WarpSum(acc[t]);
-    if (lane == 0) y[t * y_tok + g * y_grp + r] = s;
-  }
+#pragma unroll
+  for (uint32_t j = 0; j < R; ++j)
+#pragma unroll
+    for (uint32_t t = 0; t < kMaxTok; ++t) {
+      if (t >= n)
+        break;
+      const float s = WarpSum(acc[j][t]);
+      if (lane == 0 && r0 + j < m)
+        y[t * y_tok + g * y_grp + r0 + j] = s;
+    }
 }
 
 // --------------------------------------------------------------------- rope
@@ -1570,17 +1607,31 @@ int hy4_hc_init(const float* x, float* h, uint32_t n, uint32_t hc, uint32_t dim,
 int hy4_gemv_float(int type, const void* w, const float* x, float* y, uint32_t m, uint32_t k, uint32_t n,
                    hipStream_t stream) {
   if (k % 8) return 1;
-  const uint32_t blocks = (m + RowsPerBlock() - 1) / RowsPerBlock();
+  if (type != HY4_TYPE_F32 && type != HY4_TYPE_F16)
+    return 1;
   for (uint32_t t0 = 0; t0 < n; t0 += kMaxTok) {
     const uint32_t nt = n - t0 < kMaxTok ? n - t0 : kMaxTok;
+    const float* xt = x + (uint64_t)t0 * k;
+    float* yt = y + (uint64_t)t0 * m;
+    // Four rows per warp from two tokens on: the same sums, the activations
+    // loaded once per four rows.
+    const uint32_t rows = nt > 1 ? 4 : 1;
+    const uint32_t blocks =
+        (m + RowsPerBlock() * rows - 1) / (RowsPerBlock() * rows);
     if (type == HY4_TYPE_F32) {
-      GemvFloat<float><<<blocks, kBlock, 0, stream>>>((const float*)w, x + (uint64_t)t0 * k,
-                                                                  y + (uint64_t)t0 * m, m, k, nt);
-    } else if (type == HY4_TYPE_F16) {
-      GemvFloat<__half><<<blocks, kBlock, 0, stream>>>((const __half*)w, x + (uint64_t)t0 * k,
-                                                                   y + (uint64_t)t0 * m, m, k, nt);
+      if (rows == 4)
+        GemvFloat<float, 4>
+            <<<blocks, kBlock, 0, stream>>>((const float*)w, xt, yt, m, k, nt);
+      else
+        GemvFloat<float, 1>
+            <<<blocks, kBlock, 0, stream>>>((const float*)w, xt, yt, m, k, nt);
     } else {
-      return 1;
+      if (rows == 4)
+        GemvFloat<__half, 4>
+            <<<blocks, kBlock, 0, stream>>>((const __half*)w, xt, yt, m, k, nt);
+      else
+        GemvFloat<__half, 1>
+            <<<blocks, kBlock, 0, stream>>>((const __half*)w, xt, yt, m, k, nt);
     }
   }
   return Status();
@@ -1589,12 +1640,22 @@ int hy4_gemv_float(int type, const void* w, const float* x, float* y, uint32_t m
 int hy4_gemv_q8_0_grouped(const void* w, const float* x, float* y, uint32_t m, uint32_t k, uint32_t groups,
                           uint32_t n, uint64_t x_tok, uint64_t x_grp, uint64_t y_tok, uint64_t y_grp,
                           hipStream_t stream) {
-  if (k % 32) return 1;
-  const uint32_t blocks = (m + RowsPerBlock() - 1) / RowsPerBlock();
+  if (k % 32)
+    return 1;
   for (uint32_t t0 = 0; t0 < n; t0 += kMaxTok) {
     const uint32_t nt = n - t0 < kMaxTok ? n - t0 : kMaxTok;
-    GemvQ8_0Grouped<<<dim3(blocks, groups), kBlock, 0, stream>>>(
-        (const BlockQ8_0*)w, x + t0 * x_tok, y + t0 * y_tok, m, k, nt, x_tok, x_grp, y_tok, y_grp);
+    // Four rows per warp from two tokens on, as in hy4_gemv_float.
+    const uint32_t rows = nt > 1 ? 4 : 1;
+    const uint32_t blocks =
+        (m + RowsPerBlock() * rows - 1) / (RowsPerBlock() * rows);
+    if (rows == 4)
+      GemvQ8_0Grouped<4><<<dim3(blocks, groups), kBlock, 0, stream>>>(
+          (const BlockQ8_0*)w, x + t0 * x_tok, y + t0 * y_tok, m, k, nt, x_tok,
+          x_grp, y_tok, y_grp);
+    else
+      GemvQ8_0Grouped<1><<<dim3(blocks, groups), kBlock, 0, stream>>>(
+          (const BlockQ8_0*)w, x + t0 * x_tok, y + t0 * y_tok, m, k, nt, x_tok,
+          x_grp, y_tok, y_grp);
   }
   return Status();
 }

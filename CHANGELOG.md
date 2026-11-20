@@ -65,3 +65,7 @@
   launch with the tokens that share an expert back to back, with the same
   results as one-token decoding
   ([E27](docs/EXPERIMENTS.md#e27-verify-passes-routed-experts-in-one-launch-slots-ordered-by-expert-2026-11-20)).
+- DFly2 decoding a further 3-6% faster: a verify pass's float and grouped
+  GEMVs compute four rows per warp, with the same results as one-token
+  decoding
+  ([E28](docs/EXPERIMENTS.md#e28-verify-passes-four-rows-per-warp-in-the-float-and-grouped-gemvs-2026-11-20)).

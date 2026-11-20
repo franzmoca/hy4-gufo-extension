@@ -362,6 +362,19 @@ void TestGemv() {
       Near(Host(y, n * m), want, 1e-5,
            std::string("gemv_float ") + (type == HY4_TYPE_F32 ? "f32" : "f16") +
                " n=" + std::to_string(n));
+      // A multi-token call computes each token as a one-token call would.
+      const auto many = Host(y, n * m);
+      float* dx = Device(x);
+      bool same = true;
+      for (uint32_t t = 0; t < n; ++t) {
+        float* y1 = Device(std::vector<float>(m));
+        Expect(hy4_gemv_float(type, dw, dx + t * k, y1, m, k, 1, nullptr) == 0,
+               "gemv_float one-token status");
+        const auto one = Host(y1, m);
+        same &= std::memcmp(one.data(), many.data() + t * m, m * 4) == 0;
+      }
+      Expect(same,
+             "gemv_float tokens equal one-token calls n=" + std::to_string(n));
     }
   }
   Expect(hy4_gemv_float(HY4_TYPE_Q8_0, nullptr, nullptr, nullptr, 1, 8, 1,
@@ -389,6 +402,27 @@ void TestGemv() {
         want[t * y_tok + g * y_grp + r] = acc;
       }
   Near(Host(y, n * y_tok), want, 1e-5, "gemv_q8_0_grouped");
+  {  // Each token as a one-token call computes it, also with a partial row
+     // group (m = 62).
+    const uint32_t m2 = 62;
+    auto* dw = Device(w);
+    auto* dx = Device(x);
+    float* many = Device(std::vector<float>(n * y_tok, 7.0f));
+    Expect(hy4_gemv_q8_0_grouped(dw, dx, many, m2, kk, groups, n, x_tok, x_grp,
+                                 y_tok, y_grp, nullptr) == 0,
+           "gemv_q8_0_grouped many status");
+    const auto hm = Host(many, n * y_tok);
+    bool same = true;
+    for (uint32_t t = 0; t < n; ++t) {
+      float* one = Device(std::vector<float>(y_tok, 7.0f));
+      Expect(hy4_gemv_q8_0_grouped(dw, dx + t * x_tok, one, m2, kk, groups, 1,
+                                   x_tok, x_grp, y_tok, y_grp, nullptr) == 0,
+             "gemv_q8_0_grouped one status");
+      const auto ho = Host(one, y_tok);
+      same &= std::memcmp(ho.data(), hm.data() + t * y_tok, y_tok * 4) == 0;
+    }
+    Expect(same, "gemv_q8_0_grouped tokens equal one-token calls");
+  }
 
   // The prefill absorption at Hy4's shape (wk_b 512 x 192, rope 64), with a
   // partial token tile: [W . q_nope, q_rope] as binary16, q rounded to
