@@ -24,6 +24,10 @@ enum {
   HY4_TYPE_F8_E4M3 = 43,
 };
 
+/* dst[i] = src[ids[i]] for n rows of row_bytes bytes (a multiple of 4). */
+int hy4_gather_rows(const void* src, uint64_t row_bytes, const int32_t* ids,
+                    uint32_t n, void* dst, hipStream_t stream);
+
 /* out[t, 0:dim] = row tokens[t] of a Q8_0 table [rows][dim]. */
 int hy4_embed_q8_0(const void* table, const int32_t* tokens, uint32_t n, uint32_t dim, float* out,
                    hipStream_t stream);

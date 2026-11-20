@@ -84,6 +84,14 @@ int Status() { return hipGetLastError() == hipSuccess ? 0 : 1; }
 
 // ---------------------------------------------------------------- embedding
 
+__global__ void GatherRows(const uint32_t* src, uint64_t words,
+                           const int32_t* ids, uint32_t* dst) {
+  const uint32_t* row = src + (uint64_t)ids[blockIdx.x] * words;
+  uint32_t* out = dst + (uint64_t)blockIdx.x * words;
+  for (uint64_t i = threadIdx.x; i < words; i += blockDim.x)
+    out[i] = row[i];
+}
+
 __global__ void EmbedQ8_0(const BlockQ8_0* table, const int32_t* tokens, uint32_t dim, float* out) {
   const uint32_t t = blockIdx.x;
   const BlockQ8_0* row = table + (uint64_t)tokens[t] * (dim / 32);
@@ -1715,6 +1723,17 @@ uint32_t Blocks(uint64_t count, uint32_t cap = 4096) {
 }  // namespace
 
 extern "C" {
+
+int hy4_gather_rows(const void* src, uint64_t row_bytes, const int32_t* ids,
+                    uint32_t n, void* dst, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (row_bytes % 4)
+    return 1;
+  GatherRows<<<n, kBlock, 0, stream>>>((const uint32_t*)src, row_bytes / 4, ids,
+                                       (uint32_t*)dst);
+  return Status();
+}
 
 int hy4_embed_q8_0(const void* table, const int32_t* tokens, uint32_t n, uint32_t dim, float* out,
                    hipStream_t stream) {

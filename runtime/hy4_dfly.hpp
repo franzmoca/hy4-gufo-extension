@@ -60,6 +60,18 @@ private:
   // The target's LM head for drafts: a Q8_0 copy of a binary16 head (half the
   // bytes per draft), else the target's own.
   Tensor head_;
+  // Drafts score the head's first head_rows_ rows (the BPE's earlier, more
+  // frequent tokens) and a table of the later rows whose tokens the session
+  // holds (SyncTable), in head_rows_ + table_ids_.size() logits.
+  std::uint32_t head_rows_ = 0;
+  std::uint64_t row_bytes_ = 0;
+  std::uint32_t table_capacity_ = 0;
+  void* table_ = nullptr;                // [table_capacity_] head rows
+  std::vector<std::int32_t> table_ids_;  // token of each table row
+  std::vector<std::uint8_t> in_table_;   // [n_vocab]
+  std::size_t table_synced_ = 0;         // history tokens the table covers
+  const Session* table_session_ = nullptr;
+  [[nodiscard]] bool SyncTable(const Session& session, std::string* error);
   float confidence_b_ = 0.0f;
   std::int32_t mask_token_ = 0;
   std::unique_ptr<Buffers> buf_;

@@ -40,6 +40,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E32 | Sampled drafts from the drafter's distribution | rejected |
 | E33 | Prompt lookup | retained |
 | E34 | 16-token verify passes for copies | retained |
+| E35 | A smaller draft head: the frequent rows and the request's own | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -841,4 +842,43 @@ Gufo's `conversation`, `long-context`, `cache`, `tools` and
 and `reasoning-budget` without a drafter, pass every case except `tools`'
 `auto-tools` length check, which fails the same way on the base build (the
 model's 11-token tool call finishes inside the case's 12-token limit).
+Retained.
+
+## E35: A smaller draft head: the frequent rows and the request's own (2026-11-20)
+
+Each DFly2 slot read the whole Q8_0 head copy (120,832 rows, 394 MB, about
+1.6 ms). Drafts now score its first 65,536 rows (the BPE's earlier merges,
+the more frequent tokens) and a table of the later rows whose tokens the
+session holds, gathered on the device as the history grows (`hy4_gather_rows`,
+up to 16,384 rows, 53 MB) and rebuilt when the history is replaced; the
+argmax runs over both and the host maps a table index back to its token. A
+token outside both cannot be drafted, which costs acceptance, never output.
+
+Offline, from the tokenized replies of the file edit, the standard prompts
+and the 53-request agent recording, the share of reply tokens outside the
+prefix and the request's earlier tokens:
+
+| prefix | file edit | standard prompts | agent |
+| --- | --- | --- | --- |
+| 32,768 | 0% | 4.4% | 1.9% |
+| 65,536 | 0% | 1.5-1.7% | 0.8% |
+
+Three standard prompts, greedy and seeds 1-3 at the default sampling, in
+mirrored order (full, 32,768, 65,536, 65,536, 32,768, full), a fresh server
+each; every reply is identical in all arms, and each arm's two runs agree
+within 0.4%:
+
+| head | draft per cycle | accepted | tok/s vs full (geomean) |
+| --- | --- | --- | --- |
+| full | 10.7 ms | 1,594 / 2,568 | |
+| 32,768 + table | 7.8 ms | 1,570 / 2,623 | +1.0% |
+| 65,536 + table | 8.9 ms | 1,586 / 2,593 | +1.25% (greedy +1.2%, sampled +1.3%) |
+
+The agent recording, full / 65,536 / 65,536 / full: decode 121.7 → 119.75 s
+(-1.6%) in both pairs, 53 of 53 replies identical. The drafter's resident
+memory grows from 1.29 to 1.35 GB; a 1,048,576-token session with DFly2 and
+vision loads and answers (4.4 GB of the device heap free after load).
+Gufo's `conversation`, `long-context` and `cache` suites pass every case.
+Scripts and per-request numbers:
+[artifacts/2026-11-20-draft-vocab/](artifacts/2026-11-20-draft-vocab/).
 Retained.

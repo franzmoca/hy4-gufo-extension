@@ -33,6 +33,12 @@ namespace {
 
 constexpr std::uint32_t kHidden = 3072;
 constexpr std::uint32_t kInter = 9216;
+// Drafts score the head's first kHeadPrefix rows (the BPE's earlier, more
+// frequent tokens) and up to kTableRows later rows whose tokens the session
+// holds (53 MB): a slot reads 214 MB of the head plus its table instead of 394
+// (E35).
+constexpr std::uint32_t kHeadPrefix = 65536;
+constexpr std::uint32_t kTableRows = 16384;
 constexpr std::uint32_t kHeads = 32;
 constexpr std::uint32_t kQLora = 1024;
 constexpr std::uint32_t kKvLora = 512;
@@ -165,6 +171,7 @@ struct Drafter::Buffers {
   std::int32_t* iota = nullptr;    // [max selection] 0, 1, ...
   std::int32_t* prev = nullptr;    // [1] the token before the slot
   std::int32_t* best = nullptr;    // [1] the slot's draft
+  std::int32_t* table_new = nullptr;  // [table_capacity_] tokens to add
   float* best_work = nullptr;      // hy4_argmax_work_floats()
   float* conf = nullptr;           // [1] confidence logit
   float* x = nullptr;              // [kBlock][hidden] residual
@@ -198,12 +205,16 @@ struct Drafter::HostIo {
   std::int32_t prev;
   float conf;
   std::int32_t best;
+  std::int32_t* table_new;  // [table_capacity_] pinned, tokens to add
 };
 
 Drafter::~Drafter() {
   for (void* p : allocations_) (void)hipFree(p);
-  if (io_)
+  if (io_) {
+    if (io_->table_new)
+      (void)hipHostFree(io_->table_new);
     (void)hipHostFree(io_);
+  }
 }
 
 std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, std::string* error) {
@@ -367,6 +378,7 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
     Fail(error, "hy4 dfly: pinned allocation failed");
     return nullptr;
   }
+  d->io_->table_new = nullptr;
   const Tensor& out = target.weights().output;
   d->head_ = out;
   if (out.type == HY4_TYPE_F16 && out.dims.size() >= 2 &&
@@ -388,6 +400,24 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
     d->head_.type = HY4_TYPE_Q8_0;
     d->resident_bytes_ += blocks * sizeof(BlockQ8);
   }
+  d->head_rows_ = c.n_vocab;
+  if (d->head_.type == HY4_TYPE_Q8_0 && kHeadPrefix < c.n_vocab) {
+    d->head_rows_ = kHeadPrefix;
+    d->row_bytes_ = std::uint64_t{kHidden} / 32 * sizeof(BlockQ8);
+    d->table_capacity_ =
+        std::min<std::uint32_t>(kTableRows, c.n_vocab - kHeadPrefix);
+    if (!DeviceAlloc(reinterpret_cast<std::uint8_t**>(&d->table_),
+                     d->table_capacity_ * d->row_bytes_, own) ||
+        !DeviceAlloc(&b.table_new, d->table_capacity_, own) ||
+        hipHostMalloc(reinterpret_cast<void**>(&d->io_->table_new),
+                      d->table_capacity_ * sizeof(std::int32_t)) !=
+            hipSuccess) {
+      Fail(error, "hy4 dfly: head table allocation failed");
+      return nullptr;
+    }
+    d->in_table_.assign(c.n_vocab, 0);
+    d->resident_bytes_ += d->table_capacity_ * d->row_bytes_;
+  }
   std::vector<std::int32_t> iota(b.max_sel);
   std::iota(iota.begin(), iota.end(), 0);
   if (hipMemcpy(b.iota, iota.data(), iota.size() * sizeof(std::int32_t), hipMemcpyHostToDevice) != hipSuccess) {
@@ -395,6 +425,42 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
     return nullptr;
   }
   return d;
+}
+
+bool Drafter::SyncTable(const Session& session, std::string* error) {
+  if (table_capacity_ == 0)
+    return true;
+  const std::vector<std::int32_t>& history = session.History();
+  if (&session != table_session_ || history.size() < table_synced_) {
+    for (const std::int32_t t : table_ids_)
+      in_table_[t] = 0;
+    table_ids_.clear();
+    table_synced_ = 0;
+    table_session_ = &session;
+  }
+  std::uint32_t added = 0;
+  const auto vocab = static_cast<std::int32_t>(in_table_.size());
+  for (std::size_t i = table_synced_; i < history.size(); ++i) {
+    const std::int32_t t = history[i];
+    if (t < static_cast<std::int32_t>(head_rows_) || t >= vocab || in_table_[t])
+      continue;
+    if (table_ids_.size() + added == table_capacity_)
+      break;
+    in_table_[t] = 1;
+    io_->table_new[added++] = t;
+  }
+  table_synced_ = history.size();
+  if (added == 0)
+    return true;
+  hipStream_t st = target_.stream();
+  HY4_CHECK(hipMemcpyAsync(buf_->table_new, io_->table_new,
+                           added * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                           st));
+  HY4_CHECK(hy4_gather_rows(
+      head_.data, row_bytes_, buf_->table_new, added,
+      static_cast<std::uint8_t*>(table_) + table_ids_.size() * row_bytes_, st));
+  table_ids_.insert(table_ids_.end(), io_->table_new, io_->table_new + added);
+  return true;
 }
 
 bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t count, float min_accept,
@@ -413,6 +479,8 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
   const std::uint32_t a = session.Position();  // the anchor's position
   if (a == 0) return Fail(error, "hy4 dfly: no frontier to draft from");
   const std::int32_t frontier = static_cast<std::int32_t>(a) - 1;
+  if (!SyncTable(session, error))
+    return false;
 
   std::int32_t tokens[kBlock];
   std::int32_t pos[kBlock];
@@ -522,13 +590,25 @@ bool Drafter::Draft(const Session& session, std::int32_t anchor, std::uint32_t c
     HY4_CHECK(hipStreamSynchronize(st));
     accept *= 1.0f / (1.0f + std::exp(-(io.conf + confidence_b_)));
     if (accept < min_accept) break;
-    if (!MatVec(head_, b.hk, b.logits, c.n_vocab, kHidden, 1, ex, error))
+    const auto table_rows = static_cast<std::uint32_t>(table_ids_.size());
+    Tensor prefix = head_;
+    prefix.dims = {kHidden, head_rows_};
+    if (!MatVec(prefix, b.hk, b.logits, head_rows_, kHidden, 1, ex, error))
       return false;
-    HY4_CHECK(hy4_argmax(b.logits, c.n_vocab, b.best_work, b.best, st));
+    if (table_rows) {
+      const Tensor table{table_, head_.type, {kHidden, table_rows}};
+      if (!MatVec(table, b.hk, b.logits + head_rows_, table_rows, kHidden, 1,
+                  ex, error))
+        return false;
+    }
+    HY4_CHECK(
+        hy4_argmax(b.logits, head_rows_ + table_rows, b.best_work, b.best, st));
     HY4_CHECK(hipMemcpyAsync(&io.best, b.best, sizeof io.best,
                              hipMemcpyDeviceToHost, st));
     HY4_CHECK(hipStreamSynchronize(st));
-    prev = io.best;
+    prev = static_cast<std::uint32_t>(io.best) < head_rows_
+               ? io.best
+               : table_ids_[io.best - head_rows_];
     drafts->push_back(prev);
   }
   return true;

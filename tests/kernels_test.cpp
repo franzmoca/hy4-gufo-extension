@@ -971,6 +971,25 @@ void TestQuantizeHalf() {
          "quantize_q8_0_half (" + std::to_string(mismatches) + " mismatches)");
 }
 
+void TestGatherRows() {
+  const uint32_t rows = 50, words = 816;  // a 3,072-wide Q8_0 row
+  std::vector<uint32_t> src(rows * words);
+  for (std::size_t i = 0; i < src.size(); ++i)
+    src[i] = (uint32_t)(i * 2654435761u);
+  const std::vector<int32_t> ids = {49, 0, 7, 7, 31};
+  uint32_t* dst = Device(std::vector<uint32_t>(ids.size() * words));
+  Expect(hy4_gather_rows(Device(src), words * 4, Device(ids),
+                         (uint32_t)ids.size(), dst, nullptr) == 0,
+         "gather_rows status");
+  const auto got = Host(dst, ids.size() * words);
+  int mismatches = 0;
+  for (std::size_t r = 0; r < ids.size(); ++r)
+    for (uint32_t w = 0; w < words; ++w)
+      mismatches += got[r * words + w] != src[ids[r] * words + w];
+  Expect(mismatches == 0,
+         "gather_rows (" + std::to_string(mismatches) + " mismatches)");
+}
+
 void TestRoute() {
   const uint32_t n = 3, experts = 192, k = 8;
   const float scale = 2.5f;
@@ -1662,6 +1681,7 @@ int main() {
   TestRows();
   TestArgmax();
   TestQuantizeHalf();
+  TestGatherRows();
   TestElementwise();
   TestRoute();
   TestEngram();

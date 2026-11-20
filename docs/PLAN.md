@@ -89,8 +89,9 @@ Not needed: expert streaming. The trunk is resident.
 
 ## Memory budget (124 GiB host)
 
-- Trunk 91.1 GiB (97.8 GB), vision 1 GB, DFly2 1.3 GB at Q8_0 (0.9 GB of
-  layers and, since E31, a 394 MB copy of the LM head for drafts).
+- Trunk 91.1 GiB (97.8 GB), vision 1 GB, DFly2 1.35 GB at Q8_0 (0.9 GB of
+  layers and, since E31, a 394 MB copy of the LM head for drafts, plus E35's
+  53 MB table of a request's rare-token rows).
 - KV (binary16 since E30): the 12 sparse layers × 576 × 2 bytes come to
   13.8 KB per token; the indexer's pooled keys add 1.5 KB and its score buffer
   2 KB, about 17.4 KB per token of session context (18 GB at 1M). The 30 SWA
@@ -255,7 +256,8 @@ These are judgment calls made without the maintainer; revisit any of them.
     the target's pair layout at the sparse base (1e7). Slot k >= 1 predicts
     a + k: its final-normed hidden plus the hidden correction on the previous
     token's embedding (the anchor, then slot k - 1's draft), through the
-    target's LM head (its Q8_0 copy). The confidence head sets the draft
+    target's LM head (its Q8_0 copy: the first 65,536 rows and the request's
+    own later tokens, E35). The confidence head sets the draft
     length (decision 18), read before the head so the slot it stops at skips
     it. Drafts are the head's argmax at any temperature: drawing them from
     the drafter's distribution did not emit more tokens per pass (E32).
@@ -563,8 +565,9 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   every slot read the binary16 LM head) and about 60 ms + 9.7 ms per draft
   of verification. The five draft layers over the block are most of what is
   left (about 5 ms of Q8_0 GEMVs at about 200 GB/s); each slot adds the
-  correction MLP, the Q8_0 head (about 1.7 ms) and two host
-  synchronizations. Sampled requests spend 1.8 ms per cycle on the host
+  correction MLP, the Q8_0 head (about 1.7 ms; about 0.9 ms since E35
+  scores its first 65,536 rows and the request's own later ones) and two
+  host synchronizations. Sampled requests spend 1.8 ms per cycle on the host
   sampler, which device draws could recover.
 
 - **Prompt lookup** (E33-E34, 2026-11-20). Before drafting, a step copies
