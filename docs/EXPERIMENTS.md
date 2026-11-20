@@ -49,6 +49,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E41 | Prefill attention: staging loads in flight together, paired value reads | retained |
 | E42 | Prefill attention: interleaved score chains | retained |
 | E43 | 8,192-token prefill passes for contexts up to 256K | retained |
+| E44 | Rope angles shared across heads | rejected |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1057,3 +1058,18 @@ device heap free, 3.10 before: the wider indexer ring).
 Gufo's `conversation`, `long-context`, `cache` and `prefill-scheduling`
 suites pass every case at a 32,768-token context (the harness's measurement
 check reports DFly2 drafts on AR requests, as at E37).
+
+## E44: Rope angles shared across heads (2026-11-20)
+
+`Rope` computes `powf` and `sincosf` per head although the angle depends
+only on the token and the pair. One thread per pair of eight heads, the
+angle computed once: `Rope` took 115 ms of a 3,712-token prefill against 80
+(an eighth of the threads to hide the memory latency), and the logits moved
+(KL 0.08317 against 0.08424). Rejected.
+
+After E41-E43 the cheap levers that E40 listed are spent: a 3,712-token
+prefill runs at about 920 tok/s, 8,192 tokens at 936. The rest is in the
+dense and routed FP16 GEMMs (about 60% of the time, at 60-65% of the
+matrix cores' peak, no phase dominant) and the attention's barriers and
+softmax; closing the gap to 1,000 tok/s needs a GEMM redesign (deeper K
+stages or a different wave layout) rather than another local fix.
