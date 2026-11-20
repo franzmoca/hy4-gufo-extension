@@ -67,6 +67,15 @@ bool HostAlloc(T** p, std::size_t count, std::vector<void*>* owned) {
   return true;
 }
 
+// Bytes of one expert's [dims[1]][dims[0]] matrix of a 3-D expert tensor.
+std::uint64_t ExpertBytes(const Tensor& w) {
+  const std::uint64_t block = w.type == HY4_TYPE_Q8_0   ? 34
+                              : w.type == HY4_TYPE_Q4_K ? 144
+                                                        : 210;
+  const std::uint64_t values = w.type == HY4_TYPE_Q8_0 ? 32 : 256;
+  return w.dims[0] * w.dims[1] / values * block;
+}
+
 }  // namespace
 
 bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uint32_t k, std::uint32_t n,
@@ -97,6 +106,10 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uin
     case HY4_TYPE_Q4_K:
     case HY4_TYPE_Q6_K:
       if (k % 256 == 0) {
+        if (batched && m % 16 == 0) {
+          HY4_CHECK(hy4_f16_dense(w.type, w.data, x, y, m, n, k, 1, 0, stream));
+          return true;
+        }
         if (batched) {
           HY4_CHECK(hy4_mmq_dense_typed(w.type, w.data, x, y, static_cast<int>(m), static_cast<int>(n),
                                         static_cast<int>(k), stream));
@@ -123,12 +136,11 @@ bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
   const bool quantized = w1.type == HY4_TYPE_Q8_0 || w1.type == HY4_TYPE_Q4_K ||
                          w1.type == HY4_TYPE_Q6_K;
   if (n > Model::kVecMax && quantized && w2.type == w1.type && k % 256 == 0 &&
-      w1.dims.size() >= 2 && w1.dims[0] == k && w1.dims[1] == m1 &&
-      w2.dims.size() >= 2 && w2.dims[0] == k && w2.dims[1] == m2) {
-    HY4_CHECK(hy4_mmq_dense_pair_typed(
-        w1.type, w1.data, y1, static_cast<int>(m1), w2.data, y2,
-        static_cast<int>(m2), x, static_cast<int>(n), static_cast<int>(k),
-        ex.stream));
+      m1 % 16 == 0 && m2 % 16 == 0 && w1.dims.size() >= 2 && w1.dims[0] == k &&
+      w1.dims[1] == m1 && w2.dims.size() >= 2 && w2.dims[0] == k &&
+      w2.dims[1] == m2) {
+    HY4_CHECK(hy4_f16_dense_pair(w1.type, w1.data, y1, m1, w2.data, y2, m2, x,
+                                 n, k, 0, ex.stream));
     return true;
   }
   return MatVec(w1, x, y1, m1, k, n, ex, error) &&
@@ -146,6 +158,8 @@ bool Model::AllocScratch(std::string* error) {
   const std::size_t ffn = std::max<std::size_t>(std::size_t{c.n_ff_dense} * n,
                                                 std::size_t{c.n_expert_used} * n *
                                                     std::max(c.n_ff_exp, c.n_latent));
+  const std::size_t slots = std::size_t{c.n_expert_used} * n;
+  const std::size_t plan = slots + c.n_expert + 1 + slots / 128 + c.n_expert;
   scratch_ = std::make_unique<Scratch>();
   Scratch& s = *scratch_;
   auto* owned = &allocations_;
@@ -189,8 +203,8 @@ bool Model::AllocScratch(std::string* error) {
       DeviceAlloc(&s.logits_r, std::size_t{n} * c.n_expert, owned) &&
       DeviceAlloc(&s.ids, std::size_t{n} * c.n_expert_used, owned) &&
       HostAlloc(&s.ids_host, std::size_t{n} * c.n_expert_used, owned) &&
-      DeviceAlloc(&s.expert_class, c.n_expert, owned) &&
-      HostAlloc(&s.expert_class_host, c.n_expert, owned) &&
+      DeviceAlloc(&s.route_plan, plan, owned) &&
+      HostAlloc(&s.route_plan_host, plan, owned) &&
       DeviceAlloc(&s.route_w, std::size_t{n} * c.n_expert_used, owned) &&
       DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) &&
       DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
@@ -660,9 +674,8 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
                               c.kv_lora, st));
   }
   if (n > Model::kVecMax) {
-    HY4_CHECK(hy4_mmq_dense_grouped_typed(l.wv_b.type, l.wv_b.data, s.att, s.attv, static_cast<int>(c.head_v),
-                                          static_cast<int>(n), static_cast<int>(c.kv_lora), static_cast<int>(heads),
-                                          st));
+    HY4_CHECK(hy4_f16_dense(l.wv_b.type, l.wv_b.data, s.att, s.attv, c.head_v,
+                            n, c.kv_lora, heads, 0, st));
   } else {
     HY4_CHECK(hy4_gemv_q8_0_grouped(l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
                                     std::uint64_t{heads} * c.kv_lora, c.kv_lora, std::uint64_t{heads} * c.head_v,
@@ -783,30 +796,34 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex, error)) return false;
   if (n > Model::kVecMax) {
     if (l.gate_exps.type != l.up_exps.type) return Fail(error, "hy4: gate and up experts differ in type");
-    // Bound the routed grids by the real expert buckets (results unchanged).
-    HY4_CHECK(hipMemcpyAsync(s.ids_host, s.ids, std::size_t{n} * used * sizeof(std::int32_t), hipMemcpyDeviceToHost,
-                             st));
+    // The routed plan: slots grouped by expert in 128-slot tiles.
+    const std::uint32_t slots = n * used;
+    HY4_CHECK(hipMemcpyAsync(s.ids_host, s.ids,
+                             std::size_t{slots} * sizeof(std::int32_t),
+                             hipMemcpyDeviceToHost, st));
     HY4_CHECK(hipStreamSynchronize(st));
-    std::vector<unsigned int> counts(c.n_expert, 0);
-    for (std::uint32_t i = 0; i < n * used; ++i) ++counts[static_cast<std::uint32_t>(s.ids_host[i]) % c.n_expert];
-    hy4_mmq_set_routed_max_expert_rows(static_cast<int>(*std::max_element(counts.begin(), counts.end())));
-    // A column-tile width per expert, from its bucket size.
-    int widths[3], max_rows[3];
-    const int n_classes = hy4_mmq_routed_classes_for_counts(
-        counts.data(), static_cast<int>(c.n_expert), s.expert_class_host,
-        widths, max_rows);
-    HY4_CHECK(hipMemcpyAsync(s.expert_class, s.expert_class_host, c.n_expert,
-                             hipMemcpyHostToDevice, st));
-    hy4_mmq_set_routed_classes(s.expert_class, n_classes, widths, max_rows);
-    HY4_CHECK(hy4_mmq_moe_swiglu_typed(l.gate_exps.type, l.gate_exps.data, l.up_exps.data, s.latent, s.ids,
-                                       s.route_w, s.ffn_a, s.ffn_c, static_cast<int>(f),
-                                       static_cast<int>(c.n_latent), static_cast<int>(n),
-                                       static_cast<int>(c.n_expert), static_cast<int>(used), c.swiglu_clamp[il], st));
-    HY4_CHECK(hy4_mmq_moe_typed(l.down_exps.type, l.down_exps.data, s.ffn_c, s.ids, s.ffn_a,
-                                static_cast<int>(c.n_latent), static_cast<int>(f), static_cast<int>(n * used),
-                                static_cast<int>(c.n_expert), 1, st));
-    hy4_mmq_set_routed_max_expert_rows(0);
-    hy4_mmq_set_routed_classes(nullptr, 0, nullptr, nullptr);
+    std::int32_t* rows = s.route_plan_host;
+    std::int32_t* bounds = rows + slots;
+    std::int32_t* tiles = bounds + c.n_expert + 1;
+    const std::uint32_t n_tiles =
+        hy4_f16_routed_plan(s.ids_host, slots, c.n_expert, rows, bounds, tiles);
+    const std::size_t plan = std::size_t{slots} + c.n_expert + 1 + n_tiles;
+    HY4_CHECK(hipMemcpyAsync(s.route_plan, s.route_plan_host,
+                             plan * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                             st));
+    const std::int32_t* d_rows = s.route_plan;
+    const std::int32_t* d_bounds = d_rows + slots;
+    const std::int32_t* d_tiles = d_bounds + c.n_expert + 1;
+    // Gate and up with SwiGLU into FP16 rows (in ffn_c), then down.
+    auto* mid = reinterpret_cast<std::uint16_t*>(s.ffn_c);
+    HY4_CHECK(hy4_f16_routed(l.gate_exps.type, l.gate_exps.data, l.up_exps.data,
+                             ExpertBytes(l.gate_exps), s.latent, used, d_rows,
+                             d_bounds, d_tiles, n_tiles, s.route_w,
+                             c.swiglu_clamp[il], mid, f, c.n_latent, st));
+    HY4_CHECK(hy4_f16_routed(l.down_exps.type, l.down_exps.data, nullptr,
+                             ExpertBytes(l.down_exps), mid, 1, d_rows, d_bounds,
+                             d_tiles, n_tiles, nullptr, 0.0f, s.ffn_a,
+                             c.n_latent, f, st));
     HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
     if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
     HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));

@@ -219,6 +219,46 @@ int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64
 int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t stream);
 int hy4_argmax(const float* x, uint32_t n, uint32_t dim, int32_t* out, hipStream_t stream);
 
+/* Batched Q8_0, Q4_K and Q6_K projections on the FP16 matrix cores
+ * (hy4_f16_mm.hip.cpp). For each group z < groups, out[t, z m + r] =
+ * W_z[r] . x[t, z k : z k + k] over n tokens, W_z the z-th [m][k] matrix
+ * stored back to back; x rows hold groups * k floats, rounded to FP16 as they
+ * are staged, and out rows groups * m floats; non-finite outputs read as 0.
+ * With HY4_F16_X_HALF the x rows are FP16 bits, with HY4_F16_OUT_HALF the out
+ * rows are FP16 (rounded from the FP32 sums). m must be a multiple of 16 and
+ * k of 256; returns 1 otherwise or for other types. */
+#define HY4_F16_X_HALF 1u
+#define HY4_F16_OUT_HALF 2u
+int hy4_f16_dense(int type, const void* w, const void* x, void* out, uint32_t m,
+                  uint32_t n, uint32_t k, uint32_t groups, uint32_t io,
+                  hipStream_t stream);
+/* out1 = W1 x and out2 = W2 x in one launch, the same results as two
+ * hy4_f16_dense calls of one group: W1 [m1][k] and W2 [m2][k] of one type. */
+int hy4_f16_dense_pair(int type, const void* w1, void* out1, uint32_t m1,
+                       const void* w2, void* out2, uint32_t m2, const void* x,
+                       uint32_t n, uint32_t k, uint32_t io, hipStream_t stream);
+/* Batched routed experts on the FP16 matrix cores. rows lists the slots
+ * grouped by expert, expert e owning rows[bounds[e] .. bounds[e + 1]), and
+ * tiles[0:n_tiles] names 128 of them each as expert | index << 16 (see
+ * hy4_f16_routed_plan); entries < 0 are skipped. A slot s reads x row
+ * s / x_div; expert e's matrices start e * expert_bytes into w (and w_up).
+ * With w_up, x is FP32 and y (FP16 bits) [s, r] = route_w[s] *
+ * silu(min(gate, limit)) * clamp(up, +-limit) (no clamp for limit <= 0);
+ * without it, x is FP16 bits and y (FP32) [s, r] = (W x)[r]. Non-finite
+ * products read as 0. */
+int hy4_f16_routed(int type, const void* w, const void* w_up,
+                   uint64_t expert_bytes, const void* x, uint32_t x_div,
+                   const int32_t* rows, const int32_t* bounds,
+                   const int32_t* tiles, uint32_t n_tiles, const float* route_w,
+                   float limit, void* y, uint32_t m, uint32_t k,
+                   hipStream_t stream);
+/* Host side: rows[slots], bounds[n_experts + 1] and tiles (at most
+ * slots / 128 + n_experts entries) from the slot experts ids[slots]; ids
+ * outside 0 .. n_experts - 1 are skipped. Returns the tile count. */
+uint32_t hy4_f16_routed_plan(const int32_t* ids, uint32_t slots,
+                             uint32_t n_experts, int32_t* rows, int32_t* bounds,
+                             int32_t* tiles);
+
 #ifdef __cplusplus
 }
 #endif

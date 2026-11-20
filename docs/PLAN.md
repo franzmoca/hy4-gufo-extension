@@ -488,19 +488,23 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   Then E12-E16: hyper-connection mix 8 tokens per block, paired projections
   quantized once, the attention softmax on every thread, keys converted to
   binary16 once per pass, a routed tile width per expert: 8.24 → 7.18 s.
+  FP16 matrix-core kernels for every quantized projection and the routed
+  experts instead of MMQ: 7.18 → 5.58 s (E17).
 
-- **Prefill profile after E16** (3,712 tokens, 7.0 s of kernels): vendored
-  MMQ 4.3 s (Q8_0 dense 1.72 s at high efficiency; routed Q4_K/Q6_K 2.6 s,
-  limited by padding and compute rather than weight reloads, E16), the
-  attention 0.66 s, activation quantization 0.42 s, the indexer score 0.18 s
-  (bound by its warp sums; a faster form changes the summation order, which
-  the selection's near ties are sensitive to), the FP32 router GEMM 0.2 s,
-  hyper-connection kernels 0.43 s, the attention gate 0.12 s. Candidates:
-  fuse the attention gate's sigmoid product into the `wo` input quantization
-  (needs a pre-quantized MMQ entry), fuse `HcPost` into the next `HcMix`
-  (both read the four streams), and in the attention a conflict-free value
-  transpose (staging is now cheap; P.V is about 20% of the kernel). Register
-  prefetch of key tiles does not fit beside the query fragments (E15).
+- **Prefill profile after E17** (3,712 tokens, 5.35 s of kernels): dense
+  FP16 projections 1.87 s (27-33 TFLOPS standalone; `wo` and `attn_gate` are
+  most of it), routed experts 1.36 s (gate/up 0.87 s at about 28 TFLOPS),
+  the attention 0.66 s, the FP32 router GEMM 0.2 s, hyper-connection kernels
+  0.43 s, the indexer score 0.17 s (bound by its warp sums; a faster form
+  changes the summation order, which the selection's near ties are sensitive
+  to), the attention gate 0.12 s. Candidates: the grouped `wv_b` runs at
+  6.7 TFLOPS (k = 512: two weight blocks per row, so the staging pipeline
+  never fills; FP16 attention output from `MlaPrefill` would halve its
+  reads); fold the attention gate's sigmoid product into the `wo` staging;
+  fuse `HcPost` into the next `HcMix` (both read the four streams); in the
+  attention a conflict-free value transpose (P.V is about 20% of the
+  kernel). Register prefetch of key tiles does not fit beside the query
+  fragments (E15).
 
 - **Designs to borrow for the prefill attention.** ds41's
   `attention_f16_kernel` (`ds41_v41.hip.cpp`) is the same MLA shape: block
@@ -545,7 +549,12 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   differing means the dense projections and experts vary with the pass width
   too, not only attention: bisect layer 0's operations with the probe before
   choosing which kernels to make row-independent. After E7 layer 0 matches
-  across splits; the first difference is in layer 1 (0.0026).
+  across splits; the first difference is in layer 1 (0.0026). Since E17
+  batched passes are split-invariant (`--chunkcheck` 200 and 517: identical
+  logits); a pass of 8 or fewer tokens still takes the single-token MMQ
+  kernels (`--chunkcheck 995`: KL 0.0028). Running those passes through the
+  FP16 kernels too would close it, if the 2-8 token cost allows; one-token
+  decoding would then have to match them for `--passcheck`.
 
 - Sparse layers score every earlier key and mask all but the 2,048 selected
   (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per

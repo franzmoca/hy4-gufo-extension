@@ -35,3 +35,8 @@
   [E14](docs/EXPERIMENTS.md#e14-prefill-attention-softmax-on-every-thread-2026-11-19),
   [E15](docs/EXPERIMENTS.md#e15-prefill-attention-keys-as-binary16-once-per-pass-2026-11-20),
   [E16](docs/EXPERIMENTS.md#e16-routed-expert-tile-width-per-expert-2026-11-20)).
+- Prefill 29% faster again (517 → 665 tok/s on 3,712 tokens): the quantized
+  projections and routed experts run on FP16 matrix-core kernels instead of
+  the vendored MMQ, and a prompt prefilled in different passes now gives the
+  same results, except for passes of 8 or fewer tokens
+  ([E17](docs/EXPERIMENTS.md#e17-fp16-matrix-core-projections-and-routed-experts-instead-of-mmq-2026-11-20)).

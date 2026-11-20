@@ -22,6 +22,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E14 | Prefill attention softmax on every thread | retained |
 | E15 | Prefill attention keys converted to binary16 once per pass | retained |
 | E16 | Routed expert tile width per expert | retained |
+| E17 | FP16 matrix-core projections and routed experts instead of MMQ | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -290,3 +291,43 @@ in ABAB order: 7.18, 7.22 s against 7.29, 7.28 s; as the default, 7.19 and
 0.084 ± 0.008, same top 91.5%. Rejected on the way: a register-held query
 variant of `IndexerScore` (bit-identical, but 0.21 s against 0.18 s: the
 warp sums, not the query reads, bound it). Retained.
+
+## E17: FP16 matrix-core projections and routed experts instead of MMQ (2026-11-20)
+
+Every batched Q8_0, Q4_K and Q6_K projection left the vendored MMQ (and its
+Q8_1 activation quantization) for `kernels/rocm/hy4_f16_mm.hip.cpp`: each
+weight decodes to FP16 with its sub-block scale folded in, the activations
+round to FP16 as they are staged, and the matrix-core products accumulate in
+FP32. The dense kernel is DS41's (`ds41_dense_f16.hip.cpp`: 256 rows x 128
+tokens per workgroup, a half-wave decoding each 8-value group and exchanging
+it with `permlanex16`) with a Q4_K format and rows past the last 256-row
+block guarded (`attn_kv_a_mqa` has 576). DS41's routed kernel loads whole
+blocks per lane, which suits its 50-82-byte IQ blocks but not 144-byte Q4_K
+and 210-byte Q6_K; the routed kernel here reuses the dense K loop on one
+expert's 128-slot tile, gathering the slots' activation rows, with waves 0-7
+on gate rows and 8-15 on the same up rows, the up sums passed through LDS
+and SwiGLU with the clamp and route weight stored as FP16 for the down pass.
+With 64-slot tiles (four 16-slot products) the compiler hoisted every
+fragment load to 256 VGPRs and 9-83 spills; at 128 slots it holds 166-190
+VGPRs without spills, and 16-slot tiles past a bucket are skipped, so the
+wider tile pads no more.
+
+Standalone at Hy4 shapes (2,048 tokens, random weights; MMQ including its
+quantization): dense 1.06-1.61x (`attn_gate` 8.05 → 6.64 ms, `wo` 9.07 →
+7.63 ms, shared gate+up 1.68 → 1.52 ms), the grouped `wv_b` equal (5.16 /
+5.24 ms); routed per layer with a skewed expert distribution, Q4_K gate/up
+20.3 → 10.9 ms (15 → 28 TFLOPS), Q4_K down 11.4 → 5.4 ms, Q6_K down 15.4 →
+6.7 ms. FP16 and MMQ outputs differ by 5.4e-3 (dense) and 1.5e-2 (routed,
+relative L2), MMQ's Q8_1 rounding; `hy4flash.kernels` checks the new kernels
+against the ggml dequantization in double precision.
+
+3,712-token prefill 7.18 → 5.58 s (517 → 665 tok/s; two runs, both 5.58 s).
+Kernels 7.05 → 5.35 s: routed 2.57 → 1.36 s, dense 1.72 s plus 0.49 s of
+quantization → 1.87 s. KL against llama.cpp 0.0834 ± 0.0079, same top
+92.1% (E15: 0.0844, 91.5%); PPL 15.388 against E15's 15.112 (llama.cpp's
+noise-floor run 14.930), a shift inside what two chaotic chunks move by
+when KL is unchanged; `--passcheck 8` exact. Batched passes are now
+independent of the pass split: `--chunkcheck` at 200 and 517 gives identical
+logits (was KL 0.0055 from layer 0, E6), since a row's sums no longer depend
+on its place in the batch. A tail of 8 or fewer tokens still takes the
+single-token MMQ path and differs (`--chunkcheck 995`: KL 0.0028). Retained.

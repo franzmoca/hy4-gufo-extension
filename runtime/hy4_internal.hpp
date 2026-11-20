@@ -62,8 +62,10 @@ struct Model::Scratch {
   float* logits_r = nullptr;  // [chunk][n_expert]
   std::int32_t* ids = nullptr;   // [chunk][used]
   std::int32_t* ids_host = nullptr;  // pinned copy, batched passes
-  std::uint8_t* expert_class = nullptr;       // routed tile class per expert
-  std::uint8_t* expert_class_host = nullptr;  // pinned copy
+  // Routed plan (hy4_f16_routed_plan): rows [chunk * used], bounds
+  // [n_expert + 1], tiles [chunk * used / 128 + n_expert], back to back.
+  std::int32_t* route_plan = nullptr;
+  std::int32_t* route_plan_host = nullptr;  // pinned copy
   float* route_w = nullptr;      // [chunk][used]
   float* moe = nullptr;          // [chunk][n_latent]
   float* shared = nullptr;       // [chunk][n_embd]

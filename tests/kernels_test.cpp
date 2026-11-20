@@ -1027,6 +1027,284 @@ void TestAttnSoftmax() {
 
 }  // namespace
 
+// Random Q8_0, Q4_K or Q6_K rows as raw blocks, and their values from the
+// ggml reference dequantization (dequantize_row_q4_K / _q6_K).
+std::vector<uint8_t> RandomQuant(int type, std::size_t rows, std::size_t k) {
+  const std::size_t bytes = type == HY4_TYPE_Q8_0   ? 34
+                            : type == HY4_TYPE_Q4_K ? 144
+                                                    : 210;
+  const std::size_t values = type == HY4_TYPE_Q8_0 ? 32 : 256;
+  std::uniform_int_distribution<int> byte(0, 255), s(1, 60);
+  std::vector<uint8_t> v(rows * k / values * bytes);
+  for (auto& b : v)
+    b = (uint8_t)byte(g_rng);
+  for (std::size_t i = 0; i < v.size() / bytes; ++i) {
+    uint8_t* b = v.data() + i * bytes;
+    const auto put = [&](std::size_t at, float x) {
+      const uint16_t h = HalfBits(x);
+      std::memcpy(b + at, &h, 2);
+    };
+    // Weights of magnitude up to about 0.1, as in a trained model.
+    if (type == HY4_TYPE_Q8_0) {
+      put(0, (float)s(g_rng) / 65536.0f);
+    } else if (type == HY4_TYPE_Q4_K) {
+      put(0, (float)s(g_rng) / 262144.0f);
+      put(2, (float)s(g_rng) / 262144.0f);
+    } else {
+      put(208, (float)s(g_rng) / 4194304.0f);
+    }
+  }
+  return v;
+}
+
+std::vector<double> Dequant(int type, const std::vector<uint8_t>& v) {
+  std::vector<double> y;
+  if (type == HY4_TYPE_Q8_0) {
+    for (std::size_t i = 0; i < v.size(); i += 34) {
+      uint16_t d;
+      std::memcpy(&d, &v[i], 2);
+      for (int j = 0; j < 32; ++j)
+        y.push_back(HalfValue(d) * (int8_t)v[i + 2 + j]);
+    }
+    return y;
+  }
+  if (type == HY4_TYPE_Q4_K) {
+    for (std::size_t i = 0; i < v.size(); i += 144) {
+      const uint8_t* b = &v[i];
+      uint16_t dh, mh;
+      std::memcpy(&dh, b, 2);
+      std::memcpy(&mh, b + 2, 2);
+      const double d = HalfValue(dh), dmin = HalfValue(mh);
+      const uint8_t* sc = b + 4;
+      const uint8_t* q = b + 16;
+      const auto scale_min = [&](int j, int* scale, int* min) {
+        if (j < 4) {
+          *scale = sc[j] & 63;
+          *min = sc[j + 4] & 63;
+        } else {
+          *scale = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+          *min = (sc[j + 4] >> 4) | ((sc[j] >> 6) << 4);
+        }
+      };
+      for (int j = 0, is = 0; j < 256; j += 64, is += 2, q += 32) {
+        int s1, m1, s2, m2;
+        scale_min(is, &s1, &m1);
+        scale_min(is + 1, &s2, &m2);
+        for (int l = 0; l < 32; ++l)
+          y.push_back(d * s1 * (q[l] & 0xF) - dmin * m1);
+        for (int l = 0; l < 32; ++l)
+          y.push_back(d * s2 * (q[l] >> 4) - dmin * m2);
+      }
+    }
+    return y;
+  }
+  for (std::size_t i = 0; i < v.size(); i += 210) {
+    const uint8_t* ql = &v[i];
+    const uint8_t* qh = ql + 128;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(ql + 192);
+    uint16_t dh;
+    std::memcpy(&dh, ql + 208, 2);
+    const double d = HalfValue(dh);
+    double out[256];
+    for (int n = 0; n < 256; n += 128, ql += 64, qh += 32, sc += 8)
+      for (int l = 0; l < 32; ++l) {
+        const int is = l / 16;
+        out[n + l] =
+            d * sc[is] * (((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+        out[n + l + 32] =
+            d * sc[is + 2] *
+            (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+        out[n + l + 64] =
+            d * sc[is + 4] * (((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+        out[n + l + 96] =
+            d * sc[is + 6] *
+            (((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+      }
+    y.insert(y.end(), out, out + 256);
+  }
+  return y;
+}
+
+// The FP16 matrix-core projections against the dequantized weights and the
+// FP16-rounded activations: rows past 256-row blocks, partial token tiles,
+// groups, pairs of different heights, FP16 inputs and outputs, and routed
+// experts with a bucket over one tile, an empty expert and the clamp.
+void TestF16Matmul() {
+  const auto half_round = [](const std::vector<float>& x) {
+    std::vector<double> r(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i)
+      r[i] = HalfValue(HalfBits(x[i]));
+    return r;
+  };
+  const auto project = [](const std::vector<double>& w,
+                          const std::vector<double>& x, uint32_t m, uint32_t n,
+                          uint32_t k, uint32_t groups) {
+    std::vector<double> y((std::size_t)n * groups * m);
+    for (uint32_t t = 0; t < n; ++t)
+      for (uint32_t z = 0; z < groups; ++z)
+        for (uint32_t r = 0; r < m; ++r) {
+          double acc = 0;
+          for (uint32_t c = 0; c < k; ++c)
+            acc += w[((std::size_t)z * m + r) * k + c] *
+                   x[((std::size_t)t * groups + z) * k + c];
+          y[((std::size_t)t * groups + z) * m + r] = acc;
+        }
+    return y;
+  };
+  struct Case {
+    int type;
+    uint32_t m, k, n, groups;
+    const char* name;
+  };
+  for (const Case& c : {Case{HY4_TYPE_Q8_0, 272, 512, 150, 1, "q8_0"},
+                        Case{HY4_TYPE_Q4_K, 48, 256, 37, 1, "q4_k"},
+                        Case{HY4_TYPE_Q6_K, 32, 512, 130, 3, "q6_k grouped"}}) {
+    const auto w = RandomQuant(c.type, (std::size_t)c.m * c.groups, c.k);
+    const auto x = Random((std::size_t)c.n * c.groups * c.k);
+    const auto want =
+        project(Dequant(c.type, w), half_round(x), c.m, c.n, c.k, c.groups);
+    auto* dw = Device(w);
+    auto* dx = Device(x);
+    const std::size_t outs = (std::size_t)c.n * c.groups * c.m;
+    float* dy = Device(std::vector<float>(outs));
+    Expect(hy4_f16_dense(c.type, dw, dx, dy, c.m, c.n, c.k, c.groups, 0,
+                         nullptr) == 0,
+           std::string("f16_dense status ") + c.name);
+    Near(Host(dy, outs), want, 2e-3, std::string("f16_dense ") + c.name);
+    // FP16 in and out: the same sums, rounded once more on the way out.
+    std::vector<uint16_t> xh(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i)
+      xh[i] = HalfBits(x[i]);
+    auto* dxh = Device(xh);
+    auto* dyh = Device(std::vector<uint16_t>(outs));
+    Expect(hy4_f16_dense(c.type, dw, dxh, dyh, c.m, c.n, c.k, c.groups,
+                         HY4_F16_X_HALF | HY4_F16_OUT_HALF, nullptr) == 0,
+           std::string("f16_dense half status ") + c.name);
+    const auto yh = Host(dyh, outs);
+    std::vector<float> got(outs);
+    for (std::size_t i = 0; i < outs; ++i)
+      got[i] = (float)HalfValue(yh[i]);
+    Near(got, want, 3e-3, std::string("f16_dense half ") + c.name);
+    (void)hipFree(dw);
+    (void)hipFree(dx);
+    (void)hipFree(dy);
+    (void)hipFree(dxh);
+    (void)hipFree(dyh);
+  }
+
+  {  // Pair of different heights, both partial 256-row blocks.
+    const uint32_t m1 = 32, m2 = 48, k = 256, n = 140;
+    const auto w1 = RandomQuant(HY4_TYPE_Q4_K, m1, k),
+               w2 = RandomQuant(HY4_TYPE_Q4_K, m2, k);
+    const auto x = Random((std::size_t)n * k);
+    const auto xr = half_round(x);
+    auto* dw1 = Device(w1);
+    auto* dw2 = Device(w2);
+    auto* dx = Device(x);
+    float* y1 = Device(std::vector<float>((std::size_t)n * m1));
+    float* y2 = Device(std::vector<float>((std::size_t)n * m2));
+    Expect(hy4_f16_dense_pair(HY4_TYPE_Q4_K, dw1, y1, m1, dw2, y2, m2, dx, n, k,
+                              0, nullptr) == 0,
+           "f16_dense_pair status");
+    Near(Host(y1, (std::size_t)n * m1),
+         project(Dequant(HY4_TYPE_Q4_K, w1), xr, m1, n, k, 1), 2e-3,
+         "f16_dense_pair first");
+    Near(Host(y2, (std::size_t)n * m2),
+         project(Dequant(HY4_TYPE_Q4_K, w2), xr, m2, n, k, 1), 2e-3,
+         "f16_dense_pair second");
+    (void)hipFree(dw1);
+    (void)hipFree(dw2);
+    (void)hipFree(dx);
+    (void)hipFree(y1);
+    (void)hipFree(y2);
+  }
+
+  {  // Routed: gate/up (Q4_K) with SwiGLU, then down (Q6_K).
+    const uint32_t experts = 5, used = 2, n = 140, f = 256, lat = 256, out = 48;
+    const uint32_t slots = n * used;
+    std::vector<int32_t> ids(slots);
+    std::uniform_int_distribution<int> pick(
+        1, experts - 2);  // expert 4 stays empty
+    for (uint32_t t = 0; t < n; ++t) {
+      ids[t * used] = 0;  // 140 slots: a full tile and a partial one
+      ids[t * used + 1] = pick(g_rng);
+    }
+    const auto rw = Random(slots, 0.1f, 1.0f);
+    const auto wg = RandomQuant(HY4_TYPE_Q4_K, (std::size_t)experts * f, lat);
+    const auto wu = RandomQuant(HY4_TYPE_Q4_K, (std::size_t)experts * f, lat);
+    const auto wd = RandomQuant(HY4_TYPE_Q6_K, (std::size_t)experts * out, f);
+    const auto x = Random((std::size_t)n * lat);
+    const auto xr = half_round(x);
+    const auto g = Dequant(HY4_TYPE_Q4_K, wg), u = Dequant(HY4_TYPE_Q4_K, wu),
+               dn = Dequant(HY4_TYPE_Q6_K, wd);
+    const float limit = 0.3f;  // clamps some gate and up sums
+    std::vector<double> mid((std::size_t)slots * f);
+    std::size_t clamped = 0;
+    for (uint32_t s = 0; s < slots; ++s)
+      for (uint32_t r = 0; r < f; ++r) {
+        double a = 0, b = 0;
+        for (uint32_t c = 0; c < lat; ++c) {
+          a += g[((std::size_t)ids[s] * f + r) * lat + c] *
+               xr[(std::size_t)(s / used) * lat + c];
+          b += u[((std::size_t)ids[s] * f + r) * lat + c] *
+               xr[(std::size_t)(s / used) * lat + c];
+        }
+        clamped += a > limit || std::fabs(b) > limit;
+        a = std::min<double>(a, limit);
+        b = std::clamp<double>(b, -limit, limit);
+        mid[(std::size_t)s * f + r] = a * Sigmoid(a) * b * rw[s];
+      }
+    Expect(clamped > 0 && clamped < mid.size() / 2,
+           "f16_routed clamp engaged " + std::to_string(clamped));
+    std::vector<int32_t> rows(slots), bounds(experts + 1),
+        tiles(slots / 128 + experts);
+    const uint32_t n_tiles = hy4_f16_routed_plan(
+        ids.data(), slots, experts, rows.data(), bounds.data(), tiles.data());
+    Expect(n_tiles == 2 + 3,
+           "f16_routed_plan tiles " + std::to_string(n_tiles));
+    auto* dids = Device(rows);
+    auto* dbounds = Device(bounds);
+    auto* dtiles = Device(tiles);
+    auto* dwg = Device(wg);
+    auto* dwu = Device(wu);
+    auto* dwd = Device(wd);
+    auto* dx = Device(x);
+    auto* drw = Device(rw);
+    auto* dmid = Device(std::vector<uint16_t>((std::size_t)slots * f));
+    float* dy = Device(std::vector<float>((std::size_t)slots * out));
+    Expect(
+        hy4_f16_routed(HY4_TYPE_Q4_K, dwg, dwu, (uint64_t)f * lat / 256 * 144,
+                       dx, used, dids, dbounds, dtiles, n_tiles, drw, limit,
+                       dmid, f, lat, nullptr) == 0,
+        "f16_routed gate/up status");
+    const auto mh = Host(dmid, (std::size_t)slots * f);
+    std::vector<float> got(mh.size());
+    std::vector<double> mid_r(mh.size());
+    for (std::size_t i = 0; i < mh.size(); ++i)
+      got[i] = (float)(mid_r[i] = HalfValue(mh[i]));
+    Near(got, mid, 4e-3, "f16_routed gate/up");
+    Expect(hy4_f16_routed(HY4_TYPE_Q6_K, dwd, nullptr,
+                          (uint64_t)out * f / 256 * 210, dmid, 1, dids, dbounds,
+                          dtiles, n_tiles, nullptr, 0.0f, dy, out, f,
+                          nullptr) == 0,
+           "f16_routed down status");
+    std::vector<double> want((std::size_t)slots * out);
+    for (uint32_t s = 0; s < slots; ++s)
+      for (uint32_t r = 0; r < out; ++r) {
+        double a = 0;
+        for (uint32_t c = 0; c < f; ++c)
+          a += dn[((std::size_t)ids[s] * out + r) * f + c] *
+               mid_r[(std::size_t)s * f + c];
+        want[(std::size_t)s * out + r] = a;
+      }
+    Near(Host(dy, (std::size_t)slots * out), want, 2e-3, "f16_routed down");
+    for (void* p :
+         {(void*)dids, (void*)dbounds, (void*)dtiles, (void*)dwg, (void*)dwu,
+          (void*)dwd, (void*)dx, (void*)drw, (void*)dmid, (void*)dy})
+      (void)hipFree(p);
+  }
+}
+
 int main() {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
@@ -1046,6 +1324,7 @@ int main() {
   TestEngram();
   TestKpool();
   TestAttnSoftmax();
+  TestF16Matmul();
   if (g_failures) {
     std::fprintf(stderr, "%d failures\n", g_failures);
     return 1;

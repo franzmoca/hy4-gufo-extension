@@ -14,7 +14,8 @@ to 4,095, where the sparse layers' indexer selects pools).
 | run | mean KL | same top token | PPL |
 | --- | --- | --- | --- |
 | llama.cpp, F32 cache against its F16 cache (noise floor) | 0.070 | 92.0% | 14.930 |
-| this engine (`hy4_eval_probe --kl`) | 0.096 ± 0.010 | 91.4% | 15.031 |
+| this engine (`hy4_eval_probe --kl`), first build | 0.096 ± 0.010 | 91.4% | 15.031 |
+| this engine after E17 (FP16 matrix-core projections) | 0.083 ± 0.008 | 92.1% | 15.388 |
 
 llama.cpp's own PPL on the base run is 14.466. The model is chaotic under
 rounding past 2,048 tokens (near-tied pool and expert choices), so single
@@ -52,11 +53,15 @@ treatment follow decision 19; their only check is these answers.
 Greedy replies are reproducible for the same request history, and the release
 (`nix build`) and development builds give byte-identical replies. They are
 not invariant to the history: a prompt-cache restore moves the prefill pass
-boundaries, and the pass width changes results from the first layer on (KL
-0.006, 2% of greedy tokens flip;
+boundaries. Since
+[E17](EXPERIMENTS.md#e17-fp16-matrix-core-projections-and-routed-experts-instead-of-mmq-2026-11-20)
+passes of more than 8 tokens give identical results however a prompt is
+split; a pass of 8 or fewer tokens takes the single-token kernels and differs
+slightly (KL 0.003; before E17 every split changed results from the first
+layer on, KL 0.006,
 [E6](EXPERIMENTS.md#e6-prefill-results-against-the-pass-split-2026-11-19)).
-An image prompt served cold and after other requests can therefore word its
-answer differently.
+An image prompt served cold and after other requests can therefore still word
+its answer differently.
 
 ## Functional suites
 
@@ -71,9 +76,9 @@ with DFly2 and the vision sidecar:
 | `image-inputs` | passed |
 | `tool-images` | passed but `tool_images_two_calls`: the model answers `red, blue` to "separated by a comma and no spaces" |
 
-After the prefill kernel work (E10-E16, 2026-11-20), `conversation`,
-`long-context` and `cache` give the same results: all pass but the same
-`legacy-tool-cancel-disk` case.
+After the prefill kernel work (E10-E16, 2026-11-20) and again after E17,
+`conversation`, `long-context` and `cache` give the same results: all pass
+but the same `legacy-tool-cancel-disk` case.
 
 The harness marks drafter runs failed in its measurements ("AR request
 executed speculative drafts"): it knows only Gufo's own speculative backends.
