@@ -514,7 +514,7 @@ __global__ void __launch_bounds__(kKeyListThreads)
 }
 
 __global__ void __launch_bounds__(kAttnWarps * 32)
-    MlaDecode(const float* q, const float* cache, uint32_t ring,
+    MlaDecode(const float* q, const _Float16* cache, uint32_t ring,
               const int32_t* pos, uint32_t window, const int32_t* list,
               const uint32_t* list_count, uint32_t list_stride, float scale,
               float* part_ml, float* part_acc, uint32_t heads) {
@@ -552,6 +552,14 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
     const int32_t kp = lt ? lt[j] : first + (int32_t)j;
     return cache + (uint64_t)((uint32_t)kp % ring) * kAttnDk;
   };
+  // Four binary16 values (8 bytes) or two (4 bytes) as floats.
+  auto load4 = [](const _Float16* x) {
+    const Half4 h = *(const Half4*)x;
+    return make_float4((float)h[0], (float)h[1], (float)h[2], (float)h[3]);
+  };
+  auto load2 = [](const _Float16* x) {
+    return make_float2((float)x[0], (float)x[1]);
+  };
   for (uint32_t c0 = begin; c0 < end; c0 += kAttnChunk) {
     const uint32_t nk = min(kAttnChunk, end - c0);
     // Lane j keeps key c0 + j's scores. kAttnUnroll keys at a time, their
@@ -565,10 +573,10 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
       float2 kt[kAttnUnroll];
 #pragma unroll
       for (uint32_t u = 0; u < kAttnUnroll; ++u) {
-        const float* kr = row(c0 + min(j + u, nk - 1));
+        const _Float16* kr = row(c0 + min(j + u, nk - 1));
         for (uint32_t i = 0; i < 4; ++i)
-          kv[u][i] = *(const float4*)(kr + 128 * i + 4 * lane);
-        kt[u] = *(const float2*)(kr + kAttnDv + 2 * lane);
+          kv[u][i] = load4(kr + 128 * i + 4 * lane);
+        kt[u] = load2(kr + kAttnDv + 2 * lane);
       }
       float d[kAttnUnroll][kAttnHpw];
 #pragma unroll
@@ -613,9 +621,9 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
       float4 kv[kAttnUnroll][4];
 #pragma unroll
       for (uint32_t u = 0; u < kAttnUnroll; ++u) {
-        const float* kr = row(c0 + min(j + u, nk - 1));
+        const _Float16* kr = row(c0 + min(j + u, nk - 1));
         for (uint32_t i = 0; i < 4; ++i)
-          kv[u][i] = *(const float4*)(kr + 128 * i + 4 * lane);
+          kv[u][i] = load4(kr + 128 * i + 4 * lane);
       }
 #pragma unroll
       for (uint32_t u = 0; u < kAttnUnroll; ++u)
@@ -681,6 +689,17 @@ __global__ void StoreRows(const float* src, uint64_t src_stride, float* dst, uin
   const uint64_t row = (uint64_t)((uint32_t)pos[t] % ring);
   for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
     dst[row * dim + c] = src[t * src_stride + c];
+  }
+}
+
+__global__ void StoreRowsHalf(const float* src, uint64_t src_stride,
+                              _Float16* dst, uint32_t ring, const int32_t* pos,
+                              uint32_t dim) {
+  const uint32_t t = blockIdx.y;
+  const uint64_t row = (uint64_t)((uint32_t)pos[t] % ring);
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim;
+       c += gridDim.x * blockDim.x) {
+    dst[row * dim + c] = (_Float16)src[t * src_stride + c];
   }
 }
 
@@ -1120,34 +1139,15 @@ __global__ void AttnSoftmax(float* scores, uint32_t heads, uint32_t n_keys, int3
   for (uint32_t j = threadIdx.x; j < n_keys; j += blockDim.x) row[j] *= inv;
 }
 
-__global__ void GatherRows(const float* src, uint32_t ring, int32_t first, uint32_t dim, float* dst) {
-  const uint32_t r = blockIdx.y;
-  const uint64_t from = (uint64_t)((uint32_t)(first + (int32_t)r) % ring) * dim;
-  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
-    dst[(uint64_t)r * dim + c] = src[from + c];
-  }
-}
-
-// One block per row, one thread per four values.
-__global__ void GatherRowsHalf(const float* src, uint32_t ring, int32_t first,
-                               uint32_t dim, _Float16* dst) {
-  const uint32_t r = blockIdx.x;
-  const uint64_t from = (uint64_t)((uint32_t)(first + (int32_t)r) % ring) * dim;
-  for (uint32_t c = threadIdx.x * 4; c < dim; c += blockDim.x * 4) {
-    const float4 v = *reinterpret_cast<const float4*>(src + from + c);
-    const Half4 h = {(_Float16)v.x, (_Float16)v.y, (_Float16)v.z,
-                     (_Float16)v.w};
-    *reinterpret_cast<Half4*>(dst + (uint64_t)r * dim + c) = h;
-  }
-}
-
-__global__ void GatherIndexed(const float* src, uint32_t ring, const int32_t* idx, int32_t limit, uint32_t dim,
+__global__ void GatherIndexed(const _Float16* src, uint32_t ring,
+                              const int32_t* idx, int32_t limit, uint32_t dim,
                               float* dst) {
   const uint32_t r = blockIdx.y;
   const int32_t p = idx[r];
   const bool ok = p >= 0 && p <= limit;
   for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
-    dst[(uint64_t)r * dim + c] = ok ? src[(uint64_t)((uint32_t)p % ring) * dim + c] : 0.0f;
+    dst[(uint64_t)r * dim + c] =
+        ok ? (float)src[(uint64_t)((uint32_t)p % ring) * dim + c] : 0.0f;
   }
 }
 
@@ -1331,10 +1331,10 @@ __device__ __forceinline__ int32_t MlaKey(const int32_t* sel_t, int32_t first,
 }
 
 __global__ void __launch_bounds__(32 * kMlaWaves)
-    MlaPrefill(const _Float16* q, const _Float16* keys, int32_t lo,
-               const int32_t* pos, uint32_t window, const int32_t* sel,
-               uint32_t n_sel, const float* sinks, float scale, _Float16* out,
-               uint32_t heads) {
+    MlaPrefill(const _Float16* q, const _Float16* keys, uint32_t ring,
+               int32_t lo, const int32_t* pos, uint32_t window,
+               const int32_t* sel, uint32_t n_sel, const float* sinks,
+               float scale, _Float16* out, uint32_t heads) {
   __shared__ __align__(16) _Float16 kt[kMlaTile * kMlaKtPitch];
   __shared__ __align__(16) _Float16 probs[kMlaHeads * kMlaProbPitch];
   __shared__ float part[kMlaSplit][kMlaHeads][kMlaTile];
@@ -1374,8 +1374,11 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
   MlaFloat8 acc[kMlaPvTiles] = {};
 
   for (uint32_t j0 = 0; j0 < count; j0 += kMlaTile) {
-    if (tid < kMlaTile)
-      rows[tid] = MlaKey(sel_t, lo_t, j0 + tid, count, p, lo_t);
+    // The tile's ring rows, -1 for a key the token does not see.
+    if (tid < kMlaTile) {
+      const int32_t k = MlaKey(sel_t, lo_t, j0 + tid, count, p, lo_t);
+      rows[tid] = k >= 0 ? (int32_t)((uint32_t)k % ring) : -1;
+    }
     __syncthreads();
     // Stage the tile: 16-byte groups of the binary16 rows.
     for (uint32_t i = tid; i < kMlaTile * (kMlaDk / 8); i += blockDim.x) {
@@ -1383,8 +1386,8 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
       const uint32_t c = (i % (kMlaDk / 8)) * 8;
       uint4 v = make_uint4(0, 0, 0, 0);
       if (rows[r] >= 0)
-        v = *reinterpret_cast<const uint4*>(
-            keys + (uint64_t)(rows[r] - lo) * kMlaDk + c);
+        v = *reinterpret_cast<const uint4*>(keys + (uint64_t)rows[r] * kMlaDk +
+                                            c);
       *reinterpret_cast<uint4*>(kt + r * kMlaKtPitch + c) = v;
     }
     __syncthreads();
@@ -1846,7 +1849,7 @@ uint64_t hy4_mla_attention_work(uint32_t n, uint32_t heads, uint32_t n_sel) {
   return lists + (uint64_t)n * kAttnSplits * heads * (2 + kAttnDv);
 }
 
-int hy4_mla_attention(const float* q, const float* cache, uint32_t ring,
+int hy4_mla_attention(const float* q, const uint16_t* cache, uint32_t ring,
                       const int32_t* pos, uint32_t window, const int32_t* sel,
                       uint32_t n_sel, const float* sinks, float scale,
                       float* out, uint32_t n, uint32_t heads, uint32_t dk,
@@ -1870,10 +1873,20 @@ int hy4_mla_attention(const float* q, const float* cache, uint32_t ring,
   float* part_acc = part + (uint64_t)n * kAttnSplits * heads * 2;
   const uint32_t groups = (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock;
   MlaDecode<<<dim3(kAttnSplits, groups, n), kAttnWarps * 32, 0, stream>>>(
-      q, cache, ring, pos, window, list, count, n_sel, scale, part_ml, part_acc,
-      heads);
+      q, reinterpret_cast<const _Float16*>(cache), ring, pos, window, list,
+      count, n_sel, scale, part_ml, part_acc, heads);
   MlaCombine<<<dim3(heads, n), kAttnDv / 4, 0, stream>>>(
       part_ml, part_acc, pos, window, count, sinks, out, heads);
+  return Status();
+}
+
+int hy4_store_rows_half(const float* src, uint64_t src_stride, uint16_t* dst,
+                        uint32_t ring, const int32_t* pos, uint32_t n,
+                        uint32_t dim, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  StoreRowsHalf<<<dim3(Blocks(dim, 16), n), kBlock, 0, stream>>>(
+      src, src_stride, reinterpret_cast<_Float16*>(dst), ring, pos, dim);
   return Status();
 }
 
@@ -1995,27 +2008,13 @@ int hy4_attn_softmax(float* scores, uint32_t n, uint32_t heads, uint32_t n_keys,
   return Status();
 }
 
-int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t count, uint32_t dim, float* dst,
-                    hipStream_t stream) {
-  if (count == 0) return 0;
-  GatherRows<<<dim3(Blocks(dim, 16), count), kBlock, 0, stream>>>(src, ring, first, dim, dst);
-  return Status();
-}
-
-int hy4_gather_rows_half(const float* src, uint32_t ring, int32_t first,
-                         uint32_t count, uint32_t dim, uint16_t* dst,
-                         hipStream_t stream) {
-  if (dim % 4 != 0)
-    return 1;
+int hy4_gather_indexed(const uint16_t* src, uint32_t ring, const int32_t* idx,
+                       uint32_t count, int32_t limit, uint32_t dim, float* dst,
+                       float* mask, uint32_t rows, uint32_t n_keys,
+                       hipStream_t stream) {
   if (count)
-    GatherRowsHalf<<<count, 160, 0, stream>>>(src, ring, first, dim,
-                                              reinterpret_cast<_Float16*>(dst));
-  return Status();
-}
-
-int hy4_gather_indexed(const float* src, uint32_t ring, const int32_t* idx, uint32_t count, int32_t limit,
-                       uint32_t dim, float* dst, float* mask, uint32_t rows, uint32_t n_keys, hipStream_t stream) {
-  if (count) GatherIndexed<<<dim3(1, count), kBlock, 0, stream>>>(src, ring, idx, limit, dim, dst);
+    GatherIndexed<<<dim3(1, count), kBlock, 0, stream>>>(
+        reinterpret_cast<const _Float16*>(src), ring, idx, limit, dim, dst);
   if (rows && n_keys) {
     IndexMask<<<dim3((n_keys + kBlock - 1) / kBlock, rows), kBlock, 0, stream>>>(idx, count, limit, mask, n_keys);
   }
@@ -2059,19 +2058,19 @@ int hy4_mla_absorb(const uint16_t* wq, const float* wd, const float* q,
   return Status();
 }
 
-int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, int32_t lo,
-                    const int32_t* pos, uint32_t window, const int32_t* sel,
-                    uint32_t n_sel, const float* sinks, float scale,
-                    uint16_t* out, uint32_t n, uint32_t heads, uint32_t dk,
-                    uint32_t dv, hipStream_t stream) {
+int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, uint32_t ring,
+                    int32_t lo, const int32_t* pos, uint32_t window,
+                    const int32_t* sel, uint32_t n_sel, const float* sinks,
+                    float scale, uint16_t* out, uint32_t n, uint32_t heads,
+                    uint32_t dk, uint32_t dv, hipStream_t stream) {
   if (n == 0)
     return 0;
   if (dk != kMlaDk || dv != kMlaDv || heads % kMlaHeads != 0)
     return 1;
   MlaPrefill<<<dim3(n, heads / kMlaHeads), 32 * kMlaWaves, 0, stream>>>(
       reinterpret_cast<const _Float16*>(q),
-      reinterpret_cast<const _Float16*>(keys), lo, pos, window, sel, n_sel,
-      sinks, scale, reinterpret_cast<_Float16*>(out), heads);
+      reinterpret_cast<const _Float16*>(keys), ring, lo, pos, window, sel,
+      n_sel, sinks, scale, reinterpret_cast<_Float16*>(out), heads);
   return Status();
 }
 

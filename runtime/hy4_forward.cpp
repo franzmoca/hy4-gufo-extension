@@ -283,8 +283,6 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::st
   }
   const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
   ok = ok &&
-       DeviceAlloc(&s->keys_half_, std::size_t{max_context} * dk,
-                   &s->allocations_) &&
        DeviceAlloc(&s->score_, std::size_t{kMaxChunk} * pools,
                    &s->allocations_) &&
        DeviceAlloc(&s->sel_, std::size_t{kMaxChunk} * (top_pools + 1) * c.kpool,
@@ -655,7 +653,8 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
                                c.n_rot * sizeof(float), std::size_t{n} * heads,
                                hipMemcpyDeviceToDevice, st));
   }
-  HY4_CHECK(hy4_store_rows(s.kva, dk, cache_[il], ring_[il], s.pos, n, dk, st));
+  HY4_CHECK(
+      hy4_store_rows_half(s.kva, dk, cache_[il], ring_[il], s.pos, n, dk, st));
 
   const std::int32_t* sel = nullptr;
   std::uint32_t n_sel = 0;
@@ -675,21 +674,18 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   // Prefill attention output as binary16 bits in att's storage.
   auto* att_half = reinterpret_cast<std::uint16_t*>(s.att);
   if (batched) {
-    // Prefill reads binary16 keys, converted once per pass, and runs each
-    // token over exactly its own keys on the matrix cores, so a token's
-    // result does not depend on how its span was cut into passes.
+    // Prefill runs each token over exactly its own keys on the matrix cores,
+    // reading the binary16 cache rows, so a token's result does not depend on
+    // how its span was cut into passes. The ring holds the window and the
+    // whole pass.
     const std::uint32_t window = c.is_swa[il] ? c.swa_window : 0;
-    const std::int32_t last = static_cast<std::int32_t>(Position() + n - 1);
     std::int32_t lo = 0;
     if (window)
       lo = std::max<std::int32_t>(0, static_cast<std::int32_t>(Position()) -
                                          static_cast<std::int32_t>(window) + 1);
-    const auto n_keys = static_cast<std::uint32_t>(last - lo + 1);
-    HY4_CHECK(hy4_gather_rows_half(cache_[il], ring_[il], lo, n_keys, dk,
-                                   keys_half_, st));
-    HY4_CHECK(hy4_mla_prefill(qh, keys_half_, lo, s.pos, window, sel, n_sel,
-                              l.attn_sinks.f32(), scale, att_half, n, heads, dk,
-                              c.kv_lora, st));
+    HY4_CHECK(hy4_mla_prefill(qh, cache_[il], ring_[il], lo, s.pos, window, sel,
+                              n_sel, l.attn_sinks.f32(), scale, att_half, n,
+                              heads, dk, c.kv_lora, st));
   } else {
     // Decoding and verify passes: each token over exactly the keys a
     // one-token pass would see.

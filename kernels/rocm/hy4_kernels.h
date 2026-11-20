@@ -109,8 +109,9 @@ int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
 /* MLA attention with learnable sinks over latent rows (llama.cpp
  * build_attn_mha with wv_b applied by the caller). q[t, h, 0:dk] holds the
  * absorbed nope part (dv = kv_lora floats) and the roped tail; cache rows
- * are [dk] floats (the normed latent, then the roped key tail), stored at
- * row pos % ring. Token t at position pos[t] attends to positions
+ * are [dk] binary16 values (the normed latent, then the roped key tail),
+ * stored at row pos % ring (hy4_store_rows_half); the arithmetic is FP32.
+ * Token t at position pos[t] attends to positions
  * max(0, pos[t] - window + 1) .. pos[t] (window 0: no lower bound), or to
  * sel[t, 0:n_sel] (positions, -1 for an empty slot) when sel is not NULL.
  * out[t, h, 0:dv] = softmax(scale * q.k, sink[h]) . latent. Positions
@@ -120,7 +121,7 @@ int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
  * of 4. `work` holds hy4_mla_attention_work(n, heads, n_sel)
  * floats (n_sel 0 without a selection). */
 uint64_t hy4_mla_attention_work(uint32_t n, uint32_t heads, uint32_t n_sel);
-int hy4_mla_attention(const float* q, const float* cache, uint32_t ring,
+int hy4_mla_attention(const float* q, const uint16_t* cache, uint32_t ring,
                       const int32_t* pos, uint32_t window, const int32_t* sel,
                       uint32_t n_sel, const float* sinks, float scale,
                       float* out, uint32_t n, uint32_t heads, uint32_t dk,
@@ -130,18 +131,23 @@ int hy4_mla_attention(const float* q, const float* cache, uint32_t ring,
 /* hy4_mla_attention for prefill on the matrix cores (binary16 operands, FP32
  * softmax and accumulation; q as binary16 bits from hy4_mla_absorb), each
  * token over exactly its own keys, so a token's result does not depend on the
- * pass it is in. Key position k is row k - lo of `keys` [rows][dk] (binary16
- * bits, from hy4_gather_rows_half); token t sees max(lo, pos[t] - window + 1)
+ * pass it is in. Key position k is row k % ring of `keys` [ring][dk] (the
+ * binary16 cache rows); token t sees max(lo, pos[t] - window + 1)
  * .. pos[t] (lo without a window), or the positions of sel[t, 0:n_sel] in that
  * range. out [n][heads][dv] is binary16 bits (the rounding the wv_b
  * projection applies to its input). dk must be 576, dv 512 and heads a
  * multiple of 32. */
-int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, int32_t lo,
-                    const int32_t* pos, uint32_t window, const int32_t* sel,
-                    uint32_t n_sel, const float* sinks, float scale,
-                    uint16_t* out, uint32_t n, uint32_t heads, uint32_t dk,
-                    uint32_t dv, hipStream_t stream);
+int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, uint32_t ring,
+                    int32_t lo, const int32_t* pos, uint32_t window,
+                    const int32_t* sel, uint32_t n_sel, const float* sinks,
+                    float scale, uint16_t* out, uint32_t n, uint32_t heads,
+                    uint32_t dk, uint32_t dv, hipStream_t stream);
 
+/* hy4_store_rows into binary16: dst row pos[t] % ring = src row t rounded
+ * to binary16 (round to nearest even). */
+int hy4_store_rows_half(const float* src, uint64_t src_stride, uint16_t* dst,
+                        uint32_t ring, const int32_t* pos, uint32_t n,
+                        uint32_t dim, hipStream_t stream);
 /* Copies n rows of `dim` floats into a ring: dst row pos[t] % ring. */
 int hy4_store_rows(const float* src, uint64_t src_stride, float* dst, uint32_t ring, const int32_t* pos,
                    uint32_t n, uint32_t dim, hipStream_t stream);
@@ -221,20 +227,14 @@ int hy4_kpool_select(const float* score, const int32_t* n_pool, uint32_t n_pool_
 int hy4_attn_softmax(float* scores, uint32_t n, uint32_t heads, uint32_t n_keys,
                      int32_t key_pos0, const int32_t* pos, uint32_t window,
                      const float* mask, const float* sinks, hipStream_t stream);
-/* dst [count][dim] = rows of the positions first .. first + count - 1 of a ring. */
-int hy4_gather_rows(const float* src, uint32_t ring, int32_t first, uint32_t count, uint32_t dim, float* dst,
-                    hipStream_t stream);
-/* hy4_gather_rows into binary16 bits: dst [count][dim] = the rows of
- * positions first .. first + count - 1 of a ring. dim must be a multiple of
- * 4, src rows and dst 8-byte aligned. */
-int hy4_gather_rows_half(const float* src, uint32_t ring, int32_t first,
-                         uint32_t count, uint32_t dim, uint16_t* dst,
-                         hipStream_t stream);
-/* dst [count][dim] = rows of the positions idx[j] of a ring; a position < 0
- * or > limit is missing (a zero row). mask [rows][n_keys] = -inf at the
- * missing j, 0 at the other j < count and at every j >= count. */
-int hy4_gather_indexed(const float* src, uint32_t ring, const int32_t* idx, uint32_t count, int32_t limit,
-                       uint32_t dim, float* dst, float* mask, uint32_t rows, uint32_t n_keys, hipStream_t stream);
+/* dst [count][dim] = binary16 rows of the positions idx[j] of a ring, as
+ * floats; a position < 0 or > limit is missing (a zero row). mask
+ * [rows][n_keys] = -inf at the missing j, 0 at the other j < count and at every
+ * j >= count. */
+int hy4_gather_indexed(const uint16_t* src, uint32_t ring, const int32_t* idx,
+                       uint32_t count, int32_t limit, uint32_t dim, float* dst,
+                       float* mask, uint32_t rows, uint32_t n_keys,
+                       hipStream_t stream);
 /* x += a * b, elementwise over `count` floats; b repeats every `period` floats. */
 int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64_t period, hipStream_t stream);
 /* out [blocks * 32] = dequantized Q8_0 blocks. */

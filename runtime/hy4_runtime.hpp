@@ -289,7 +289,9 @@ public:
   // latent rows [KvRing(layer)][kv_lora + n_rot] (position p in row
   // p % KvRing); indexer layers also keep a value | gate ring
   // [kIndexerRing][2 idx_dim] and pooled keys [max_context / kpool + 1][idx_dim].
-  [[nodiscard]] float* KvRows(std::uint32_t layer) const { return cache_[layer]; }
+  [[nodiscard]] std::uint16_t* KvRows(std::uint32_t layer) const {
+    return cache_[layer];
+  }
   [[nodiscard]] std::uint32_t KvRing(std::uint32_t layer) const { return ring_[layer]; }
   [[nodiscard]] float* IndexerRing(std::uint32_t layer) const { return idx_rows_[layer]; }
   [[nodiscard]] float* IndexerPools(std::uint32_t layer) const { return idx_pooled_[layer]; }
@@ -331,8 +333,8 @@ private:
   std::vector<std::array<std::int32_t, 3>> chunk_rope_;
   [[nodiscard]] std::array<std::int32_t, 3> PassRope(std::uint32_t p,
                                                      std::uint32_t pos0) const;
-  // Per layer: latent rows [ring][kv_lora + n_rot].
-  std::vector<float*> cache_;
+  // Per layer: latent rows [ring][kv_lora + n_rot] in binary16.
+  std::vector<std::uint16_t*> cache_;
   std::vector<std::uint32_t> ring_;
   // Per indexer layer: value | gate rows [kIdxRing][2 idx_dim] and pooled
   // keys [max_context / kpool][idx_dim].
@@ -357,8 +359,6 @@ private:
   // The last Verify: its first position and logits [n][n_vocab].
   std::uint32_t pass_pos0_ = 0;
   std::vector<float> pass_logits_;
-  // A prefill pass's visible key rows as binary16, for hy4_mla_prefill.
-  std::uint16_t* keys_half_ = nullptr;
   std::vector<void*> allocations_;
   std::vector<float> last_logits_;
   WriteHook write_hook_ = nullptr;

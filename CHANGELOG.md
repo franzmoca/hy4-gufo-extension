@@ -74,3 +74,8 @@
   15.3 → 16.2 tok/s after a 3,712-token prompt and 13.2 → 16.1 after 14,849
   tokens; with DFly2, 15% faster after a 4,192-token prompt
   ([E29](docs/EXPERIMENTS.md#e29-fused-decode-attention-over-each-tokens-own-keys-2026-11-20)).
+- The KV cache is binary16: about half the session memory per token, so the
+  model's full 1,048,576-token context fits beside DFly2 and vision. Prefill
+  results are unchanged; prompt-cache entries from earlier builds are not
+  reused
+  ([E30](docs/EXPERIMENTS.md#e30-binary16-kv-cache-2026-11-20)).

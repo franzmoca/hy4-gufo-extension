@@ -35,6 +35,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E27 | Verify passes: routed experts in one launch, slots ordered by expert | retained |
 | E28 | Verify passes: four rows per warp in the float and grouped GEMVs | retained |
 | E29 | Fused decode attention over each token's own keys | retained |
+| E30 | Binary16 KV cache | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -629,3 +630,51 @@ within each build), which also moves the draft acceptance:
 | long context (4,192-token prompt) | 21.5 | 24.7 | +14.7% | 179/258 → 188/275 |
 
 Retained.
+
+## E30: Binary16 KV cache (2026-11-20)
+
+The cache held each layer's 576-wide latent rows in FP32: 27.6 KB per token
+for the 12 sparse layers, so a 1,048,576-token session (the model's context)
+failed to allocate beside the 91 GiB trunk. Prefill passes also copied their
+visible rows into a binary16 buffer of the session's full length for
+`MlaPrefill`.
+
+Reference stacks keep 16 bits: the transformers port (PR 50903) caches the
+latent and indexer keys in the model dtype (BF16) without rounding, vLLM's
+default `auto` and SGLang's recipes store BF16, and llama.cpp's port stores
+F16. FP8 caches exist only as opt-in serving modes. Over a 14,845-token
+prompt and 64 decoded tokens (40 million values), the stored latent peaks at
+5.0 and the roped tail at 25.6, so binary16 (largest 65,504) keeps 3 more
+mantissa bits than BF16 at the same size; 0.002% of values fall below
+binary16's normal range.
+
+The cache rows are now binary16, rounded once when stored. `MlaPrefill`
+reads them from the ring, so the full-length copy is gone, and since it
+rounded keys the same way before, prefill is bit-identical: the logits after
+a 3,712-token prompt match byte for byte, KL 0.08424 and `--chunkcheck`
+exact. Decode and verify passes convert the rows to FP32 in `MlaDecode` and
+the drafter's gather; `--passcheck` 2, 4 and 8 stay exact. Decoding against
+prefill (`--passcheck 16`, 128 tokens): mean |dlogit| 0.114 (0.154 with the
+FP32 cache), mean KL 0.00179, 126/128 same top. The prompt cache's rows
+halve too, and its layout identity changes, so earlier disk entries are
+refused.
+
+Session memory: 32.4 → 17.4 KB per token of context. A 1M session with DFly2
+and vision now loads (122.6 of 124 GiB of device memory, prompt cache 3.4
+GB); before, it failed to allocate. Speed, `hy4_eval_probe`, ABBA:
+
+| | before | E30 |
+| --- | --- | --- |
+| prefill, 3,712 tokens (s) | 4.632 | 4.618 |
+| prefill, 14,845 tokens (s) | 18.913 | 18.906 |
+| decode after 3,712 tokens (tok/s) | 16.14 | 16.17 |
+| decode after 14,845 tokens (tok/s) | 16.11 | 16.10 |
+
+Decode attention is bound by its FP32 arithmetic (E29), not by the bytes
+read, so halving them changes nothing; binary16 operands on the matrix cores
+are now possible without a conversion pass. A first version computed `% ring`
+for every 16-byte load in `MlaPrefill` and was 0.3% slower; the tile's ring
+rows are now computed once.
+
+Gufo's `conversation`, `long-context` and `cache` suites (with DFly2 and
+vision, disk prompt cache included): 16 of 16 cases pass. Retained.

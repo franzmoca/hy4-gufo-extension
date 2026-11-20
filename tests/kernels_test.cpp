@@ -567,8 +567,14 @@ std::vector<double> MlaReference(const std::vector<float>& q,
 void TestMlaAttention() {
   const uint32_t dk = 576, dv = 512, ring = 2600;
   const float scale = 1.0f / 16.0f;
-  const auto cache = Random(ring * dk, -1, 1);
-  float* dc = Device(cache);
+  // Binary16 cache rows; the reference reads their exact values.
+  auto cache = Random(ring * dk, -1, 1);
+  std::vector<uint16_t> cbits(cache.size());
+  for (std::size_t i = 0; i < cache.size(); ++i) {
+    cbits[i] = HalfBits(cache[i]);
+    cache[i] = (float)HalfValue(cbits[i]);
+  }
+  uint16_t* dc = Device(cbits);
   auto run = [&](const std::vector<float>& q, const std::vector<int32_t>& pos,
                  uint32_t ring_used, uint32_t window,
                  const std::vector<int32_t>& sel, uint32_t n_sel,
@@ -697,48 +703,31 @@ void TestMlaPrefill() {
     q[i] = (float)HalfValue(qbits[i]);
   }
   auto* dq = Device(qbits);
-  // Keys as hy4_gather_rows_half writes them: binary16 rows from position 0.
-  auto* dcf = Device(cache);
-  auto* dc = Device(std::vector<uint16_t>(cache.size()));
-  Expect(hy4_gather_rows_half(dcf, ring, 0, ring, dk, dc, nullptr) == 0,
-         "gather_rows_half status");
-  {
-    std::vector<uint16_t> want(cache.size());
-    for (std::size_t i = 0; i < cache.size(); ++i)
-      want[i] = HalfBits(cache[i]);
-    Expect(Host(dc, cache.size()) == want, "gather_rows_half");
-    // Wrapping the ring: positions ring - 2 .. ring + 1.
-    auto* wrap = Device(std::vector<uint16_t>(4 * dk));
-    Expect(hy4_gather_rows_half(dcf, ring, (int32_t)ring - 2, 4, dk, wrap,
-                                nullptr) == 0,
-           "gather_rows_half wrap status");
-    const auto got = Host(wrap, 4 * dk);
-    bool same = true;
-    for (uint32_t r = 0; r < 4; ++r)
-      for (uint32_t i = 0; i < dk; ++i)
-        same =
-            same && got[r * dk + i] == want[((ring - 2 + r) % ring) * dk + i];
-    Expect(same, "gather_rows_half wrap");
-  }
+  // The binary16 cache rows, as hy4_store_rows_half writes them.
+  std::vector<uint16_t> cbits(cache.size());
+  for (std::size_t i = 0; i < cache.size(); ++i)
+    cbits[i] = HalfBits(cache[i]);
+  auto* dc = Device(cbits);
   auto* dp = Device(pos);
   auto* ds = Device(sinks);
-  const auto run = [&](const uint16_t* keys, int32_t lo, uint32_t window,
+  const auto run = [&](uint32_t ring_used, int32_t lo, uint32_t window,
                        const std::vector<int32_t>* sel, uint32_t n_sel,
                        bool sink,
                        const std::vector<std::vector<int32_t>>& want_keys,
                        const std::string& what) {
     auto* out = Device(std::vector<uint16_t>(n * heads * dv));
-    Expect(hy4_mla_prefill(
-               dq, keys, lo, dp, window, sel ? Device(*sel) : nullptr, n_sel,
-               sink ? ds : nullptr, scale, out, n, heads, dk, dv, nullptr) == 0,
+    Expect(hy4_mla_prefill(dq, dc, ring_used, lo, dp, window,
+                           sel ? Device(*sel) : nullptr, n_sel,
+                           sink ? ds : nullptr, scale, out, n, heads, dk, dv,
+                           nullptr) == 0,
            what + " status");
     const auto bits = Host(out, n * heads * dv);
     std::vector<float> got(bits.size());
     for (std::size_t i = 0; i < bits.size(); ++i)
       got[i] = (float)HalfValue(bits[i]);
     Near(got,
-         MlaReference(q, cache, ring, want_keys, sink ? sinks.data() : nullptr,
-                      scale, heads, dk, dv),
+         MlaReference(q, cache, ring_used, want_keys,
+                      sink ? sinks.data() : nullptr, scale, heads, dk, dv),
          4e-3, what);
   };
   for (bool sink : {true, false}) {
@@ -746,12 +735,13 @@ void TestMlaPrefill() {
     for (uint32_t t = 0; t < n; ++t)
       for (int32_t k = 0; k <= pos[t]; ++k)
         keys[t].push_back(k);
-    run(dc, 0, 0, nullptr, 0, sink, keys,
+    run(ring, 0, 0, nullptr, 0, sink, keys,
         std::string("mla_prefill causal") + (sink ? " sinks" : ""));
   }
   {
-    // Window 64 over keys gathered from position 20 (positions below 20 are
-    // never read: token 0 sees none and keeps only the sink).
+    // Window 64 from position 20 (positions below 20 are never read: token 0
+    // sees none and keeps only the sink), in a 256-row ring that position
+    // 299's window wraps.
     const int32_t lo = 20;
     const uint32_t window = 64;
     std::vector<std::vector<int32_t>> keys(n);
@@ -759,8 +749,7 @@ void TestMlaPrefill() {
       for (int32_t k = std::max(lo, pos[t] - (int32_t)window + 1); k <= pos[t];
            ++k)
         keys[t].push_back(k);
-    run(dc + std::size_t{lo} * dk, lo, window, nullptr, 0, true, keys,
-        "mla_prefill window");
+    run(256, lo, window, nullptr, 0, true, keys, "mla_prefill window");
   }
   {
     const uint32_t n_sel = 40;
@@ -776,10 +765,10 @@ void TestMlaPrefill() {
         if (k <= pos[t])
           keys[t].push_back(k);  // a future key is skipped
       }
-    run(dc, 0, 0, &sel, n_sel, true, keys, "mla_prefill selection");
+    run(ring, 0, 0, &sel, n_sel, true, keys, "mla_prefill selection");
   }
-  Expect(hy4_mla_prefill(dq, dc, 0, dp, 0, nullptr, 0, ds, scale, nullptr, n,
-                         24, dk, dv, nullptr) != 0,
+  Expect(hy4_mla_prefill(dq, dc, ring, 0, dp, 0, nullptr, 0, ds, scale, nullptr,
+                         n, 24, dk, dv, nullptr) != 0,
          "mla_prefill rejects 24 heads");
 }
 
@@ -798,24 +787,26 @@ void TestRows() {
     for (uint32_t c = 0; c < dim; ++c)
       want[(pos[t] % ring) * dim + c] = src[t * src_stride + c];
   Near(Host(ring_rows, ring * dim), want, 0, "store_rows");
-  const auto stored = Host(ring_rows, ring * dim);
 
-  const uint32_t count = 5;
-  float* dst = Device(std::vector<float>(count * dim));
-  Expect(hy4_gather_rows(ring_rows, ring, 3, count, dim, dst, nullptr) == 0,
-         "gather_rows status");
-  std::vector<double> rows(count * dim);
-  for (uint32_t r = 0; r < count; ++r)
+  // The same rows into a binary16 ring: each value rounded once.
+  auto* half_rows = Device(std::vector<uint16_t>(ring * dim));
+  Expect(hy4_store_rows_half(Device(src), src_stride, half_rows, ring,
+                             Device(pos), n, dim, nullptr) == 0,
+         "store_rows_half status");
+  const auto half_stored = Host(half_rows, ring * dim);
+  bool rounded = true;
+  for (uint32_t t = 0; t < n; ++t)
     for (uint32_t c = 0; c < dim; ++c)
-      rows[r * dim + c] = stored[((3 + r) % ring) * dim + c];
-  Near(Host(dst, count * dim), rows, 0, "gather_rows");
+      rounded = rounded && half_stored[(pos[t] % ring) * dim + c] ==
+                               HalfBits(src[t * src_stride + c]);
+  Expect(rounded, "store_rows_half");
 
   const std::vector<int32_t> idx{7, -1, 2, 9, 5};
   const int32_t limit = 7;
   const uint32_t mask_rows = 2, n_keys = 8;
   float* gathered = Device(std::vector<float>(idx.size() * dim));
   float* mask = Device(std::vector<float>(mask_rows * n_keys, 3.0f));
-  Expect(hy4_gather_indexed(ring_rows, ring, Device(idx), (uint32_t)idx.size(),
+  Expect(hy4_gather_indexed(half_rows, ring, Device(idx), (uint32_t)idx.size(),
                             limit, dim, gathered, mask, mask_rows, n_keys,
                             nullptr) == 0,
          "gather_indexed status");
@@ -823,7 +814,8 @@ void TestRows() {
   for (uint32_t r = 0; r < idx.size(); ++r) {
     const bool ok = idx[r] >= 0 && idx[r] <= limit;
     for (uint32_t c = 0; c < dim; ++c)
-      g[r * dim + c] = ok ? stored[(idx[r] % ring) * dim + c] : 0.0;
+      g[r * dim + c] =
+          ok ? HalfValue(half_stored[(idx[r] % ring) * dim + c]) : 0.0;
     for (uint32_t t = 0; t < mask_rows; ++t)
       m[t * n_keys + r] = ok ? 0.0 : -INFINITY;
   }

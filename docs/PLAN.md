@@ -90,9 +90,12 @@ Not needed: expert streaming. The trunk is resident.
 ## Memory budget (124 GiB host)
 
 - Trunk 91.1 GiB (97.8 GB), vision 1 GB, DFly2 about 1 GB at Q8_0.
-- KV: the 12 sparse layers × 576 × 2 bytes come to 13.8 KB per token, plus the
-  kpool cache. That's about 1.8 GB at 128K and 14 GB at 1M. The 30 SWA layers
-  hold 512 rows each.
+- KV (binary16 since E30): the 12 sparse layers × 576 × 2 bytes come to
+  13.8 KB per token; the indexer's pooled keys add 1.5 KB and its score buffer
+  2 KB, about 17.4 KB per token of session context (18 GB at 1M). The 30 SWA
+  layers hold rings of 2,560 rows. With DFly2 and vision, a 1,048,576-token
+  session loads with 122.6 of 124 GiB of device memory in use; the prompt cache
+  shrinks to 3.4 GB.
 - What's left goes to the page cache for the 63.4 GB Engram file (its hot rows),
   the prompt cache and the runtime. Decode reads 64 rows per token
   (4 layers × 2 orders × 8 heads), 96 bytes each.
@@ -186,11 +189,11 @@ These are judgment calls made without the maintainer; revisit any of them.
 4. **Evaluation in chunks of up to 8 tokens.** `mmvq` serves N ≤ 8, so one
    evaluation takes 1-8 tokens: decode is N = 1, and prefill loops over chunks
    of 8. Large-batch MMQ prefill is phase 5.
-5. **KV in FP32 at first.** Each layer stores one 576-wide latent row per token
-   (512 normed `kv_cmpr` + 64 roped `k_pe`). Sparse layers keep every row;
-   SWA layers keep a 512-row ring. FP32 costs 27.6 KB per token for the 12
-   sparse layers (1.8 GB at 64K). F16 like llama.cpp's default cache is a later
-   memory/speed change.
+5. **KV in FP32 at first** (binary16 since E30). Each layer stores one
+   576-wide latent row per token (512 normed `kv_cmpr` + 64 roped `k_pe`).
+   Sparse layers keep every row; SWA layers keep a 512-row ring. FP32 cost
+   27.6 KB per token for the 12 sparse layers, too much for the model's 1M
+   context; binary16 halves it.
 6. **Full attention below 2,048 tokens.** A sparse layer selects at most 511
    pooled 4-token groups plus its own group, so at up to 2,048 tokens it
    attends to all of them. The indexer's pooled keys are still written from

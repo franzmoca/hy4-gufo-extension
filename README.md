@@ -45,7 +45,8 @@ gufo serve llm -m Hy4-flash-Q4_K_M-00001-of-00002.gguf \
 ```
 
 The second GGUF shard (the Engram table) must sit beside the first. Without
-`--context` a session holds 32,768 tokens. `--dfly-model` takes the drafter's
+`--context` a session holds 32,768 tokens; the model's full 1,048,576 tokens
+fit on a 128 GB Strix Halo beside DFly2 and vision. `--dfly-model` takes the drafter's
 safetensors file or the directory holding it. By default it drafts until its
 confidence head predicts acceptance below 0.45, up to 7 tokens;
 `--dfly-draft-tokens` (1 to 7) fixes the count instead. Without `--mmproj`, a single

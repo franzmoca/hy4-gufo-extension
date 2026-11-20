@@ -156,7 +156,8 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model, std::uint
   add(ContinuationPart::kTokens, 0,
       {.id = {}, .kind = cache::ComponentKind::kAppendRows, .row_bytes = sizeof(std::int32_t),
        .rows_per_chunk = kSmallChunkRows});
-  const std::size_t latent_bytes = std::size_t{c.kv_lora + c.n_rot} * sizeof(float);
+  const std::size_t latent_bytes =
+      std::size_t{c.kv_lora + c.n_rot} * sizeof(std::uint16_t);
   std::size_t ring_bytes = 0;
   for (std::uint32_t l = 0; l < c.n_layer; ++l) {
     if (c.is_swa[l]) {
@@ -183,7 +184,7 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model, std::uint
   const auto put = [&](std::uint32_t value) {
     for (unsigned i = 0; i < 4; ++i) identity_.push_back(static_cast<std::uint8_t>(value >> (8 * i)));
   };
-  put(2);  // Component layout version.
+  put(3);  // Component layout version (3: binary16 latent rows).
   put(context);
 }
 
@@ -279,7 +280,7 @@ std::vector<ContinuationAdapter::Piece> ContinuationAdapter::PrivateRegion(State
       // (Positions before 0, at the start of a short prompt, are rows no pass
       // reads.)
       const auto Tokens = static_cast<std::int64_t>(state.Tokens());
-      const auto span = [&](float* base, std::uint32_t ring, std::int64_t first,
+      const auto span = [&](void* base, std::uint32_t ring, std::int64_t first,
                             std::uint32_t count, std::size_t row_bytes) {
         const auto start =
             static_cast<std::uint32_t>(((first % ring) + ring) % ring);
@@ -290,7 +291,8 @@ std::vector<ContinuationAdapter::Piece> ContinuationAdapter::PrivateRegion(State
         if (run < count)
           add(base, std::size_t{count - run} * row_bytes);
       };
-      const std::size_t latent_bytes = std::size_t{cfg.kv_lora + cfg.n_rot} * sizeof(float);
+      const std::size_t latent_bytes =
+          std::size_t{cfg.kv_lora + cfg.n_rot} * sizeof(std::uint16_t);
       const std::size_t index_bytes =
           std::size_t{2} * cfg.idx_dim * sizeof(float);
       for (std::uint32_t l = 0; l < cfg.n_layer; ++l) {
