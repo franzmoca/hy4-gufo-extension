@@ -1,0 +1,160 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 40,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.2.11-200.fc44.x86_64",
+      "memoryTotalBytes": 133610618880,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "10.1.0",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "d95cf8ed0540f18010f09b38f08ee3ed292c9d17a7100ce4d0273dd287de1c7f",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-11-20",
+  "mode": "dfly",
+  "model": {
+    "id": "Hy4-Flash",
+    "variant": null
+  },
+  "notes": [
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.154 tokens/word, template overhead 24 tokens",
+    "not measured, d4096: depth 4096: server generated 120 of 128 tokens (cache_n 4137, prompt_n 2032); either the model stopped at EOS despite the continuation request, or prefix + prompt + output exceed the table's `context`"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "acceptance": 99.16,
+      "acceptance_sd": null,
+      "accepted_per_step": 11.8,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "counts": [
+        {
+          "cache_n": 0,
+          "completion_sha256": "51cf5722a55295d1238a74076a0222b728da678ea6e48f6f153a7af2d784ce76",
+          "draft_n": 119,
+          "draft_n_accepted": 118,
+          "predicted_n": 128,
+          "prompt_n": 2042
+        }
+      ],
+      "pp": 863.82,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 63.69,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "16384": {
+      "acceptance": 92.86,
+      "acceptance_sd": null,
+      "accepted_per_step": 10.64,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "counts": [
+        {
+          "cache_n": 16316,
+          "completion_sha256": "7d5e75fceaed189980845ce3e183392509dc367635e60893db445c691828beaa",
+          "draft_n": 126,
+          "draft_n_accepted": 117,
+          "predicted_n": 128,
+          "prompt_n": 2041
+        }
+      ],
+      "pp": 795.56,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 58.57,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "32768": {
+      "acceptance": 95.12,
+      "acceptance_sd": null,
+      "accepted_per_step": 10.64,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "counts": [
+        {
+          "cache_n": 32771,
+          "completion_sha256": "3ac633e8e1eff93f0c460ded1a100586f7466119fa0d30f63f77906a04ed0d4a",
+          "draft_n": 123,
+          "draft_n_accepted": 117,
+          "predicted_n": 128,
+          "prompt_n": 2044
+        }
+      ],
+      "pp": 741.0,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 57.78,
+      "tg_sd": null,
+      "workload": "repetition"
+    },
+    "8192": {
+      "acceptance": 92.06,
+      "acceptance_sd": null,
+      "accepted_per_step": 9.67,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "counts": [
+        {
+          "cache_n": 8194,
+          "completion_sha256": "d41deb81970acd64ba9ad9f5e72a070a0c979e8f4a94cca94acae44c9f5e61f9",
+          "draft_n": 126,
+          "draft_n_accepted": 116,
+          "predicted_n": 128,
+          "prompt_n": 2020
+        }
+      ],
+      "pp": 814.6,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 57.51,
+      "tg_sd": null,
+      "workload": "repetition"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "gufo",
+      "serve",
+      "--port",
+      "52613",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "Hy4-flash-Q4_K_M-00001-of-00002.gguf",
+      "--context",
+      "40960",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off",
+      "--dfly-model",
+      "tencent-dfly2"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "0a473ebfca668dbf9e41265b8082239a1935d719"
+  },
+  "table": "single-dfly-repetition",
+  "target": "gufo"
+}

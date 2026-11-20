@@ -1,0 +1,160 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 40,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.2.11-200.fc44.x86_64",
+      "memoryTotalBytes": 133610618880,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "10.1.0",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "d95cf8ed0540f18010f09b38f08ee3ed292c9d17a7100ce4d0273dd287de1c7f",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-11-20",
+  "mode": null,
+  "model": {
+    "id": "Hy4-Flash",
+    "variant": null
+  },
+  "notes": [
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.154 tokens/word, template overhead 24 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "counts": [
+        {
+          "cache_n": 0,
+          "completion_sha256": "1b3ed0427b45bd47a122102a136e3da3ad86f84e5d6048d02eeba5ee0f726f31",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2044
+        }
+      ],
+      "pp": 869.99,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 16.36,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "16384": {
+      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "counts": [
+        {
+          "cache_n": 16311,
+          "completion_sha256": "40587d0f2eb53d718117d2f0e76d52be0880372cafec7ce80c4536fe6c46f1e7",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2044
+        }
+      ],
+      "pp": 795.81,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 16.28,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "32768": {
+      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "counts": [
+        {
+          "cache_n": 32752,
+          "completion_sha256": "68af090df713d6d3e013f001437b8a63c43dbdb6b7b1a3a1e480ea62c03b343f",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2016
+        }
+      ],
+      "pp": 758.38,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 16.18,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "4096": {
+      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "counts": [
+        {
+          "cache_n": 4097,
+          "completion_sha256": "61d4cabed6fb565df38b123b726f2ef2b920bcc38dd5e4be5237e20967b32440",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2043
+        }
+      ],
+      "pp": 825.61,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 16.38,
+      "tg_sd": null,
+      "workload": "prose"
+    },
+    "8192": {
+      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "counts": [
+        {
+          "cache_n": 8190,
+          "completion_sha256": "21a452c5f2054fa40e4c156cba0d368b3a95b6cd9054bfb3b6045b71dd54de91",
+          "draft_n": 0,
+          "draft_n_accepted": 0,
+          "predicted_n": 128,
+          "prompt_n": 2023
+        }
+      ],
+      "pp": 817.72,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 16.34,
+      "tg_sd": null,
+      "workload": "prose"
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "gufo",
+      "serve",
+      "--port",
+      "46755",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "Hy4-flash-Q4_K_M-00001-of-00002.gguf",
+      "--context",
+      "40960",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "0a473ebfca668dbf9e41265b8082239a1935d719"
+  },
+  "table": "single-ar",
+  "target": "gufo"
+}

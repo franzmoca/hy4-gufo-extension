@@ -1,0 +1,87 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 40,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.2.11-200.fc44.x86_64",
+      "memoryTotalBytes": 133610618880,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "10.1.0",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "d95cf8ed0540f18010f09b38f08ee3ed292c9d17a7100ce4d0273dd287de1c7f",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-11-20",
+  "mode": null,
+  "model": {
+    "id": "Hy4-Flash",
+    "variant": null
+  },
+  "notes": [
+    "llama.cpp: llama-server version: 1.0.0 (build 11429, commit cf70454a)",
+    "file cache reset before each launch with `echo 3 > /proc/sys/vm/drop_caches`",
+    "readiness = HTTP 200 on /health"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "default": {
+      "command": "llama-server -m Hy4-flash-Q4_K_M-00001-of-00002.gguf -c 262144 -np 1 --port 40509 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --load-mode none --lazy-mode on --override-tensor ^per_layer_token_embd\\.weight$=CPU",
+      "ready_s": 20.019,
+      "ready_s_sd": null,
+      "samples": 1
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "llama-server",
+      "-m",
+      "Hy4-flash-Q4_K_M-00001-of-00002.gguf",
+      "-c",
+      "262144",
+      "-np",
+      "1",
+      "--port",
+      "40509",
+      "--host",
+      "127.0.0.1",
+      "--alias",
+      "bench",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--cache-ram",
+      "0",
+      "--load-mode",
+      "none",
+      "--lazy-mode",
+      "on",
+      "--override-tensor",
+      "^per_layer_token_embd\\.weight$=CPU"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "0a473ebfca668dbf9e41265b8082239a1935d719"
+  },
+  "table": "loading",
+  "target": "reference"
+}
