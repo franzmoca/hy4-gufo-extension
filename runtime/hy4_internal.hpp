@@ -78,10 +78,11 @@ struct Model::Scratch {
 struct Exec {
   hipStream_t stream;
   void* blas_handle;
+  bool prompt = false;  // a prompt pass: GEMMs at any token count
 };
 
 /// y[t] = W x[t] for any weight type the model uses (n tokens, W [m][k]):
-/// matvecs up to Model::kVecMax tokens, GEMMs beyond.
+/// matvecs up to Model::kVecMax tokens outside prompt passes, GEMMs beyond.
 bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uint32_t k, std::uint32_t n,
             const Exec& ex, std::string* error);
 

@@ -54,14 +54,12 @@ Greedy replies are reproducible for the same request history, and the release
 (`nix build`) and development builds give byte-identical replies. They are
 not invariant to the history: a prompt-cache restore moves the prefill pass
 boundaries. Since
-[E17](EXPERIMENTS.md#e17-fp16-matrix-core-projections-and-routed-experts-instead-of-mmq-2026-11-20)
-passes of more than 8 tokens give identical results however a prompt is
-split; a pass of 8 or fewer tokens takes the single-token kernels and differs
-slightly (KL 0.003; before E17 every split changed results from the first
-layer on, KL 0.006,
+[E18](EXPERIMENTS.md#e18-prompt-passes-on-the-batched-kernels-at-any-size-2026-11-20)
+a prompt gives identical logits however it is split into passes
+(`--chunkcheck` at tails of 800 down to 1 token), so a reply after a restore
+matches the same request served cold. Before E17 every split changed results
+from the first layer on (KL 0.006, 2% of greedy tokens flipped;
 [E6](EXPERIMENTS.md#e6-prefill-results-against-the-pass-split-2026-11-19)).
-An image prompt served cold and after other requests can therefore still word
-its answer differently.
 
 ## Functional suites
 
@@ -71,14 +69,15 @@ with DFly2 and the vision sidecar:
 | suite | result |
 | --- | --- |
 | `conversation`, `long-context`, `reasoning-budget` | passed |
-| `cache` | passed but `legacy-tool-cancel-disk` `content-preserve1-sampled0` (a greedy near tie after a restore re-prefilled in other chunk shapes; passes without the drafter) |
+| `cache` | passed (since E18; before it, `legacy-tool-cancel-disk` `content-preserve1-sampled0` failed: a greedy near tie after a restore re-prefilled in other pass shapes) |
 | `tools` | passed but the 12-token `auto-tools` limit (Hy4's tags are single tokens) |
 | `image-inputs` | passed |
 | `tool-images` | passed but `tool_images_two_calls`: the model answers `red, blue` to "separated by a comma and no spaces" |
 
 After the prefill kernel work (E10-E16, 2026-11-20) and again after E17,
-`conversation`, `long-context` and `cache` give the same results: all pass
-but the same `legacy-tool-cancel-disk` case.
+`conversation`, `long-context` and `cache` gave the same results: all passed
+but the same `legacy-tool-cancel-disk` case. After E18 every case of the
+three suites passes.
 
 The harness marks drafter runs failed in its measurements ("AR request
 executed speculative drafts"): it knows only Gufo's own speculative backends.

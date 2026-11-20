@@ -395,11 +395,12 @@ __global__ __launch_bounds__(kThreads) void dense_f16_kernel(
   __shared__ __attribute__((aligned(16))) _Float16 act[2 * kTile * kPitch];
   const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32, h = lane / 16;
   const uint64_t row_bytes = (uint64_t)k / 256 * F::kBlockBytes;
-  /* Workgroups run in index order: group, then chunks of chunk_tiles token
-   * tiles, chunks of chunk_rows row blocks, tiles, row blocks. */
-  const uint32_t per_group = row_blocks * tiles;
-  const uint32_t z = blockIdx.x / per_group;
-  uint32_t index = blockIdx.x - z * per_group;
+  /* Workgroups run in index order: chunks of chunk_tiles token tiles, chunks
+   * of chunk_rows row blocks, tiles, row blocks, and the group fastest, so
+   * that the workgroups in flight read and write neighbouring parts of the
+   * same token rows. */
+  const uint32_t z = blockIdx.x % groups;
+  uint32_t index = blockIdx.x / groups;
   const uint32_t tile_chunk = index / (row_blocks * chunk_tiles);
   index -= tile_chunk * row_blocks * chunk_tiles;
   const uint32_t tiles_here =
@@ -439,21 +440,46 @@ __global__ __launch_bounds__(kThreads) void dense_f16_kernel(
   L::run(act, wr, xs, k, live, acc);
 
   /* Accumulator element e of a lane is (row 2 e + lane / 16, token lane % 16).
-   */
-  if (row0 >= m)
-    return;
+   * Each 16-token tile goes through LDS, so that a token's 256 rows leave as
+   * contiguous 16-byte stores rather than 2 floats per token per store. */
+  float* stage = reinterpret_cast<float*>(act);  // [16 tokens][kRows + 4]
+  constexpr int kStagePitch = kRows + 4;
+  static_assert(16 * kStagePitch * 4 <= sizeof(act));
+  const uint32_t valid = min((uint32_t)kRows, m - block * kRows);
   const uint64_t out_stride = (uint64_t)groups * m;
+  const uint32_t s_token = tid / 32, s_col = (tid % 32) * 8;
 #pragma unroll
   for (int t = 0; t < 8; ++t) {
-    if (t >= live)
-      continue;
-    const uint32_t token = t0 + t * 16 + lane % 16;
-    if (!kFull && token >= n)
-      continue;
+    if (t >= live)  // uniform; a runtime-bounded loop sent acc to scratch
+      break;
+    __syncthreads();  // the K loop's or the previous tile's reads are done
 #pragma unroll
     for (int e = 0; e < 8; ++e)
-      out[token * out_stride + (uint64_t)z * m + row0 + 2 * e + h] =
-          (Y)finite_or_zero(acc[t][e]);
+      stage[(lane % 16) * kStagePitch + wave * 16 + 2 * e + h] = acc[t][e];
+    __syncthreads();
+    const uint32_t token = t0 + t * 16 + s_token;
+    if ((kFull || token < n) && s_col < valid) {
+      const float4 lo = *reinterpret_cast<const float4*>(
+          stage + s_token * kStagePitch + s_col);
+      const float4 hi = *reinterpret_cast<const float4*>(
+          stage + s_token * kStagePitch + s_col + 4);
+      Y* o = out + token * out_stride + (uint64_t)z * m + block * kRows + s_col;
+      const float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+      if constexpr (sizeof(Y) == 4) {
+        *reinterpret_cast<float4*>(o) =
+            float4{finite_or_zero(v[0]), finite_or_zero(v[1]),
+                   finite_or_zero(v[2]), finite_or_zero(v[3])};
+        *reinterpret_cast<float4*>(o + 4) =
+            float4{finite_or_zero(v[4]), finite_or_zero(v[5]),
+                   finite_or_zero(v[6]), finite_or_zero(v[7])};
+      } else {
+        half8 hv;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          hv[i] = (_Float16)finite_or_zero(v[i]);
+        *reinterpret_cast<half8*>(o) = hv;
+      }
+    }
   }
 }
 

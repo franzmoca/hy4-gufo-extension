@@ -84,15 +84,23 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uin
     return Fail(error, "hy4: matvec shape mismatch (" + std::to_string(m) + "x" + std::to_string(k) + ")");
   }
   hipStream_t stream = ex.stream;
-  const bool batched = n > Model::kVecMax;
+  const bool batched = n > Model::kVecMax || ex.prompt;
   switch (w.type) {
     case HY4_TYPE_F32:
       if (batched) {
         // Row-major y[n][m] = x[n][k] W^T, as column-major y^T = W^T x^T.
+        // Small prompt passes run as 16 rows (x and y are chunk scratch; the
+        // extra rows are ignored): hipBLAS takes another kernel for a single
+        // row, which would make a prompt's last token depend on its pass.
         const float one = 1.0f;
         const float zero = 0.0f;
-        if (hipblasSgemm(static_cast<hipblasHandle_t>(ex.blas_handle), HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(m), static_cast<int>(n),
-                         static_cast<int>(k), &one, w.f32(), static_cast<int>(k), x, static_cast<int>(k), &zero, y,
+        const std::uint32_t rows =
+            ex.prompt ? std::max<std::uint32_t>(n, 16) : n;
+        if (hipblasSgemm(static_cast<hipblasHandle_t>(ex.blas_handle),
+                         HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(m),
+                         static_cast<int>(rows), static_cast<int>(k), &one,
+                         w.f32(), static_cast<int>(k), x, static_cast<int>(k),
+                         &zero, y,
                          static_cast<int>(m)) != HIPBLAS_STATUS_SUCCESS) {
           return Fail(error, "hy4: sgemm failed");
         }
@@ -135,10 +143,10 @@ bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
                 std::uint32_t n, const Exec& ex, std::string* error) {
   const bool quantized = w1.type == HY4_TYPE_Q8_0 || w1.type == HY4_TYPE_Q4_K ||
                          w1.type == HY4_TYPE_Q6_K;
-  if (n > Model::kVecMax && quantized && w2.type == w1.type && k % 256 == 0 &&
-      m1 % 16 == 0 && m2 % 16 == 0 && w1.dims.size() >= 2 && w1.dims[0] == k &&
-      w1.dims[1] == m1 && w2.dims.size() >= 2 && w2.dims[0] == k &&
-      w2.dims[1] == m2) {
+  if ((n > Model::kVecMax || ex.prompt) && quantized && w2.type == w1.type &&
+      k % 256 == 0 && m1 % 16 == 0 && m2 % 16 == 0 && w1.dims.size() >= 2 &&
+      w1.dims[0] == k && w1.dims[1] == m1 && w2.dims.size() >= 2 &&
+      w2.dims[0] == k && w2.dims[1] == m2) {
     HY4_CHECK(hy4_f16_dense_pair(w1.type, w1.data, y1, m1, w2.data, y2, m2, x,
                                  n, k, 0, ex.stream));
     return true;
@@ -289,8 +297,14 @@ Session::~Session() {
   for (void* p : allocations_) (void)hipFree(p);
 }
 
-bool Session::Evaluate(std::span<const std::int32_t> tokens, std::vector<float>* logits, bool all_logits,
-                       std::string* error) {
+bool Session::Evaluate(std::span<const std::int32_t> tokens,
+                       std::vector<float>* logits, bool all_logits,
+                       std::string* error, bool prompt) {
+  prompt_pass_ = prompt;
+  struct Reset {
+    bool& flag;
+    ~Reset() { flag = false; }
+  } reset{prompt_pass_};
   if (logits) logits->clear();
   std::vector<float> part;
   for (std::size_t i = 0; i < tokens.size(); i += Model::kMaxChunk) {
@@ -384,7 +398,7 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   const Weights& w = m.weights_;
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_};
+  const Exec ex{st, m.blas_, prompt_pass_};
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t pos0 = Position();
   if (n == 0) return true;
@@ -565,7 +579,8 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_};
+  const Exec ex{st, m.blas_, prompt_pass_};
+  const bool batched = n > Model::kVecMax || prompt_pass_;
   auto* blas = static_cast<hipblasHandle_t>(m.blas_);
   const std::uint32_t heads = c.n_head[il];
   const std::uint32_t dk = c.kv_lora + c.n_rot;
@@ -590,7 +605,7 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (l.wk_b.type != HY4_TYPE_Q8_0 || l.wv_b.type != HY4_TYPE_Q8_0) return Fail(error, "hy4: wk_b/wv_b must be Q8_0");
   // Prefill passes hand MlaPrefill binary16 queries in qfull's storage.
   auto* qh = reinterpret_cast<std::uint16_t*>(s.qfull);
-  if (n > Model::kVecMax) {
+  if (batched) {
     HY4_CHECK(hy4_mla_absorb(l.wk_b_q, l.wk_b_d, s.q, qh, n, heads, nope,
                              c.n_rot, c.kv_lora, st));
   } else {
@@ -627,7 +642,7 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (window)
     lo = std::max<std::int32_t>(0, static_cast<std::int32_t>(Position()) - static_cast<std::int32_t>(window) + 1);
   const std::uint32_t n_keys = static_cast<std::uint32_t>(last - lo + 1);
-  if (n > Model::kVecMax) {
+  if (batched) {
     // Prefill reads binary16 keys, converted once per pass.
     HY4_CHECK(hy4_gather_rows_half(cache_[il], ring_[il], lo, n_keys, dk,
                                    keys_half_, st));
@@ -636,12 +651,12 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
         hy4_gather_rows(cache_[il], ring_[il], lo, n_keys, dk, s.keys, st));
     keys = s.keys;
   }
-  if (sel && n <= Model::kVecMax)
+  if (sel && !batched)
     HY4_CHECK(hy4_selection_mask(sel, n_sel, mask_, n, n_keys, st));
   const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_k));
   const float zero = 0.0f;
   const float one = 1.0f;
-  if (n <= Model::kVecMax) {
+  if (!batched) {
     // Each token over exactly the keys a one-token pass would see, so a
     // verify pass computes what decoding its tokens one by one would.
     for (std::uint32_t t = 0; t < n; ++t) {
@@ -666,14 +681,14 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
       }
     }
   }
-  if (n > Model::kVecMax) {
+  if (batched) {
     // Prefill: each token over exactly its own keys on the matrix cores, so a
     // token's result does not depend on how its span was cut into passes.
     HY4_CHECK(hy4_mla_prefill(qh, keys_half_, lo, s.pos, window, sel, n_sel,
                               l.attn_sinks.f32(), scale, s.att, n, heads, dk,
                               c.kv_lora, st));
   }
-  if (n > Model::kVecMax) {
+  if (batched) {
     HY4_CHECK(hy4_f16_dense(l.wv_b.type, l.wv_b.data, s.att, s.attv, c.head_v,
                             n, c.kv_lora, heads, 0, st));
   } else {
@@ -695,7 +710,7 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_};
+  const Exec ex{st, m.blas_, prompt_pass_};
   const std::uint32_t d = c.idx_dim;
   const float base = c.rope_base;  // indexer layers are the sparse ones
 
@@ -769,7 +784,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_};
+  const Exec ex{st, m.blas_, prompt_pass_};
 
   if (il < c.n_dense_lead) {
     const std::uint32_t f = c.n_ff_dense;
@@ -794,7 +809,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   HY4_CHECK(hy4_route(s.logits_r, l.exp_bias ? l.exp_bias.f32() : nullptr, s.ids, s.route_w, n, c.n_expert, used,
                       c.expert_norm ? 1 : 0, c.expert_scale, st));
   if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex, error)) return false;
-  if (n > Model::kVecMax) {
+  if (n > Model::kVecMax || prompt_pass_) {
     if (l.gate_exps.type != l.up_exps.type) return Fail(error, "hy4: gate and up experts differ in type");
     // The routed plan: slots grouped by expert in 128-slot tiles.
     const std::uint32_t slots = n * used;

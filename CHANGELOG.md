@@ -40,3 +40,7 @@
   the vendored MMQ, and a prompt prefilled in different passes now gives the
   same results, except for passes of 8 or fewer tokens
   ([E17](docs/EXPERIMENTS.md#e17-fp16-matrix-core-projections-and-routed-experts-instead-of-mmq-2026-11-20)).
+- A prompt gives the same results however it is cut into passes, so a reply
+  after a prompt-cache restore matches the reply to the same prompt served
+  cold; short prompt passes are faster
+  ([E18](docs/EXPERIMENTS.md#e18-prompt-passes-on-the-batched-kernels-at-any-size-2026-11-20)).

@@ -1170,7 +1170,23 @@ void TestF16Matmul() {
     Expect(hy4_f16_dense(c.type, dw, dx, dy, c.m, c.n, c.k, c.groups, 0,
                          nullptr) == 0,
            std::string("f16_dense status ") + c.name);
-    Near(Host(dy, outs), want, 2e-3, std::string("f16_dense ") + c.name);
+    const auto full = Host(dy, outs);
+    Near(full, want, 2e-3, std::string("f16_dense ") + c.name);
+    // A token's rows do not depend on the pass it is in: the first 5 tokens
+    // alone give the same bits (prompt passes rely on it).
+    {
+      const uint32_t few = 5;
+      const std::size_t few_outs = (std::size_t)few * c.groups * c.m;
+      float* dyf = Device(std::vector<float>(few_outs));
+      Expect(hy4_f16_dense(c.type, dw, dx, dyf, c.m, few, c.k, c.groups, 0,
+                           nullptr) == 0,
+             std::string("f16_dense few status ") + c.name);
+      const auto part = Host(dyf, few_outs);
+      Expect(
+          std::memcmp(part.data(), full.data(), few_outs * sizeof(float)) == 0,
+          std::string("f16_dense rows independent of the pass ") + c.name);
+      (void)hipFree(dyf);
+    }
     // FP16 in and out: the same sums, rounded once more on the way out.
     std::vector<uint16_t> xh(x.size());
     for (std::size_t i = 0; i < x.size(); ++i)

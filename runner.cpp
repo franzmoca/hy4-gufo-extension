@@ -435,7 +435,8 @@ public:
     }
     const auto tokens = EngineTokens(prompt.subspan(offset, consumed));
     std::string error;
-    if (!hy4.session().Step(tokens, &error)) throw std::runtime_error("Hy4 prefill failed: " + error);
+    if (!hy4.session().Prompt(tokens, &error))
+      throw std::runtime_error("Hy4 prefill failed: " + error);
     hy4.set_position(offset + consumed);
     return {.consumed_tokens = consumed, .decode_ready = offset + consumed == prompt.size()};
   }

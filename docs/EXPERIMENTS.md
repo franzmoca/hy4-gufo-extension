@@ -23,6 +23,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E15 | Prefill attention keys converted to binary16 once per pass | retained |
 | E16 | Routed expert tile width per expert | retained |
 | E17 | FP16 matrix-core projections and routed experts instead of MMQ | retained |
+| E18 | Prompt passes on the batched kernels at any size | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -331,3 +332,33 @@ independent of the pass split: `--chunkcheck` at 200 and 517 gives identical
 logits (was KL 0.0055 from layer 0, E6), since a row's sums no longer depend
 on its place in the batch. A tail of 8 or fewer tokens still takes the
 single-token MMQ path and differs (`--chunkcheck 995`: KL 0.0028). Retained.
+
+## E18: Prompt passes on the batched kernels at any size (2026-11-20)
+
+After E17 only passes of 8 or fewer tokens still depended on the pass split:
+they took the single-token kernels (MMQ matvecs, per-token hipBLAS
+attention), which verify passes need so that they compute what one-token
+decoding does. Prompt passes have no such constraint, so `Session::Prompt`
+(the runner's prefill, and `Evaluate(..., prompt = true)`) now takes the
+batched kernels at any size, and only decoding and verify passes take the
+single-token ones. One more kernel depended on the row count: hipBLAS runs a
+one-row FP32 GEMM (the router, the indexer weights) with another kernel, so
+prompt passes under 16 rows run it as 16 rows of the chunk scratch.
+`--chunkcheck` on 1,000 tokens at 200, 517, 995, 996, 998 and 999 (tails of
+800 down to 1 token): identical logits at every split, against KL 0.0028 at
+995 with E17. `hy4flash.kernels` checks that the FP16 kernels give a token's
+rows the same bits in a 5-token and a 150-token pass. The `cache` suite now
+passes `legacy-tool-cancel-disk`, which a restore re-prefilling a gap in
+other pass shapes had failed since the first build. A 5-token prompt pass
+takes 0.142 s instead of 0.205 s (the single-token attention ran one token
+at a time).
+
+Two changes to the dense kernel's stores came with it. Ablation on the
+grouped `wv_b` (64 groups of 256 rows, k = 512; 5.15 ms) found the stores
+half its time (2.85 ms without them) and FP16 input 0.9 ms. Each 16-token
+tile now goes through LDS and leaves as contiguous 16-byte stores of a
+token's rows (5.24 → 4.96 ms; `wo` 7.63 → 7.48 ms), and the group index is
+the fastest grid index, so the workgroups in flight read and write
+neighbouring parts of the same token rows (4.96 → 4.13 ms). Same values.
+3,712-token prefill 5.58 → 5.52, 5.53 s. KL 0.0834 ± 0.0079 and
+`--passcheck 8` unchanged. Retained.

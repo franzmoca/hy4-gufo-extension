@@ -200,9 +200,13 @@ public:
 
   /// Evaluates `tokens` at the next positions; with `logits` set, writes the
   /// logits of every evaluated token ([n][n_vocab], host) when `all_logits`,
-  /// else of the last one.
-  [[nodiscard]] bool Evaluate(std::span<const std::int32_t> tokens, std::vector<float>* logits,
-                              bool all_logits, std::string* error);
+  /// else of the last one. `prompt` passes take the batched kernels at any
+  /// size, so a prompt gives the same results however it is cut into passes;
+  /// other passes of up to kVecMax tokens compute what one-token decoding
+  /// would.
+  [[nodiscard]] bool Evaluate(std::span<const std::int32_t> tokens,
+                              std::vector<float>* logits, bool all_logits,
+                              std::string* error, bool prompt = false);
 
   /// Evaluates `tokens` and keeps the last one's logits (LastLogits).
   [[nodiscard]] bool Step(std::span<const std::int32_t> tokens, std::string* error) {
@@ -210,6 +214,11 @@ public:
   }
   /// The logits after the last Step, [n_vocab] on the host.
   [[nodiscard]] std::vector<float>& LastLogits() { return last_logits_; }
+  /// Step for prompt tokens (Evaluate's `prompt`).
+  [[nodiscard]] bool Prompt(std::span<const std::int32_t> tokens,
+                            std::string* error) {
+    return Evaluate(tokens, &last_logits_, false, error, true);
+  }
 
   /// Evaluates `tokens` (at most kTapRows) and keeps every one's logits
   /// (PassLogits) until Keep.
@@ -344,6 +353,7 @@ private:
   std::uint32_t tap_row_ = 0;
   std::uint32_t tap_rows_ = 0;  // rows the last pass left
   bool tap_ready_ = false;
+  bool prompt_pass_ = false;  // the current Evaluate is a prompt pass
   // The last Verify: its first position and logits [n][n_vocab].
   std::uint32_t pass_pos0_ = 0;
   std::vector<float> pass_logits_;

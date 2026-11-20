@@ -497,10 +497,10 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   the attention 0.66 s, the FP32 router GEMM 0.2 s, hyper-connection kernels
   0.43 s, the indexer score 0.17 s (bound by its warp sums; a faster form
   changes the summation order, which the selection's near ties are sensitive
-  to), the attention gate 0.12 s. Candidates: the grouped `wv_b` runs at
-  6.7 TFLOPS (k = 512: two weight blocks per row, so the staging pipeline
-  never fills; FP16 attention output from `MlaPrefill` would halve its
-  reads); fold the attention gate's sigmoid product into the `wo` staging;
+  to), the attention gate 0.12 s. Candidates: the grouped `wv_b` (4.1 ms
+  per 2,048 tokens after E18's store changes, about half of it stores of
+  FP32 rows: FP16 attention output from `MlaPrefill` would save about 0.9 ms
+  of its reads, an FP16 `attv` for `wo` its stores); fold the attention gate's sigmoid product into the `wo` staging;
   fuse `HcPost` into the next `HcMix` (both read the four streams); in the
   attention a conflict-free value transpose (P.V is about 20% of the
   kernel). Register prefetch of key tiles does not fit beside the query
@@ -538,23 +538,13 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   lower-bit attention quant (half the bytes per token), a model-format
   choice rather than a kernel one.
 
-- **Prefill batch invariance.** A token's result depends on the passes its
-  span was cut into (GEMMs over different row counts, the vec path at 8 or
-  fewer), so a restore that re-prefills a gap with other chunk shapes can
-  flip a greedy near tie. Gufo's `cache` suite expects invariance. Making the
-  batched kernels row-independent (MMQ tiles without stream-K, attention per
-  row block over its own keys) is the likely route; measure the prefill cost.
-  E6 measures it with `hy4_eval_probe --chunkcheck`: token S differs from
-  layer 0 on, KL 0.006 and 2% flipped greedy tokens after the split. Layer 0
-  differing means the dense projections and experts vary with the pass width
-  too, not only attention: bisect layer 0's operations with the probe before
-  choosing which kernels to make row-independent. After E7 layer 0 matches
-  across splits; the first difference is in layer 1 (0.0026). Since E17
-  batched passes are split-invariant (`--chunkcheck` 200 and 517: identical
-  logits); a pass of 8 or fewer tokens still takes the single-token MMQ
-  kernels (`--chunkcheck 995`: KL 0.0028). Running those passes through the
-  FP16 kernels too would close it, if the 2-8 token cost allows; one-token
-  decoding would then have to match them for `--passcheck`.
+- **Prefill batch invariance** (done, E17-E18). A token's result depended
+  on the passes its span was cut into, so a restore re-prefilling a gap in
+  other pass shapes could flip a greedy near tie. E17's FP16 kernels made
+  batched passes row-independent, and E18 runs prompt passes of any size on
+  them (with the hipBLAS FP32 GEMM held to 16 rows): `--chunkcheck` is exact
+  at every split, and the `cache` suite passes. Decoding and verify passes
+  keep the single-token kernels, which `--passcheck` holds exact.
 
 - Sparse layers score every earlier key and mask all but the 2,048 selected
   (`hy4_selection_mask`); at 32K that reads about 75 MB per sparse layer per
