@@ -44,6 +44,8 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E36 | Prefill attention below position 2,048 independent of the pass | retained |
 | E37 | 4,096-token prefill passes | retained |
 | E38 | Fewer hyper-connection mix slices in prompt passes | rejected |
+| E39 | Hyper-connection mixes in 256-token chunks | rejected |
+| E40 | Prefill kernel ablations after E37 | analysis |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -951,3 +953,36 @@ bit. Rejected.
 
 `hy4_eval_probe --kl` and `--ppl` now evaluate in prompt passes, as serving
 prefills text; at 48 slices the result is unchanged (KL 0.08424).
+
+## E39: Hyper-connection mixes in 256-token chunks (2026-11-20)
+
+`HcApply` reads back the 182 MB of FP32 streams (3,712 tokens, four
+streams) that `HcMixTokens` has just written. Launching both on chunks of
+128 to 1,024 tokens, so that a chunk (6 to 48 MB) could stay in the 32 MiB
+cache between them, left the arithmetic unchanged but not the time: one
+3,712-token prefill took 4.14 to 4.20 s at every chunk size and without
+chunks (two runs per size, mirrored order). Rejected.
+
+## E40: Prefill kernel ablations after E37 (2026-11-20)
+
+Where a 3,712-token prefill (4.19 s of kernels) spends its time, and what
+each part of the largest kernels costs, measured by removing it (outputs
+wrong, work unchanged) under `prof.py`:
+
+| kernel | time | ablation | saved |
+| --- | --- | --- | --- |
+| dense projections (Q8, FP16 x) | 1,421 ms | weight loads / activation staging / Q8 decode / fragment exchange | 9% / 9% / 7% / 0 |
+| routed experts | 1,096 ms | down projection's FP32 store | 34 ms |
+| `MlaPrefill` | 634 ms | P·V operand gather / key staging | 59 / 112 ms |
+| hyper-connections | 318 ms | E38, E39 | none |
+| router and indexer `SgemmNt` (FP32) | 127 ms | | |
+
+The dense kernel's figures come from `tools/bench/hy4_dense_bench.hip.cpp`
+at 4,096 tokens (33.1 ms for one layer's shapes, 35 TFLOPS on the 64-head
+projections against 54.8 measured peak): no phase dominates, as in DS41's
+kernel it derives from, so no single change there recovers more than a few
+percent. `MlaPrefill` runs at about 19 TFLOPS: one token and 32 heads per
+block (the registers bound the rows), four barriers per 32-key tile and the
+dimension-split scores take about 240 ms beyond its 220 ms WMMA floor, the
+one large headroom left; its redesign is the next prefill item in the
+backlog.

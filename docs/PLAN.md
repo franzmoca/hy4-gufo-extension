@@ -509,6 +509,11 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   (E21); the post-mix in the next pre-mix: 5.07 s (E23); binary16 normed
   inputs and expert latent: 4.86 s (E24); indexer scores by thread: 4.71 s
   (E25); kpool selection by radix select: 4.62 s (E26).
+  Since then: 4,096-token passes, 888 tok/s on 3,712 tokens (E37). Where the
+  rest goes is in E40: the GEMMs run at 60-65% of peak with no dominant
+  phase; `MlaPrefill` (634 ms, about 19 TFLOPS against a 220 ms WMMA floor)
+  is the largest headroom left, mostly barriers and dimension-split scores at
+  one token per block, then key staging (112 ms) and the P.V gather (59 ms).
 
 - **Prefill profile after E17** (3,712 tokens, 5.35 s of kernels): dense
   FP16 projections 1.87 s (27-33 TFLOPS standalone; `wo` and `attn_gate` are
