@@ -89,6 +89,9 @@
   ([E33](docs/EXPERIMENTS.md#e33-prompt-lookup-2026-11-20)); greedy requests
   verify up to 15 copied tokens per pass
   ([E34](docs/EXPERIMENTS.md#e34-16-token-verify-passes-for-copies-2026-11-20)).
+- Prefill evaluates 4,096 tokens per pass: 7% faster on 3.7K to 16K-token
+  prompts (827 → 888 tok/s on 3,712 tokens)
+  ([E37](docs/EXPERIMENTS.md#e37-4096-token-prefill-passes-2026-11-20)).
 - A prompt longer than 2,048 tokens gives the same reply after a
   prompt-cache restore as served cold, wherever the restore splits it
   ([E36](docs/EXPERIMENTS.md#e36-prefill-attention-below-position-2048-independent-of-the-pass-2026-11-20)).

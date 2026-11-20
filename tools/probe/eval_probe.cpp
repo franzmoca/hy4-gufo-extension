@@ -76,7 +76,10 @@ double Seconds(std::chrono::steady_clock::time_point a, std::chrono::steady_cloc
 
 int main(int argc, char** argv) {
   if (argc < 3) {
-    std::fprintf(stderr, "usage: %s MODEL.gguf TOKENS [--gen N] [--ctx N] [--logits FILE]\n", argv[0]);
+    std::fprintf(stderr,
+                 "usage: %s MODEL.gguf TOKENS [--gen N] [--ctx N] [--logits "
+                 "FILE] [--repeat N]\n",
+                 argv[0]);
     return 2;
   }
   const std::string model_path = argv[1];
@@ -94,6 +97,8 @@ int main(int argc, char** argv) {
   std::string kl_path;
   std::uint32_t passcheck = 0;
   std::uint32_t chunkcheck = 0;
+  int repeat =
+      1;  // timed prefills, each on a fresh session; the last one decodes
   for (int i = 3; i + 1 < argc; i += 2) {
     const std::string a = argv[i];
     if (a == "--gen") gen = std::atoi(argv[i + 1]);
@@ -103,6 +108,8 @@ int main(int argc, char** argv) {
     else if (a == "--kl") kl_path = argv[i + 1];
     else if (a == "--passcheck") passcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--chunkcheck") chunkcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--repeat")
+      repeat = std::max(1, std::atoi(argv[i + 1]));
   }
   if (prompt.empty() && kl_path.empty()) {
     std::fprintf(stderr, "no tokens\n");
@@ -427,15 +434,25 @@ int main(int argc, char** argv) {
     }
     PrintTop(logits, model->config().n_vocab, p.size());
   }
-  const auto p0 = std::chrono::steady_clock::now();
-  if (!session->Evaluate(prompt, &logits, false, &error, true)) {
-    std::fprintf(stderr, "prompt failed: %s\n", error.c_str());
-    return 1;
+  for (int r = 0; r < repeat; ++r) {
+    auto fresh = r + 1 < repeat ? model->CreateSession(ctx, &error) : nullptr;
+    auto* s = fresh ? fresh.get() : session.get();
+    if (!s) {
+      std::fprintf(stderr, "session failed: %s\n", error.c_str());
+      return 1;
+    }
+    const auto p0 = std::chrono::steady_clock::now();
+    if (!s->Evaluate(prompt, &logits, false, &error, true)) {
+      std::fprintf(stderr, "prompt failed: %s\n", error.c_str());
+      return 1;
+    }
+    const auto p1 = std::chrono::steady_clock::now();
+    std::printf(
+        "prompt %zu tokens in %.3f s (%.1f tok/s), Engram gather %.3f s\n",
+        prompt.size(), Seconds(p0, p1), prompt.size() / Seconds(p0, p1),
+        s->EngramSeconds());
   }
-  const auto p1 = std::chrono::steady_clock::now();
   const std::size_t vocab = model->config().n_vocab;
-  std::printf("prompt %zu tokens in %.3f s (%.1f tok/s), Engram gather %.3f s\n", prompt.size(), Seconds(p0, p1),
-              prompt.size() / Seconds(p0, p1), session->EngramSeconds());
   if (!logits_path.empty()) {
     std::ofstream f(logits_path, std::ios::binary);
     f.write(reinterpret_cast<const char*>(logits.data()), static_cast<std::streamsize>(vocab * sizeof(float)));

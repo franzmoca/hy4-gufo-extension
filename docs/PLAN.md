@@ -211,7 +211,8 @@ These are judgment calls made without the maintainer; revisit any of them.
    the nixpkgs web UI step and backport.
 9. **Nothing leaves the machine** while the maintainer is away: commits stay
    local, with no GitHub repository or push.
-10. **Prefill in 256-token passes** (`Model::kMaxChunk`): dense and routed
+10. **Prefill in 256-token passes** (`Model::kMaxChunk`; 2,048 since E8,
+    4,096 since E37, with the indexer scoring 2,048 tokens at a time): dense and routed
     projections through the vendored MMQ (the routed grids bounded by the real
     expert buckets), F32 projections through hipBLAS SGEMM, `wk_b` (K = 192)
     dequantized to F32 for a strided-batched SGEMM, `wv_b` through the grouped

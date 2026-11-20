@@ -131,11 +131,14 @@ public:
 class Model {
 public:
   /// Most tokens one evaluation pass takes (longer spans run in passes).
-  static constexpr std::uint32_t kMaxChunk = 2048;
+  static constexpr std::uint32_t kMaxChunk = 4096;
   /// Passes up to this many tokens use matvecs; longer ones use GEMMs.
   static constexpr std::uint32_t kVecMax = 16;
   /// Rows of each indexer layer's value and gate ring.
   static constexpr std::uint32_t kIndexerRing = kMaxChunk + 8;
+  /// Tokens whose indexer scores one launch computes ([kScoreRows][pools]
+  /// per session: 2.1 GB at 1M tokens).
+  static constexpr std::uint32_t kScoreRows = 2048;
 
   ~Model();
   Model(const Model&) = delete;
@@ -340,7 +343,7 @@ private:
   // keys [max_context / kpool][idx_dim].
   std::vector<float*> idx_rows_;
   std::vector<float*> idx_pooled_;
-  // Indexer scores [kMaxChunk][pool rows] and selections
+  // Indexer scores [kScoreRows][pool rows] and selections
   // [kMaxChunk][(top pools + 1) kpool].
   float* score_ = nullptr;
   std::int32_t* sel_ = nullptr;

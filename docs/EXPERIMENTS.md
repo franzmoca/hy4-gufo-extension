@@ -42,6 +42,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E34 | 16-token verify passes for copies | retained |
 | E35 | A smaller draft head: the frequent rows and the request's own | retained |
 | E36 | Prefill attention below position 2,048 independent of the pass | retained |
+| E37 | 4,096-token prefill passes | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -904,3 +905,33 @@ selection row holds (the decode path's key list was already sorted).
 and at 1,000 on the 2,100-token prompt; KL 0.08424 (unchanged: its passes
 put no token below 2,048 beside a selection). The kernel test now checks the
 case bitwise, and fails without the fix. Retained.
+
+## E37: 4,096-token prefill passes (2026-11-20)
+
+At 2,048 tokens a pass gives each of the 512 experts about 64 slots: the
+routed tiles (128 slots) run half full and nearly every expert's weights,
+about 2 GB per layer, are read once per pass. A 3,712-token prefill in one
+pass instead of two (`prof.py`): routed experts 1,344 → 1,097 ms, dense
+projections 1,473 → 1,424 ms, attention 636 → 701 ms.
+
+The indexer's score buffer is [pass tokens][context / 4] floats per session,
+2.1 GB at 1M tokens at 2,048: scores and selections now run in slices of
+2,048 tokens (`Model::kScoreRows`) within a wider pass, so the buffer keeps
+its size. `hy4_eval_probe --repeat N` times N prefills on fresh sessions
+(the first after load varied by up to 10%); the warm runs (2 and 3 of
+three, two processes per cell in mirrored order) spread by under 0.2 s:
+
+| prompt | 2,048 | 4,096 | 8,192 |
+| --- | --- | --- | --- |
+| 3,712 tokens | 827 tok/s | 888 (+7.4%) | 883 |
+| 8,192 tokens | 811 | 866 (+6.8%) | 894 |
+| 16,384 tokens | 792 | 847 (+6.9%) | 876 |
+
+At 8,192 a 1,048,576-token session with DFly2 and vision no longer fits
+("session allocation failed"); at 4,096 it loads and answers with 3.1 GB of
+the device heap free (4.4 GB before). Passes are split-invariant (E18, E36),
+so results do not change: KL 0.08424 (identical), `--chunkcheck` exact at
+1,000, 2,049 and 3,000 on the 3,712-token document and at 5,000 on the
+8,192-token prompt (indexer slices). Gufo's `conversation`, `long-context`
+and `cache` suites pass every case. Retained at 4,096; 8,192 would suit
+servers with smaller contexts.

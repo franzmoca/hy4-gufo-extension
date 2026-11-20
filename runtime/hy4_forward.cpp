@@ -290,7 +290,7 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::st
   }
   const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
   ok = ok &&
-       DeviceAlloc(&s->score_, std::size_t{kMaxChunk} * pools,
+       DeviceAlloc(&s->score_, std::size_t{kScoreRows} * pools,
                    &s->allocations_) &&
        DeviceAlloc(&s->sel_, std::size_t{kMaxChunk} * (top_pools + 1) * c.kpool,
                    &s->allocations_);
@@ -808,8 +808,21 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   if (!MatVec(l.idx_proj, s.cur, s.iw, c.idx_heads, c.n_embd, n, ex, error,
               cur_half))
     return false;
-  HY4_CHECK(hy4_indexer_score(s.iq, s.iw, idx_pooled_[il], s.n_pool, n_pool_max, score_, n, c.idx_heads, d, st));
-  HY4_CHECK(hy4_kpool_select(score_, s.n_pool, n_pool_max, s.pos, top, c.kpool, sel_, n, st));
+  // Scores and selections in slices of kScoreRows tokens, so that the score
+  // buffer stays [kScoreRows][pools] however wide the pass; each token's
+  // selection depends only on its own visible pools.
+  const std::uint32_t n_sel_row = (top + 1) * c.kpool;
+  for (std::uint32_t t = 0; t < n; t += Model::kScoreRows) {
+    const std::uint32_t rows = std::min(Model::kScoreRows, n - t);
+    const std::uint32_t pools_max = (pos0 + t + rows - 1) / c.kpool;
+    HY4_CHECK(hy4_indexer_score(s.iq + std::size_t{t} * c.idx_heads * d,
+                                s.iw + std::size_t{t} * c.idx_heads,
+                                idx_pooled_[il], s.n_pool + t, pools_max,
+                                score_, rows, c.idx_heads, d, st));
+    HY4_CHECK(hy4_kpool_select(score_, s.n_pool + t, pools_max, s.pos + t, top,
+                               c.kpool, sel_ + std::size_t{t} * n_sel_row, rows,
+                               st));
+  }
   *sel = sel_;
   *n_sel = (top + 1) * c.kpool;
   return true;
