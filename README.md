@@ -5,9 +5,11 @@ An experimental Gufo source extension for Tencent's
 Linux x86-64 / Strix Halo `gfx1151`.
 
 **Status:** experimental. `gufo serve llm` serves chat, tool calls, reasoning,
-image input and the prompt cache (RAM and disk) from one resident session, and
-drafts with Tencent's DFly2: 16.6 tok/s greedy decode, 17 to 22 tok/s with
-DFly2, with identical replies. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
+image input and the prompt cache (RAM and disk), and drafts with Tencent's
+DFly2. One user decodes at 16.4 tok/s, 21 to 24 tok/s with DFly2 on mixed text
+and 58 to 64 on repetitive text, with identical replies; prompts prefill at 740
+to 870 tok/s. Concurrent requests decode together: eight users get 68 tok/s in
+all. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md),
 [docs/QUALITY.md](docs/QUALITY.md), [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md)
 and the design in [docs/PLAN.md](docs/PLAN.md).
 

@@ -96,8 +96,12 @@ Not needed: expert streaming. The trunk is resident.
   13.8 KB per token; the indexer's pooled keys add 1.5 KB and its score buffer
   2 KB, about 17.4 KB per token of session context (18 GB at 1M). The 30 SWA
   layers hold rings of 2,560 rows. With DFly2 and vision, a 1,048,576-token
-  session loads with 122.7 of 124.4 GiB of device memory in use (E31); the
-  prompt cache shrinks to 3.4 GB.
+  session loaded with 122.7 of 124.4 GiB of device memory in use (E31, before
+  E50 and E51 freed 9.3 GiB); the prompt cache shrinks to 3.4 GB.
+- Scratch: prompt passes of up to 8,192 rows (E43). 2,048 rows stay resident;
+  the other 5.6 GiB is mapped only for a lone prompt's wider passes and
+  released by the next decode pass (E51). The head's logits take 16 rows
+  (E50). Decode passes have their own 16-row scratch (0.09 GiB).
 - What's left goes to the page cache for the 63.4 GB Engram file (its hot rows),
   the prompt cache and the runtime. Decode reads 64 rows per token
   (4 layers × 2 orders × 8 heads), 96 bytes each.
@@ -223,9 +227,10 @@ These are judgment calls made without the maintainer; revisit any of them.
 11. **The gate for kernel changes is the KL divergence** from llama.cpp's
     logits over 4,094 positions (see Correctness oracle), not greedy identity
     or perplexity, both of which rounding moves on this model.
-12. **Serving without DSpark-era machinery.** The runner is serial (one
-    session per step, no batched decode), prefill is exact in 256-token
-    passes, and the prompt cache stores tokens, the full-attention layers'
+12. **Serving without DSpark-era machinery.** The runner started serial (one
+    session per step); since E48 and E49 concurrent sessions share decode and
+    drafter passes. Prefill gives the same results in any pass shape, and the
+    prompt cache stores tokens, the full-attention layers'
     latent rows and the indexers' pooled keys as append rows; the SWA and
     indexer rings (55 MB per checkpoint), logits and position are private
     state. Window-row components for the SWA rings would make checkpoints
@@ -619,6 +624,12 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   16 rows, and their DFly2 drafts share one drafter pass (E49). Open: more
   rows per pass (the decode kernels' 16-row limit) for wider DFly2 batches,
   and a faster batched path for the drafter's 24-64-row products.
+
+- **Device memory** (E50, E51). The card's pp2048 row is 102.7 GiB against
+  llama.cpp's 95.9: the vision tower (1.05 GiB) and RAM cache pages (2.1 GiB),
+  which llama.cpp's run does without, the resident 2,048-row prompt scratch,
+  and KV and runtime buffers. On ROCm 10.1 `hipMemcpy2DAsync` rejects
+  demand-mapped memory (E51); worth a note beside Gufo's `ScratchArena`.
 
 ## Open questions
 

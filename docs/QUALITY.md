@@ -75,6 +75,7 @@ with DFly2 and the vision sidecar:
 | `cache` | passed (since E18; before it, `legacy-tool-cancel-disk` `content-preserve1-sampled0` failed: a greedy near tie after a restore re-prefilled in other pass shapes) |
 | `tools` | passed but the 12-token `auto-tools` limit (Hy4's tags are single tokens) |
 | `image-inputs` | passed |
+| `batch`, `prefill-scheduling` | passed (2026-11-20, after E48-E51) |
 | `tool-images` | passed but `tool_images_two_calls`: the model answers `red, blue` to "separated by a comma and no spaces" |
 
 After the prefill kernel work (E10-E16, 2026-11-20) and again after E17,
