@@ -1452,15 +1452,29 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
       rows[tid] = k >= 0 ? (int32_t)((uint32_t)k % ring) : -1;
     }
     __syncthreads();
-    // Stage the tile: 16-byte groups of the binary16 rows.
-    for (uint32_t i = tid; i < kMlaTile * (kMlaDk / 8); i += blockDim.x) {
-      const uint32_t r = i / (kMlaDk / 8);
-      const uint32_t c = (i % (kMlaDk / 8)) * 8;
-      uint4 v = make_uint4(0, 0, 0, 0);
-      if (rows[r] >= 0)
-        v = *reinterpret_cast<const uint4*>(keys + (uint64_t)rows[r] * kMlaDk +
-                                            c);
-      *reinterpret_cast<uint4*>(kt + r * kMlaKtPitch + c) = v;
+    // Stage the tile: 16-byte groups of the binary16 rows, every load
+    // issued before the stores.
+    {
+      constexpr uint32_t kThreads = 32 * kMlaWaves;
+      constexpr uint32_t kGroups = kMlaTile * (kMlaDk / 8) / kThreads;  // 9
+      static_assert(kMlaTile * (kMlaDk / 8) % kThreads == 0);
+      uint4 v[kGroups];
+#pragma unroll
+      for (uint32_t g = 0; g < kGroups; ++g) {
+        const uint32_t i = tid + g * kThreads;
+        const uint32_t r = i / (kMlaDk / 8);
+        const uint32_t c = (i % (kMlaDk / 8)) * 8;
+        v[g] = make_uint4(0, 0, 0, 0);
+        if (rows[r] >= 0)
+          v[g] = *reinterpret_cast<const uint4*>(
+              keys + (uint64_t)rows[r] * kMlaDk + c);
+      }
+#pragma unroll
+      for (uint32_t g = 0; g < kGroups; ++g) {
+        const uint32_t i = tid + g * kThreads;
+        *reinterpret_cast<uint4*>(kt + i / (kMlaDk / 8) * kMlaKtPitch +
+                                  (i % (kMlaDk / 8)) * 8) = v[g];
+      }
     }
     __syncthreads();
 
@@ -1533,13 +1547,22 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
       const MlaHalf16 pa =
           MlaLoad16(probs + (hg + row) * kMlaProbPitch + b * 16);
 #pragma unroll
-      for (uint32_t c = 0; c < kMlaPvTiles; ++c) {
-        const uint32_t d = sub * (kMlaDv / kMlaSplit) + c * 16 + row;
-        MlaHalf16 vb;
+      for (uint32_t c = 0; c < kMlaPvTiles; c += 2) {
+        // Tiles c and c + 1 hold the even and odd dimensions of 32: lane
+        // row's word of each key carries both.
+        const uint32_t d = sub * (kMlaDv / kMlaSplit) + c * 16 + 2 * row;
+        uint32_t ev[8], od[8];
 #pragma unroll
-        for (uint32_t k = 0; k < 16; ++k)
-          vb[k] = kt[(b * 16 + k) * kMlaKtPitch + d];
-        acc[c] = MlaWmma(pa, vb, acc[c]);
+        for (uint32_t k = 0; k < 16; k += 2) {
+          const uint32_t w0 = *reinterpret_cast<const uint32_t*>(
+              kt + (b * 16 + k) * kMlaKtPitch + d);
+          const uint32_t w1 = *reinterpret_cast<const uint32_t*>(
+              kt + (b * 16 + k + 1) * kMlaKtPitch + d);
+          ev[k / 2] = __builtin_amdgcn_perm(w1, w0, 0x05040100u);
+          od[k / 2] = __builtin_amdgcn_perm(w1, w0, 0x07060302u);
+        }
+        acc[c] = MlaWmma(pa, __builtin_bit_cast(MlaHalf16, ev), acc[c]);
+        acc[c + 1] = MlaWmma(pa, __builtin_bit_cast(MlaHalf16, od), acc[c + 1]);
       }
     }
     __syncthreads();
@@ -1551,10 +1574,14 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
     const float l = l_s[h];
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
     _Float16* orow = out + ((uint64_t)t * heads + h0 + h) * kMlaDv +
-                     sub * (kMlaDv / kMlaSplit) + row;
+                     sub * (kMlaDv / kMlaSplit) + 2 * row;
 #pragma unroll
-    for (uint32_t c = 0; c < kMlaPvTiles; ++c)
-      orow[c * 16] = (_Float16)(acc[c][i] * inv);
+    for (uint32_t c = 0; c < kMlaPvTiles; c += 2) {
+      const _Float16 v[2] = {(_Float16)(acc[c][i] * inv),
+                             (_Float16)(acc[c + 1][i] * inv)};
+      *reinterpret_cast<uint32_t*>(orow + c * 16) =
+          __builtin_bit_cast(uint32_t, v);
+    }
   }
 }
 

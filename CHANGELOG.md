@@ -89,6 +89,8 @@
   ([E33](docs/EXPERIMENTS.md#e33-prompt-lookup-2026-11-20)); greedy requests
   verify up to 15 copied tokens per pass
   ([E34](docs/EXPERIMENTS.md#e34-16-token-verify-passes-for-copies-2026-11-20)).
+- Faster prefill attention: 3-4% faster prefill (919 tok/s on 3,712 tokens)
+  ([E41](docs/EXPERIMENTS.md#e41-prefill-attention-staging-loads-in-flight-together-paired-value-reads-2026-11-20)).
 - Prefill evaluates 4,096 tokens per pass: 7% faster on 3.7K to 16K-token
   prompts (827 → 888 tok/s on 3,712 tokens)
   ([E37](docs/EXPERIMENTS.md#e37-4096-token-prefill-passes-2026-11-20)).

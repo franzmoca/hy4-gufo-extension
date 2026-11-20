@@ -514,6 +514,8 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   phase; `MlaPrefill` (634 ms, about 19 TFLOPS against a 220 ms WMMA floor)
   is the largest headroom left, mostly barriers and dimension-split scores at
   one token per block, then key staging (112 ms) and the P.V gather (59 ms).
+  E41 fixed the staging loads' latency and halved the gather's reads: 919
+  tok/s on 3,712 tokens.
 
 - **Prefill profile after E17** (3,712 tokens, 5.35 s of kernels): dense
   FP16 projections 1.87 s (27-33 TFLOPS standalone; `wo` and `attn_gate` are

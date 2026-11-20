@@ -46,6 +46,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E38 | Fewer hyper-connection mix slices in prompt passes | rejected |
 | E39 | Hyper-connection mixes in 256-token chunks | rejected |
 | E40 | Prefill kernel ablations after E37 | analysis |
+| E41 | Prefill attention: staging loads in flight together, paired value reads | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -986,3 +987,32 @@ block (the registers bound the rows), four barriers per 32-key tile and the
 dimension-split scores take about 240 ms beyond its 220 ms WMMA floor, the
 one large headroom left; its redesign is the next prefill item in the
 backlog.
+
+## E41: Prefill attention: staging loads in flight together, paired value reads (2026-11-20)
+
+Two changes to `MlaPrefill` from the E40 ablations, measured with
+`tools/bench/hy4_mla_bench.hip.cpp` (3,712 tokens: a 64-head SWA layer and
+a 32-head indexer layer with 2,048 selected keys; outputs compared bit for
+bit with the previous kernel's):
+
+- The key tile was staged by a loop striding by `blockDim.x`, which the
+  compiler could not unroll, so each thread's nine 16-byte loads waited one
+  after another. With a constant stride all nine are issued before the LDS
+  stores: 30.7 → 25.7 ms. Issuing them in batches of three or 5 + 4 ran at
+  26.6 and 26.1 ms. (The registers rise to 256 with eight spilled.)
+- The P.V operand was gathered as 16 two-byte LDS reads per fragment. Each
+  lane now reads one word per key holding two adjacent value dimensions,
+  split by `v_perm` into the fragments of the even and the odd dimensions of
+  32, which then store as words: 32.6 → 30.8 ms.
+
+Each output sums the same products in the same order, so the logits do not
+change: KL 0.08424 (identical), `--chunkcheck` exact at 1,000 on the
+3,712-token document and at 5,000 on the 8,192-token prompt. Loading the next
+tile into registers during the softmax and P.V spilled 43 registers and ran
+at 45.5 ms (as in E15). One prefill (ABBA, three runs each, the warm two
+read):
+
+| prompt | E37 | E41 |
+| --- | --- | --- |
+| 3,712 tokens | 4.164 s (891 tok/s) | 4.039 s (919 tok/s, -3.0%) |
+| 16,384 tokens | 19.31 s (848 tok/s) | 18.58 s (882 tok/s, -3.8%) |
