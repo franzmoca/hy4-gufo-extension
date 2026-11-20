@@ -90,11 +90,16 @@ llama.cpp has no DFly2; compare with its AR row above.
 
 ## Memory occupation
 
+Measured at `a64a2fb` (E50, E51). Peak device memory in use during the
+request. Gufo's figure includes its vision tower (1.05 GiB) and RAM prompt
+cache pages (2.1 GiB), which the llama.cpp run does without; the 16K row's
+4,096-token prompt maps the 5.6 GiB of wide prefill rows for its passes.
+
 <!-- bench:memory -->
 | Hy4 Flash Q4 AR<br>Workload | Gufo GiB | llama.cpp GiB | Gain |
 | --- | ---: | ---: | ---: |
-| pp2048 + tg128 | 111.89 | 95.88 | -14.3% |
-| 16K prefix, pp4096 + tg128 | 112.51 | 95.94 | -14.7% |
+| pp2048 + tg128 | 102.65 | 95.88 | -6.6% |
+| 16K prefix, pp4096 + tg128 | 108.77 | 95.94 | -11.8% |
 <!-- /bench -->
 
 ![Memory occupation](artifacts/charts/memory.svg)

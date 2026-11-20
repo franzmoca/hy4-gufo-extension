@@ -35,13 +35,13 @@
   "referenceName": "llama.cpp",
   "rows": {
     "16K prefix, pp4096 + tg128": {
-      "command": "gufo serve --port 55407 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
-      "gib": 112.51,
+      "command": "gufo serve --port 52059 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "gib": 108.77,
       "idle_gib": 3.02
     },
     "pp2048 + tg128": {
-      "command": "gufo serve --port 55407 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
-      "gib": 111.89,
+      "command": "gufo serve --port 52059 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "gib": 102.65,
       "idle_gib": 3.02
     }
   },
@@ -51,7 +51,7 @@
       "gufo",
       "serve",
       "--port",
-      "55407",
+      "52059",
       "--sessions",
       "1",
       "llm",
