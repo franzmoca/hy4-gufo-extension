@@ -78,8 +78,9 @@ std::uint64_t ExpertBytes(const Tensor& w) {
 
 }  // namespace
 
-bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uint32_t k, std::uint32_t n,
-            const Exec& ex, std::string* error) {
+bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m,
+            std::uint32_t k, std::uint32_t n, const Exec& ex,
+            std::string* error, const std::uint16_t* xh) {
   if (w.dims.size() < 2 || w.dims[0] != k || w.dims[1] != m) {
     return Fail(error, "hy4: matvec shape mismatch (" + std::to_string(m) + "x" + std::to_string(k) + ")");
   }
@@ -102,7 +103,10 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uin
     case HY4_TYPE_Q6_K:
       if (k % 256 == 0) {
         if (batched && m % 16 == 0) {
-          HY4_CHECK(hy4_f16_dense(w.type, w.data, x, y, m, n, k, 1, 0, stream));
+          HY4_CHECK(
+              xh ? hy4_f16_dense(w.type, w.data, xh, y, m, n, k, 1,
+                                 HY4_F16_X_HALF, stream)
+                 : hy4_f16_dense(w.type, w.data, x, y, m, n, k, 1, 0, stream));
           return true;
         }
         if (batched) {
@@ -125,21 +129,37 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uin
   return Fail(error, "hy4: unsupported matvec type " + std::to_string(w.type));
 }
 
+bool DenseF16(const Tensor& w, const void* x, void* y, std::uint32_t m,
+              std::uint32_t k, std::uint32_t n, std::uint32_t io,
+              const Exec& ex, std::string* error) {
+  const bool quantized = w.type == HY4_TYPE_Q8_0 || w.type == HY4_TYPE_Q4_K ||
+                         w.type == HY4_TYPE_Q6_K;
+  if (!quantized || k % 256 != 0 || m % 16 != 0 || w.dims.size() < 2 ||
+      w.dims[0] != k || w.dims[1] != m)
+    return Fail(error, "hy4: no FP16 kernel for a " + std::to_string(m) + "x" +
+                           std::to_string(k) + " projection of type " +
+                           std::to_string(w.type));
+  HY4_CHECK(hy4_f16_dense(w.type, w.data, x, y, m, n, k, 1, io, ex.stream));
+  return true;
+}
+
 bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
                 float* y2, std::uint32_t m2, const float* x, std::uint32_t k,
-                std::uint32_t n, const Exec& ex, std::string* error) {
+                std::uint32_t n, const Exec& ex, std::string* error,
+                const std::uint16_t* xh) {
   const bool quantized = w1.type == HY4_TYPE_Q8_0 || w1.type == HY4_TYPE_Q4_K ||
                          w1.type == HY4_TYPE_Q6_K;
   if ((n > Model::kVecMax || ex.prompt) && quantized && w2.type == w1.type &&
       k % 256 == 0 && m1 % 16 == 0 && m2 % 16 == 0 && w1.dims.size() >= 2 &&
       w1.dims[0] == k && w1.dims[1] == m1 && w2.dims.size() >= 2 &&
       w2.dims[0] == k && w2.dims[1] == m2) {
-    HY4_CHECK(hy4_f16_dense_pair(w1.type, w1.data, y1, m1, w2.data, y2, m2, x,
-                                 n, k, 0, ex.stream));
+    HY4_CHECK(hy4_f16_dense_pair(w1.type, w1.data, y1, m1, w2.data, y2, m2,
+                                 xh ? static_cast<const void*>(xh) : x, n, k,
+                                 xh ? HY4_F16_X_HALF : 0, ex.stream));
     return true;
   }
-  return MatVec(w1, x, y1, m1, k, n, ex, error) &&
-         MatVec(w2, x, y2, m2, k, n, ex, error);
+  return MatVec(w1, x, y1, m1, k, n, ex, error, xh) &&
+         MatVec(w2, x, y2, m2, k, n, ex, error, xh);
 }
 
 bool Model::AllocScratch(std::string* error) {
@@ -180,8 +200,10 @@ bool Model::AllocScratch(std::string* error) {
       DeviceAlloc(&s.post, std::size_t{n} * c.hc, owned) &&
       DeviceAlloc(&s.x, std::size_t{n} * c.n_embd, owned) &&
       DeviceAlloc(&s.cur, std::size_t{n} * c.n_embd, owned) &&
+      DeviceAlloc(&s.cur_half, std::size_t{n} * c.n_embd, owned) &&
       DeviceAlloc(&s.y, std::size_t{n} * c.n_embd, owned) &&
       DeviceAlloc(&s.qr, std::size_t{n} * c.q_lora, owned) &&
+      DeviceAlloc(&s.qr_half, std::size_t{n} * c.q_lora, owned) &&
       DeviceAlloc(&s.q, std::size_t{n} * hmax * c.head_k, owned) &&
       DeviceAlloc(&s.kva, std::size_t{n} * dk, owned) &&
       DeviceAlloc(&s.qfull, std::size_t{n} * hmax * dk, owned) &&
@@ -495,6 +517,15 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   }
   HY4_CHECK(hy4_hc_init(s.x, s.h, n, c.hc, c.n_embd, st));
 
+  // Batched passes also keep cur in binary16 for the FP16 kernels.
+  const bool batched = n > Model::kVecMax || prompt_pass_;
+  auto norm_cur = [&](const Tensor& weight) {
+    return batched ? hy4_rms_norm_half(s.x, weight.f32(), s.cur, s.cur_half, n,
+                                       c.n_embd, c.n_embd, c.rms_eps, st)
+                   : hy4_rms_norm(s.x, weight.f32(), s.cur, n, c.n_embd,
+                                  c.n_embd, c.rms_eps, st);
+  };
+
   // A half's hy4_hc_post is deferred into the next pre-mix
   // (hy4_hc_post_pre) unless something reads h in between.
   bool post_pending = false;
@@ -531,13 +562,13 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
 
     HY4_CHECK(hc_pre(l.hc_attn_fn, l.hc_attn_scale, l.hc_attn_base, s.post,
                      c.hc_magnitude));
-    HY4_CHECK(hy4_rms_norm(s.x, l.attn_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
+    HY4_CHECK(norm_cur(l.attn_norm));
     if (!Attention(il, n, error)) return false;
     post_pending = true;
 
     HY4_CHECK(hc_pre(l.hc_ffn_fn, l.hc_ffn_scale, l.hc_ffn_base, s.post,
                      c.hc_magnitude));
-    HY4_CHECK(hy4_rms_norm(s.x, l.ffn_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
+    HY4_CHECK(norm_cur(l.ffn_norm));
     if (!Ffn(il, n, error)) return false;
     HY4_CHECK(hy4_rms_norm(s.y, l.ffn_post_norm.f32(), s.y, n, c.n_embd, c.n_embd, c.rms_eps, st));
     post_pending = true;
@@ -594,11 +625,19 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
   const std::uint32_t nope = c.head_k - c.n_rot;
   const float base = c.is_swa[il] ? c.rope_base_swa : c.rope_base;
 
+  const std::uint16_t* cur_half = batched ? s.cur_half : nullptr;
+  const std::uint16_t* qr_half = batched ? s.qr_half : nullptr;
   if (!MatVecPair(l.wq_a, s.qr, c.q_lora, l.wkv_a, s.kva, dk, s.cur, c.n_embd,
-                  n, ex, error))
+                  n, ex, error, cur_half))
     return false;
-  HY4_CHECK(hy4_rms_norm(s.qr, l.q_a_norm.f32(), s.qr, n, c.q_lora, c.q_lora, c.rms_eps, st));
-  if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error))
+  if (batched)
+    HY4_CHECK(hy4_rms_norm_half(s.qr, l.q_a_norm.f32(), s.qr, s.qr_half, n,
+                                c.q_lora, c.q_lora, c.rms_eps, st));
+  else
+    HY4_CHECK(hy4_rms_norm(s.qr, l.q_a_norm.f32(), s.qr, n, c.q_lora, c.q_lora,
+                           c.rms_eps, st));
+  if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error,
+              qr_half))
     return false;
   HY4_CHECK(hy4_rms_norm(s.kva, l.kv_a_norm.f32(), s.kva, n, c.kv_lora, dk, c.rms_eps, st));
   const std::int32_t* hw = s.rope_3d ? s.rope_hw : nullptr;
@@ -701,7 +740,7 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
     // The gate first, so that wv_b's stores apply it and round the gated
     // values to binary16 once, which wo then reads.
     if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex,
-                error))
+                error, cur_half))
       return false;
     if (l.wo.type != HY4_TYPE_Q8_0 && l.wo.type != HY4_TYPE_Q4_K &&
         l.wo.type != HY4_TYPE_Q6_K)
@@ -740,7 +779,10 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   const float base = c.rope_base;  // indexer layers are the sparse ones
 
   // Key side: normed key, then its value and gate projections.
-  if (!MatVec(l.idx_k, s.cur, s.ik, d, c.n_embd, n, ex, error)) return false;
+  const bool batched = n > Model::kVecMax || prompt_pass_;
+  const std::uint16_t* cur_half = batched ? s.cur_half : nullptr;
+  if (!MatVec(l.idx_k, s.cur, s.ik, d, c.n_embd, n, ex, error, cur_half))
+    return false;
   HY4_CHECK(hy4_rms_norm(s.ik, l.idx_k_norm.f32(), s.ik, n, d, d, c.rms_eps, st));
   if (!MatVec(l.idx_value, s.ik, s.ffn_a, d, d, n, ex, error)) return false;
   if (!MatVec(l.idx_gate, s.ik, s.ffn_b, d, d, n, ex, error)) return false;
@@ -790,12 +832,16 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   std::vector<std::int32_t> n_pool(n);
   for (std::uint32_t i = 0; i < n; ++i) n_pool[i] = static_cast<std::int32_t>((pos0 + i) / c.kpool);
   HY4_CHECK(hipMemcpyAsync(s.n_pool, n_pool.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-  if (!MatVec(l.idx_q_b, s.qr, s.iq, c.idx_heads * d, c.q_lora, n, ex, error)) return false;
+  if (!MatVec(l.idx_q_b, s.qr, s.iq, c.idx_heads * d, c.q_lora, n, ex, error,
+              batched ? s.qr_half : nullptr))
+    return false;
   HY4_CHECK(hy4_rope_3d(s.iq, s.rope, s.rope_3d ? s.rope_hw : nullptr, n,
                         c.idx_heads, std::uint64_t{c.idx_heads} * d, d,
                         d - c.n_rot, c.n_rot, base, st));
   // The 1 / sqrt(d heads) weight scale does not change the selection.
-  if (!MatVec(l.idx_proj, s.cur, s.iw, c.idx_heads, c.n_embd, n, ex, error)) return false;
+  if (!MatVec(l.idx_proj, s.cur, s.iw, c.idx_heads, c.n_embd, n, ex, error,
+              cur_half))
+    return false;
   HY4_CHECK(hy4_indexer_score(s.iq, s.iw, idx_pooled_[il], s.n_pool, n_pool_max, score_, n, c.idx_heads, d, st));
   HY4_CHECK(hy4_kpool_select(score_, s.n_pool, n_pool_max, s.pos, top, c.kpool, sel_, n, st));
   *sel = sel_;
@@ -810,11 +856,13 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   Model::Scratch& s = *m.scratch_;
   hipStream_t st = m.stream_;
   const Exec ex{st, m.blas_, prompt_pass_};
+  const std::uint16_t* cur_half =
+      n > Model::kVecMax || prompt_pass_ ? s.cur_half : nullptr;
 
   if (il < c.n_dense_lead) {
     const std::uint32_t f = c.n_ff_dense;
     if (!MatVecPair(l.ffn_gate, s.ffn_a, f, l.ffn_up, s.ffn_b, f, s.cur,
-                    c.n_embd, n, ex, error))
+                    c.n_embd, n, ex, error, cur_half))
       return false;
     HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
     return MatVec(l.ffn_down, s.ffn_c, s.y, c.n_embd, f, n, ex, error);
@@ -824,17 +872,23 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   const std::uint32_t used = c.n_expert_used;
   // Shared expert first, into its own buffer.
   if (!MatVecPair(l.gate_shexp, s.ffn_a, f, l.up_shexp, s.ffn_b, f, s.cur,
-                  c.n_embd, n, ex, error))
+                  c.n_embd, n, ex, error, cur_half))
     return false;
   HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
   if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, ex, error)) return false;
 
   // Router on the full-width input; experts in the latent space.
   if (!MatVec(l.gate_inp, s.cur, s.logits_r, c.n_expert, c.n_embd, n, ex, error)) return false;
-  HY4_CHECK(hy4_route(s.logits_r, l.exp_bias ? l.exp_bias.f32() : nullptr, s.ids, s.route_w, n, c.n_expert, used,
+  HY4_CHECK(hy4_route(s.logits_r, l.exp_bias ? l.exp_bias.f32() : nullptr,
+                      s.ids, s.route_w, n, c.n_expert, used,
                       c.expert_norm ? 1 : 0, c.expert_scale, st));
-  if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex, error)) return false;
   if (n > Model::kVecMax || prompt_pass_) {
+    // The latent in binary16, the routed kernels' input format: each value
+    // rounds once, as the kernels' staging rounded the FP32 latent.
+    auto* latent = reinterpret_cast<std::uint16_t*>(s.latent);
+    if (!DenseF16(l.routed_down, cur_half, latent, c.n_latent, c.n_embd, n,
+                  HY4_F16_X_HALF | HY4_F16_OUT_HALF, ex, error))
+      return false;
     if (l.gate_exps.type != l.up_exps.type) return Fail(error, "hy4: gate and up experts differ in type");
     // The routed plan: slots grouped by expert in 128-slot tiles.
     const std::uint32_t slots = n * used;
@@ -857,7 +911,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
     // Gate and up with SwiGLU into FP16 rows (in ffn_c), then down.
     auto* mid = reinterpret_cast<std::uint16_t*>(s.ffn_c);
     HY4_CHECK(hy4_f16_routed(l.gate_exps.type, l.gate_exps.data, l.up_exps.data,
-                             ExpertBytes(l.gate_exps), s.latent, used, d_rows,
+                             ExpertBytes(l.gate_exps), latent, used, d_rows,
                              d_bounds, d_tiles, n_tiles, s.route_w,
                              c.swiglu_clamp[il], mid, f, c.n_latent, st));
     HY4_CHECK(hy4_f16_routed(l.down_exps.type, l.down_exps.data, nullptr,
@@ -869,6 +923,9 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
     HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
     return true;
   }
+  if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex,
+              error))
+    return false;
   // One token per launch: the vendored launcher sums a multi-token batch in
   // another order than one token, and a verify pass must compute what
   // one-token decoding would (no weight row is shared across tokens anyway).

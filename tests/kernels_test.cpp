@@ -207,6 +207,20 @@ void TestRmsNorm() {
     }
     Near(Host(out, rows * stride), want, 2e-6,
          weighted ? "rms_norm" : "rms_norm unweighted");
+    // The binary16 copy: the FP32 outputs rounded once, bit for bit.
+    float* out2 = Device(x);
+    auto* half = Device(std::vector<uint16_t>(rows * stride));
+    Expect(hy4_rms_norm_half(dx, weighted ? dw : nullptr, out2, half, rows, dim,
+                             stride, 1e-6f, nullptr) == 0,
+           "rms_norm_half status");
+    const auto f = Host(out2, rows * stride);
+    const auto hb = Host(half, rows * stride);
+    Expect(f == Host(out, rows * stride), "rms_norm_half FP32 output");
+    bool same = true;
+    for (uint32_t r = 0; r < rows; ++r)
+      for (uint32_t i = 0; i < dim; ++i)
+        same &= hb[r * stride + i] == HalfBits(f[r * stride + i]);
+    Expect(same, "rms_norm_half rounds the FP32 output");
   }
 }
 
@@ -1370,7 +1384,10 @@ void TestF16Matmul() {
     auto* dwg = Device(wg);
     auto* dwu = Device(wu);
     auto* dwd = Device(wd);
-    auto* dx = Device(x);
+    std::vector<uint16_t> xh(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i)
+      xh[i] = HalfBits(x[i]);
+    auto* dx = Device(xh);
     auto* drw = Device(rw);
     auto* dmid = Device(std::vector<uint16_t>((std::size_t)slots * f));
     float* dy = Device(std::vector<float>((std::size_t)slots * out));

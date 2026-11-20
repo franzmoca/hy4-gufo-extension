@@ -95,8 +95,9 @@ __global__ void EmbedQ8_0(const BlockQ8_0* table, const int32_t* tokens, uint32_
 
 // --------------------------------------------------------------------- norm
 
-__global__ void RmsNorm(const float* x, const float* weight, float* out, uint32_t dim, uint32_t stride,
-                        float eps) {
+__global__ void RmsNorm(const float* x, const float* weight, float* out,
+                        uint32_t dim, uint32_t stride, float eps,
+                        _Float16* out_half = nullptr) {
   __shared__ float scratch[32];
   const float* xr = x + (uint64_t)blockIdx.x * stride;
   float* yr = out + (uint64_t)blockIdx.x * stride;
@@ -106,7 +107,15 @@ __global__ void RmsNorm(const float* x, const float* weight, float* out, uint32_
   const float scale = rsqrtf(ss / (float)dim + eps);
   for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
     const float v = xr[i] * scale;
-    yr[i] = weight ? v * weight[i] : v;
+    float y = weight ? v * weight[i] : v;
+    yr[i] = y;
+    if (out_half) {
+      // Round the product to FP32 first, as a consumer converting the FP32
+      // output would (the compiler would otherwise fuse the multiply and the
+      // conversion into one rounding).
+      asm volatile("" : "+v"(y));
+      out_half[(uint64_t)blockIdx.x * stride + i] = (_Float16)y;
+    }
   }
 }
 
@@ -1293,6 +1302,16 @@ int hy4_rms_norm(const float* x, const float* weight, float* out, uint32_t rows,
                  float eps, hipStream_t stream) {
   if (rows == 0) return 0;
   RmsNorm<<<rows, kBlock, 0, stream>>>(x, weight, out, dim, stride, eps);
+  return Status();
+}
+
+int hy4_rms_norm_half(const float* x, const float* weight, float* out,
+                      uint16_t* out_half, uint32_t rows, uint32_t dim,
+                      uint32_t stride, float eps, hipStream_t stream) {
+  if (rows == 0)
+    return 0;
+  RmsNorm<<<rows, kBlock, 0, stream>>>(x, weight, out, dim, stride, eps,
+                                       reinterpret_cast<_Float16*>(out_half));
   return Status();
 }
 

@@ -29,6 +29,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E21 | Attention gate applied in the value projection's stores, binary16 input to `wo` | retained |
 | E22 | `MlaPrefill` output staged through LDS for 16-byte stores | rejected |
 | E23 | Hyper-connection post-mix folded into the next pre-mix | retained |
+| E24 | Binary16 activations for the FP16 projections: normed inputs and the expert latent | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -438,3 +439,25 @@ probe reads the streams in between. Passes under 8 tokens keep the two
 kernels. Bit-identical (KL 0.08424, PPL 15.1167; `--passcheck 8`,
 `--chunkcheck` 517 and 999 exact; the unit test compares both paths
 bitwise). 3,712-token prefill 5.16 → 5.07 s (732 tok/s). Retained.
+
+## E24: Binary16 activations for the FP16 projections: normed inputs and the expert latent (2026-11-20)
+
+The FP16 kernels staged FP32 activations, rounding them to binary16 as they
+went, and every row block of a projection rereads its token tile's
+activations. Ablated at 2,048 tokens in a micro-benchmark, skipping the
+activation loads took `attn_gate` (16,384 x 3,072) from 6.14 to 5.09 ms and
+`q_b` (16,384 x 1,024) from 2.29 to 1.73 ms. The routed gate/up kernel reads
+each slot's gathered 1,536-value latent row once per row block: about
+2.4 GB of FP32 reads per pass, three times its weight bytes.
+
+In batched passes the RMS norms of `cur` and of the query latent now also
+write a binary16 copy (the FP32 result rounded once: a compiler barrier
+keeps the weight product from fusing into the conversion), which every FP16
+projection reading them takes instead (`wq_a`/`wkv_a`, `wq_b`, `attn_gate`,
+the shared expert, the indexer's projections, the latent projection). The
+latent projection stores binary16, the routed gate/up kernel's input. The
+router keeps its FP32 input. Bit-identical (KL 0.08424, PPL 15.1167;
+`--passcheck 8`, `--chunkcheck` 517 and 999 exact; a unit test compares the
+copy with the rounded FP32 output bitwise). 3,712-token prefill 5.07 → 5.02 s
+with the binary16 latent alone, 4.85-4.87 s with both (763 tok/s).
+Retained.

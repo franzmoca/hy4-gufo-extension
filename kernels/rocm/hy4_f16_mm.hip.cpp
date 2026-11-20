@@ -716,9 +716,9 @@ int routed_launch(const void* w, const void* w_up, uint64_t expert_bytes,
   const auto* a = static_cast<const uint8_t*>(w);
   const auto* b = static_cast<const uint8_t*>(w_up);
   if (w_up)
-    routed_f16_kernel<F, float, true>
+    routed_f16_kernel<F, _Float16, true>
         <<<dim3((m + 127) / 128, n_tiles), kThreads, 0, stream>>>(
-            a, b, expert_bytes, static_cast<const float*>(x), x_div, rows,
+            a, b, expert_bytes, static_cast<const _Float16*>(x), x_div, rows,
             bounds, tiles, route_w, limit, y, m, k);
   else
     routed_f16_kernel<F, _Float16, false>

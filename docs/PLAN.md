@@ -492,7 +492,8 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   experts instead of MMQ: 7.18 → 5.58 s (E17); coalesced dense stores and
   binary16 attention output: 5.43 s (E18, E19); the router's FP32 GEMM:
   5.355 s (E20); the gate in `wv_b`'s stores, binary16 `attv`: 5.16 s
-  (E21); the post-mix in the next pre-mix: 5.07 s (E23).
+  (E21); the post-mix in the next pre-mix: 5.07 s (E23); binary16 normed
+  inputs and expert latent: 4.86 s (E24).
 
 - **Prefill profile after E17** (3,712 tokens, 5.35 s of kernels): dense
   FP16 projections 1.87 s (27-33 TFLOPS standalone; `wo` and `attn_gate` are

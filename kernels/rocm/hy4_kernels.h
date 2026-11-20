@@ -32,6 +32,11 @@ int hy4_embed_q8_0(const void* table, const int32_t* tokens, uint32_t n, uint32_
  * `dim` floats at stride `stride` (in and out). */
 int hy4_rms_norm(const float* x, const float* weight, float* out, uint32_t rows, uint32_t dim,
                  uint32_t stride, float eps, hipStream_t stream);
+/* hy4_rms_norm that also writes each output rounded to binary16 (FP16 bits,
+ * the same layout) into out_half. */
+int hy4_rms_norm_half(const float* x, const float* weight, float* out,
+                      uint16_t* out_half, uint32_t rows, uint32_t dim,
+                      uint32_t stride, float eps, hipStream_t stream);
 
 /* iHC pre-mix of one layer half (llama.cpp build_hc_pre) for n tokens of
  * `hc` streams h[t, hc, dim]: mixes = fn [2 hc][hc dim] . rms_norm(flat h)
@@ -263,11 +268,10 @@ int hy4_f16_dense_pair(int type, const void* w1, void* out1, uint32_t m1,
  * grouped by expert, expert e owning rows[bounds[e] .. bounds[e + 1]), and
  * tiles[0:n_tiles] names 128 of them each as expert | index << 16 (see
  * hy4_f16_routed_plan); entries < 0 are skipped. A slot s reads x row
- * s / x_div; expert e's matrices start e * expert_bytes into w (and w_up).
- * With w_up, x is FP32 and y (FP16 bits) [s, r] = route_w[s] *
+ * s / x_div (FP16 bits); expert e's matrices start e * expert_bytes into w
+ * (and w_up). With w_up, y (FP16 bits) [s, r] = route_w[s] *
  * silu(min(gate, limit)) * clamp(up, +-limit) (no clamp for limit <= 0);
- * without it, x is FP16 bits and y (FP32) [s, r] = (W x)[r]. Non-finite
- * products read as 0. */
+ * without it, y (FP32) [s, r] = (W x)[r]. Non-finite products read as 0. */
 int hy4_f16_routed(int type, const void* w, const void* w_up,
                    uint64_t expert_bytes, const void* x, uint32_t x_div,
                    const int32_t* rows, const int32_t* bounds,

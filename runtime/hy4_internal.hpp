@@ -38,9 +38,11 @@ struct Model::Scratch {
   float* post = nullptr;  // [chunk][hc]
   float* x = nullptr;     // [chunk][n_embd]
   float* cur = nullptr;   // [chunk][n_embd]
+  std::uint16_t* cur_half = nullptr;  // cur in binary16, batched passes
   float* y = nullptr;     // [chunk][n_embd]
   // Attention.
   float* qr = nullptr;    // [chunk][q_lora]
+  std::uint16_t* qr_half = nullptr;  // qr in binary16, batched passes
   float* q = nullptr;     // [chunk][heads][head_k]
   float* kva = nullptr;   // [chunk][kv_lora + n_rot]
   float* qfull = nullptr; // [chunk][heads][kv_lora + n_rot]
@@ -83,14 +85,24 @@ struct Exec {
 
 /// y[t] = W x[t] for any weight type the model uses (n tokens, W [m][k]):
 /// matvecs up to Model::kVecMax tokens outside prompt passes, GEMMs beyond.
-bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m, std::uint32_t k, std::uint32_t n,
-            const Exec& ex, std::string* error);
+/// xh, if given, is x rounded to binary16, which the FP16 kernels read
+/// instead of rounding x as they stage it (the same results, half the bytes).
+bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m,
+            std::uint32_t k, std::uint32_t n, const Exec& ex,
+            std::string* error, const std::uint16_t* xh = nullptr);
+
+/// A batched y = W x on the FP16 kernels (hy4_f16_dense, io as there) for a
+/// quantized W [m][k] with k % 256 == 0 and m % 16 == 0; fails otherwise.
+bool DenseF16(const Tensor& w, const void* x, void* y, std::uint32_t m,
+              std::uint32_t k, std::uint32_t n, std::uint32_t io,
+              const Exec& ex, std::string* error);
 
 /// Two MatVecs over the same x; a batched pass of two weights of one quantized
 /// type quantizes x once. Results equal two MatVec calls.
 bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
                 float* y2, std::uint32_t m2, const float* x, std::uint32_t k,
-                std::uint32_t n, const Exec& ex, std::string* error);
+                std::uint32_t n, const Exec& ex, std::string* error,
+                const std::uint16_t* xh = nullptr);
 
 }  // namespace gufo::models::hy4_flash
 
