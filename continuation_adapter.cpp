@@ -244,10 +244,10 @@ std::vector<cache::ComponentPosition> ContinuationAdapter::Positions(const cache
 std::vector<Rows> ContinuationAdapter::PlanPrefill(const cache::Slot& slot, Rows first, Rows end) const {
   const auto& state = As(slot);
   if (!state.IsValid() || first > end || end > context_) throw std::invalid_argument("invalid Hy4 prefill plan");
-  // Session::Evaluate runs passes of kMaxChunk tokens from the frontier.
+  // Session::Evaluate runs passes of MaxChunk() tokens from the frontier.
   std::vector<Rows> result;
   while (first < end) {
-    first += std::min<Rows>(end - first, Model::kMaxChunk);
+    first += std::min<Rows>(end - first, model_->MaxChunk());
     result.push_back(first);
   }
   return result;

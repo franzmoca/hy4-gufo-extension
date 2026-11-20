@@ -274,7 +274,7 @@ public:
                 .prefix_reuse = true,
             },
         .sampling_defaults = SamplingDefaults(),
-        .scheduling = {.pass_tokens = Model::kMaxChunk,
+        .scheduling = {.pass_tokens = model_->MaxChunk(),
                        .max_layer_groups = 1u,
                        .max_yield_decode_width = 1u},
     };
@@ -754,7 +754,8 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
     set_error("Hy4 context must hold at least two tokens");
     return nullptr;
   }
-  std::unique_ptr<Model> loaded = Model::Load(options.model_path, &load_error);
+  std::unique_ptr<Model> loaded =
+      Model::Load(options.model_path, &load_error, max_context);
   if (!loaded) {
     set_error("Failed to load Hy4 Flash: " + load_error);
     return nullptr;

@@ -130,8 +130,12 @@ public:
 /// The loaded model. One evaluation runs at a time (scratch is shared).
 class Model {
 public:
-  /// Most tokens one evaluation pass takes (longer spans run in passes).
-  static constexpr std::uint32_t kMaxChunk = 4096;
+  /// Most tokens one evaluation pass can take (longer spans run in passes);
+  /// MaxChunk() is the width this model was loaded for.
+  static constexpr std::uint32_t kMaxChunk = 8192;
+  /// Contexts up to this many tokens take kMaxChunk-token passes; longer
+  /// ones take 4,096, leaving the device memory to the sessions (E43).
+  static constexpr std::uint32_t kWideContext = 262144;
   /// Passes up to this many tokens use matvecs; longer ones use GEMMs.
   static constexpr std::uint32_t kVecMax = 16;
   /// Rows of each indexer layer's value and gate ring.
@@ -146,8 +150,13 @@ public:
 
   /// `trunk_path` is the first GGUF shard; the reader maps the others (the
   /// Engram table) beside it.
-  [[nodiscard]] static std::unique_ptr<Model> Load(const std::string& trunk_path,
-                                                   std::string* error);
+  /// `max_context` (0: unknown) sets the pass width, MaxChunk().
+  [[nodiscard]] static std::unique_ptr<Model> Load(
+      const std::string& trunk_path, std::string* error,
+      std::uint32_t max_context = 0);
+  /// Most tokens one evaluation pass takes: kMaxChunk for contexts up to
+  /// kWideContext, else 4,096. Results do not depend on it (E18, E36).
+  [[nodiscard]] std::uint32_t MaxChunk() const { return max_chunk_; }
 
   [[nodiscard]] const Config& config() const { return config_; }
   [[nodiscard]] const Weights& weights() const { return weights_; }
@@ -183,13 +192,15 @@ private:
   Weights weights_;
   std::vector<void*> allocations_;
   std::uint64_t resident_bytes_ = 0;
+  std::uint32_t max_chunk_ = 4096;
   hipStream_t stream_ = nullptr;
   void* blas_ = nullptr;  // hipblasHandle_t
   const std::uint8_t* engram_table_ = nullptr;  // host mapping, FP8 rows
   std::uint64_t engram_bytes_ = 0;
   std::int32_t image_token_ = -1;
 
-  // Scratch for one evaluation of up to kMaxChunk tokens (device unless noted).
+  // Scratch for one evaluation of up to MaxChunk() tokens (device unless
+  // noted).
   struct Scratch;
   std::unique_ptr<Scratch> scratch_;
 };
@@ -344,7 +355,7 @@ private:
   std::vector<float*> idx_rows_;
   std::vector<float*> idx_pooled_;
   // Indexer scores [kScoreRows][pool rows] and selections
-  // [kMaxChunk][(top pools + 1) kpool].
+  // [MaxChunk()][(top pools + 1) kpool].
   float* score_ = nullptr;
   std::int32_t* sel_ = nullptr;
   // Draft taps (EnableTaps): rows [kTapRows][n_embd] and, per tapped layer,

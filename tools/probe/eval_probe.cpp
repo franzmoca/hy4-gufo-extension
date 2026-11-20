@@ -118,7 +118,7 @@ int main(int argc, char** argv) {
 
   std::string error;
   const auto t0 = std::chrono::steady_clock::now();
-  auto model = hy4::Model::Load(model_path, &error);
+  auto model = hy4::Model::Load(model_path, &error, ctx);
   if (!model) {
     std::fprintf(stderr, "load failed: %s\n", error.c_str());
     return 1;
@@ -133,7 +133,7 @@ int main(int argc, char** argv) {
 
   std::vector<float> logits;
   if (chunkcheck) {
-    // The prompt prefilled whole (passes of kMaxChunk from token 0) and split
+    // The prompt prefilled whole (passes of MaxChunk() from token 0) and split
     // at token `chunkcheck` (as after a prompt-cache restore there): the
     // first layer where token `chunkcheck`'s streams differ, and the logits
     // of every token after the split.
@@ -158,11 +158,8 @@ int main(int argc, char** argv) {
       r->layers.emplace_back(row, row + r->width);
     };
     const std::uint32_t split = chunkcheck;
-    Rows whole{split / hy4::Model::kMaxChunk,
-               split % hy4::Model::kMaxChunk,
-               width,
-               -1,
-               {}};
+    Rows whole{
+        split / model->MaxChunk(), split % model->MaxChunk(), width, -1, {}};
     Rows cut{0, 0, width, -1, {}};
     std::vector<float> whole_logits, cut_logits;
     {
@@ -329,8 +326,9 @@ int main(int argc, char** argv) {
       const std::size_t first = n_ctx / 2;
       double chunk_kl = 0.0;
       std::size_t chunk_n = 0;
-      for (std::size_t i = 0; i < n_ctx; i += hy4::Model::kMaxChunk) {
-        const std::size_t n = std::min<std::size_t>(hy4::Model::kMaxChunk, n_ctx - i);
+      for (std::size_t i = 0; i < n_ctx; i += model->MaxChunk()) {
+        const std::size_t n =
+            std::min<std::size_t>(model->MaxChunk(), n_ctx - i);
         const bool need = i + n > first;
         // Prompt passes, as serving prefills text.
         if (!s->Evaluate(std::span<const std::int32_t>(ct + i, n), need ? &logits : nullptr, true, &error, true)) {
@@ -399,8 +397,8 @@ int main(int argc, char** argv) {
         return 1;
       }
       double chunk_nll = 0.0;
-      for (std::size_t i = 0; i < ppl; i += hy4::Model::kMaxChunk) {
-        const std::size_t n = std::min<std::size_t>(hy4::Model::kMaxChunk, ppl - i);
+      for (std::size_t i = 0; i < ppl; i += model->MaxChunk()) {
+        const std::size_t n = std::min<std::size_t>(model->MaxChunk(), ppl - i);
         const std::span<const std::int32_t> part(prompt.data() + c0 + i, n);
         const bool need = i + n > ppl / 2;
         if (!s->Evaluate(part, need ? &logits : nullptr, true, &error, true)) {

@@ -1,4 +1,4 @@
-// Hy4 Flash evaluation: one chunk of up to Model::kMaxChunk tokens through
+// Hy4 Flash evaluation: one chunk of up to Model::MaxChunk() tokens through
 // the 42-layer iHC stack, following llama.cpp's hy_v4_flash graph.
 
 #include <gufo/ext/experimental/managed_alloc.hpp>
@@ -170,7 +170,7 @@ bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
 bool Model::AllocScratch(std::string* error) {
   if (hy4_mmq_init(0) != 0) return Fail(error, "hy4: mmq init failed");
   const Config& c = config_;
-  const std::uint32_t n = kMaxChunk;
+  const std::uint32_t n = max_chunk_;
   const std::uint32_t hmax = *std::max_element(c.n_head.begin(), c.n_head.end());
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::uint32_t modules = static_cast<std::uint32_t>(c.engram_layers.size());
@@ -266,7 +266,9 @@ std::uint32_t Model::SessionContext(std::uint32_t max_context) const {
 
 std::uint32_t Model::KvRing(std::uint32_t layer, std::uint32_t max_context) const {
   max_context = SessionContext(max_context);
-  return config_.is_swa[layer] ? std::min(max_context, config_.swa_window + kMaxChunk) : max_context;
+  return config_.is_swa[layer]
+             ? std::min(max_context, config_.swa_window + max_chunk_)
+             : max_context;
 }
 
 std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::string* error) {
@@ -289,11 +291,12 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::st
     }
   }
   const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
-  ok = ok &&
-       DeviceAlloc(&s->score_, std::size_t{kScoreRows} * pools,
-                   &s->allocations_) &&
-       DeviceAlloc(&s->sel_, std::size_t{kMaxChunk} * (top_pools + 1) * c.kpool,
-                   &s->allocations_);
+  ok =
+      ok &&
+      DeviceAlloc(&s->score_, std::size_t{kScoreRows} * pools,
+                  &s->allocations_) &&
+      DeviceAlloc(&s->sel_, std::size_t{max_chunk_} * (top_pools + 1) * c.kpool,
+                  &s->allocations_);
   if (!ok) {
     Fail(error, "hy4: session allocation failed");
     return nullptr;
@@ -315,8 +318,9 @@ bool Session::Evaluate(std::span<const std::int32_t> tokens,
   } reset{prompt_pass_};
   if (logits) logits->clear();
   std::vector<float> part;
-  for (std::size_t i = 0; i < tokens.size(); i += Model::kMaxChunk) {
-    const std::size_t n = std::min<std::size_t>(Model::kMaxChunk, tokens.size() - i);
+  const std::size_t chunk = model_->MaxChunk();
+  for (std::size_t i = 0; i < tokens.size(); i += chunk) {
+    const std::size_t n = std::min<std::size_t>(chunk, tokens.size() - i);
     const bool last = i + n == tokens.size();
     std::vector<float>* want = logits && (all_logits || last) ? &part : nullptr;
     if (!EvaluateChunk(tokens.subspan(i, n), want, all_logits, error)) return false;

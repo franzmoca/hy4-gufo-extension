@@ -179,8 +179,12 @@ Model::~Model() {
   if (stream_) (void)hipStreamDestroy(stream_);
 }
 
-std::unique_ptr<Model> Model::Load(const std::string& trunk_path, std::string* error) {
+std::unique_ptr<Model> Model::Load(const std::string& trunk_path,
+                                   std::string* error,
+                                   std::uint32_t max_context) {
   std::unique_ptr<Model> m(new Model());
+  m->max_chunk_ =
+      max_context != 0 && max_context <= kWideContext ? kMaxChunk : 4096;
   m->shards_ = std::make_unique<Shards>();
   // Opening the first shard maps the whole split model; the FP8 Engram table
   // is a type core cannot size, so it is accepted unsized and stays mapped.

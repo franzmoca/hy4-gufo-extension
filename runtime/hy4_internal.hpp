@@ -8,7 +8,7 @@
 
 namespace gufo::models::hy4_flash {
 
-/// Device scratch for one evaluation of up to Model::kMaxChunk tokens.
+/// Device scratch for one evaluation of up to Model::MaxChunk() tokens.
 struct Model::Scratch {
   // Inputs.
   std::int32_t* tokens = nullptr;  // [chunk]

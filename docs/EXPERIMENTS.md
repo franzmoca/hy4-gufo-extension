@@ -48,6 +48,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E40 | Prefill kernel ablations after E37 | analysis |
 | E41 | Prefill attention: staging loads in flight together, paired value reads | retained |
 | E42 | Prefill attention: interleaved score chains | retained |
+| E43 | 8,192-token prefill passes for contexts up to 256K | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1029,3 +1030,30 @@ same order, so the outputs are bit-identical) ran at 25.18 against 25.70 ms
 table filled during the values, saving one of the five barriers per tile,
 ran slower (25.63 ms) and was dropped, as were `#pragma unroll` on
 `RmsNorm` and `SumSlots` (unchanged under `prof.py`).
+
+## E43: 8,192-token prefill passes for contexts up to 256K (2026-11-20)
+
+E37 kept 4,096-token passes because a 1M-token session no longer fit beside
+8,192-token scratch. The width is now chosen when the model loads, from the
+configured context (`Model::MaxChunk()`): 8,192 tokens up to 262,144
+(`kWideContext`), 4,096 above. The indexer's value ring keeps the widest
+size (8,200 rows), so the prompt cache's layout does not depend on the
+width; the SWA rings, the selection buffer, the scratch, the passes
+`Session::Evaluate` runs, the continuation adapter's prefill plan and the
+scheduler's pass size follow `MaxChunk()`. Results do not depend on the
+split (E18, E36): KL 0.08424 (identical), `--chunkcheck` exact at 9,000 on
+the 16,384-token prompt. One prefill at a 32,768-token context (ABBA, three
+runs each, the warm two read):
+
+| prompt | 4,096 | 8,192 |
+| --- | --- | --- |
+| 3,712 tokens | 4.026 s | 4.034 s |
+| 8,192 tokens | 9.065 s (904 tok/s) | 8.752 s (936 tok/s, -3.5%) |
+| 16,384 tokens | 18.53 s (884 tok/s) | 17.96 s (912 tok/s, -3.1%) |
+
+With DFly2 and vision a 262,144-token server loads (8,192-token passes) and
+answers, as does a 1,048,576-token one (4,096-token passes, 3.05 GB of the
+device heap free, 3.10 before: the wider indexer ring).
+Gufo's `conversation`, `long-context`, `cache` and `prefill-scheduling`
+suites pass every case at a 32,768-token context (the harness's measurement
+check reports DFly2 drafts on AR requests, as at E37).
