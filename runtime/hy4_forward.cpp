@@ -167,71 +167,137 @@ bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
          MatVec(w2, x, y2, m2, k, n, ex, error, xh);
 }
 
-bool Model::AllocScratchRows(Scratch& s, std::uint32_t n) {
+bool Model::AllocScratchRows(Scratch& s, std::uint32_t n,
+                             std::uint32_t resident, mem::ScratchArena* arena,
+                             std::size_t* measure) {
+  if (resident == 0)
+    resident = n;
   const Config& c = config_;
   const std::uint32_t hmax = *std::max_element(c.n_head.begin(), c.n_head.end());
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::uint32_t modules = static_cast<std::uint32_t>(c.engram_layers.size());
   const std::uint32_t cols = c.engram_layers.empty() ? 0 : c.EngramCols();
-  const std::size_t ffn = std::max<std::size_t>(std::size_t{c.n_ff_dense} * n,
-                                                std::size_t{c.n_expert_used} * n *
-                                                    std::max(c.n_ff_exp, c.n_latent));
-  const std::size_t slots = std::size_t{c.n_expert_used} * n;
-  const std::size_t plan = slots + c.n_expert + 1 + slots / 128 + c.n_expert;
+  auto ffn = [&](std::size_t rows) {
+    return std::max<std::size_t>(
+        std::size_t{c.n_ff_dense} * rows,
+        std::size_t{c.n_expert_used} * rows * std::max(c.n_ff_exp, c.n_latent));
+  };
+  auto plan = [&](std::size_t rows) {
+    const std::size_t slots = std::size_t{c.n_expert_used} * rows;
+    return slots + c.n_expert + 1 + slots / 128 + c.n_expert;
+  };
   auto* owned = &allocations_;
+  // A device buffer of count(n) elements. With an arena, its first
+  // count(resident) elements stay backed and the rest only while
+  // AcquireWidePasses maps them; `measure` sums the arena bytes instead.
+  // (The head runs at most kVecMax rows at a time: Pass.)
+  auto Dev = [&](auto** p, auto count) {
+    using T = std::remove_pointer_t<std::remove_reference_t<decltype(*p)>>;
+    const std::size_t wide =
+        std::max<std::size_t>(count(std::size_t{n}), 1) * sizeof(T);
+    const std::size_t narrow =
+        std::max<std::size_t>(count(std::size_t{resident}), 1) * sizeof(T);
+    if (measure) {
+      *measure += (wide + mem::ScratchArena::kPage - 1) /
+                  mem::ScratchArena::kPage * mem::ScratchArena::kPage;
+      return true;
+    }
+    if (!arena)
+      return DeviceAlloc(p, wide / sizeof(T), owned);
+    void* v = arena->Take(wide, narrow, nullptr);
+    if (!v || hipMemset(v, 0, narrow) != hipSuccess ||
+        hipDeviceSynchronize() != hipSuccess)
+      return false;
+    *p = static_cast<T*>(v);
+    return true;
+  };
+  auto HostAlloc = [&](auto** p, std::size_t count, std::vector<void*>* list) {
+    return measure != nullptr || hy4_flash::HostAlloc(p, count, list);
+  };
   const bool ok =
-      DeviceAlloc(&s.tokens, n, owned) && DeviceAlloc(&s.pos, n, owned) &&
-      DeviceAlloc(&s.groups, n, owned) && DeviceAlloc(&s.group_pos, n, owned) &&
-      DeviceAlloc(&s.group_hw, 2 * n, owned) &&
-      DeviceAlloc(&s.n_pool, n, owned) && DeviceAlloc(&s.rope, n, owned) &&
-      DeviceAlloc(&s.rope_hw, 2 * n, owned) &&
+      Dev(&s.tokens, [&](std::size_t n) { return n; }) &&
+      Dev(&s.pos, [&](std::size_t n) { return n; }) &&
+      Dev(&s.groups, [&](std::size_t n) { return n; }) &&
+      Dev(&s.group_pos, [&](std::size_t n) { return n; }) &&
+      Dev(&s.group_hw, [&](std::size_t n) { return 2 * n; }) &&
+      Dev(&s.n_pool, [&](std::size_t n) { return n; }) &&
+      Dev(&s.rope, [&](std::size_t n) { return n; }) &&
+      Dev(&s.rope_hw, [&](std::size_t n) { return 2 * n; }) &&
       HostAlloc(&s.engram_host, std::size_t{modules} * n * cols * c.engram_dim,
                 owned) &&
       HostAlloc(&s.engram_valid_host, std::size_t{modules} * n * cols, owned) &&
       HostAlloc(&s.engram_any_host, std::size_t{modules} * n, owned) &&
-      DeviceAlloc(&s.engram_rows,
-                  std::size_t{modules} * n * cols * c.engram_dim, owned) &&
-      DeviceAlloc(&s.engram_valid, std::size_t{modules} * n * cols, owned) &&
-      DeviceAlloc(&s.engram_any, std::size_t{modules} * n, owned) &&
-      DeviceAlloc(&s.engram_normed, std::size_t{n} * cols * c.engram_dim,
-                  owned) &&
-      DeviceAlloc(&s.engram_kv, std::size_t{n} * (c.hc + 1) * c.n_embd,
-                  owned) &&
-      DeviceAlloc(&s.h, std::size_t{n} * c.hc * c.n_embd, owned) &&
-      DeviceAlloc(&s.post, std::size_t{n} * c.hc, owned) &&
-      DeviceAlloc(&s.x, std::size_t{n} * c.n_embd, owned) &&
-      DeviceAlloc(&s.cur, std::size_t{n} * c.n_embd, owned) &&
-      DeviceAlloc(&s.cur_half, std::size_t{n} * c.n_embd, owned) &&
-      DeviceAlloc(&s.y, std::size_t{n} * c.n_embd, owned) &&
-      DeviceAlloc(&s.qr, std::size_t{n} * c.q_lora, owned) &&
-      DeviceAlloc(&s.qr_half, std::size_t{n} * c.q_lora, owned) &&
-      DeviceAlloc(&s.q, std::size_t{n} * hmax * c.head_k, owned) &&
-      DeviceAlloc(&s.kva, std::size_t{n} * dk, owned) &&
-      DeviceAlloc(&s.qfull, std::size_t{n} * hmax * dk, owned) &&
-      DeviceAlloc(&s.att, std::size_t{n} * hmax * c.kv_lora, owned) &&
-      DeviceAlloc(&s.attv, std::size_t{n} * hmax * c.head_v, owned) &&
-      DeviceAlloc(&s.gate, std::size_t{n} * hmax * c.head_v, owned) &&
-      DeviceAlloc(&s.ik, std::size_t{n} * c.idx_dim, owned) &&
-      DeviceAlloc(&s.ivg, std::size_t{n} * 2 * c.idx_dim, owned) &&
-      DeviceAlloc(&s.iq, std::size_t{n} * c.idx_heads * c.idx_dim, owned) &&
-      DeviceAlloc(&s.iw, std::size_t{n} * c.idx_heads, owned) &&
-      DeviceAlloc(&s.ffn_a, ffn, owned) && DeviceAlloc(&s.ffn_b, ffn, owned) &&
-      DeviceAlloc(&s.ffn_c, ffn, owned) &&
-      DeviceAlloc(&s.latent, std::size_t{n} * c.n_latent, owned) &&
-      DeviceAlloc(&s.logits_r, std::size_t{n} * c.n_expert, owned) &&
-      DeviceAlloc(&s.ids, std::size_t{n} * c.n_expert_used, owned) &&
+      Dev(&s.engram_rows,
+          [&](std::size_t n) {
+            return std::size_t{modules} * n * cols * c.engram_dim;
+          }) &&
+      Dev(&s.engram_valid,
+          [&](std::size_t n) { return std::size_t{modules} * n * cols; }) &&
+      Dev(&s.engram_any,
+          [&](std::size_t n) { return std::size_t{modules} * n; }) &&
+      Dev(&s.engram_normed,
+          [&](std::size_t n) {
+            return std::size_t{n} * cols * c.engram_dim;
+          }) &&
+      Dev(&s.engram_kv,
+          [&](std::size_t n) {
+            return std::size_t{n} * (c.hc + 1) * c.n_embd;
+          }) &&
+      Dev(&s.h,
+          [&](std::size_t n) { return std::size_t{n} * c.hc * c.n_embd; }) &&
+      Dev(&s.post, [&](std::size_t n) { return std::size_t{n} * c.hc; }) &&
+      Dev(&s.x, [&](std::size_t n) { return std::size_t{n} * c.n_embd; }) &&
+      Dev(&s.cur, [&](std::size_t n) { return std::size_t{n} * c.n_embd; }) &&
+      Dev(&s.cur_half,
+          [&](std::size_t n) { return std::size_t{n} * c.n_embd; }) &&
+      Dev(&s.y, [&](std::size_t n) { return std::size_t{n} * c.n_embd; }) &&
+      Dev(&s.qr, [&](std::size_t n) { return std::size_t{n} * c.q_lora; }) &&
+      Dev(&s.qr_half,
+          [&](std::size_t n) { return std::size_t{n} * c.q_lora; }) &&
+      Dev(&s.q,
+          [&](std::size_t n) { return std::size_t{n} * hmax * c.head_k; }) &&
+      Dev(&s.kva, [&](std::size_t n) { return std::size_t{n} * dk; }) &&
+      Dev(&s.qfull,
+          [&](std::size_t n) { return std::size_t{n} * hmax * dk; }) &&
+      Dev(&s.att,
+          [&](std::size_t n) { return std::size_t{n} * hmax * c.kv_lora; }) &&
+      Dev(&s.attv,
+          [&](std::size_t n) { return std::size_t{n} * hmax * c.head_v; }) &&
+      Dev(&s.gate,
+          [&](std::size_t n) { return std::size_t{n} * hmax * c.head_v; }) &&
+      Dev(&s.ik, [&](std::size_t n) { return std::size_t{n} * c.idx_dim; }) &&
+      Dev(&s.ivg,
+          [&](std::size_t n) { return std::size_t{n} * 2 * c.idx_dim; }) &&
+      Dev(&s.iq,
+          [&](std::size_t n) {
+            return std::size_t{n} * c.idx_heads * c.idx_dim;
+          }) &&
+      Dev(&s.iw, [&](std::size_t n) { return std::size_t{n} * c.idx_heads; }) &&
+      Dev(&s.ffn_a, [&](std::size_t n) { return ffn(n); }) &&
+      Dev(&s.ffn_b, [&](std::size_t n) { return ffn(n); }) &&
+      Dev(&s.ffn_c, [&](std::size_t n) { return ffn(n); }) &&
+      Dev(&s.latent,
+          [&](std::size_t n) { return std::size_t{n} * c.n_latent; }) &&
+      Dev(&s.logits_r,
+          [&](std::size_t n) { return std::size_t{n} * c.n_expert; }) &&
+      Dev(&s.ids,
+          [&](std::size_t n) { return std::size_t{n} * c.n_expert_used; }) &&
       HostAlloc(&s.ids_host, std::size_t{n} * c.n_expert_used, owned) &&
-      DeviceAlloc(&s.route_plan, plan, owned) &&
-      HostAlloc(&s.route_plan_host, plan, owned) &&
-      DeviceAlloc(&s.route_w, std::size_t{n} * c.n_expert_used, owned) &&
-      DeviceAlloc(&s.moe, std::size_t{n} * c.n_latent, owned) &&
-      DeviceAlloc(&s.shared, std::size_t{n} * c.n_embd, owned) &&
-      // The head runs at most kVecMax rows at a time (Pass).
-      DeviceAlloc(&s.logits, std::size_t{std::min(n, kVecMax)} * c.n_vocab,
-                  owned) &&
+      Dev(&s.route_plan, [&](std::size_t n) { return plan(n); }) &&
+      HostAlloc(&s.route_plan_host, plan(n), owned) &&
+      Dev(&s.route_w,
+          [&](std::size_t n) { return std::size_t{n} * c.n_expert_used; }) &&
+      Dev(&s.moe, [&](std::size_t n) { return std::size_t{n} * c.n_latent; }) &&
+      Dev(&s.shared,
+          [&](std::size_t n) { return std::size_t{n} * c.n_embd; }) &&
+      Dev(&s.logits,
+          [&](std::size_t n) {
+            return std::min<std::size_t>(n, kVecMax) * c.n_vocab;
+          }) &&
       HostAlloc(&s.host_h, std::size_t{n} * c.hc * c.n_embd, owned);
   s.attn_work_floats = hy4_mla_attention_work(kVecMax, hmax, c.idx_top_k);
-  return ok && DeviceAlloc(&s.attn_work, s.attn_work_floats, owned);
+  return ok &&
+         Dev(&s.attn_work, [&](std::size_t) { return s.attn_work_floats; });
 }
 
 bool Model::AllocScratch(std::string* error) {
@@ -242,9 +308,28 @@ bool Model::AllocScratch(std::string* error) {
   // between layer groups (Session::SetPrefillYield).
   scratch_ = std::make_unique<Scratch>();
   decode_scratch_ = std::make_unique<Scratch>();
-  if (!AllocScratchRows(*scratch_, max_chunk_) ||
+  // Prompt passes of up to kResidentRows rows run on resident memory; the
+  // rest of their max_chunk_ rows is mapped only for wider passes
+  // (AcquireWidePasses), where device memory is demand-mapped.
+  const std::uint32_t resident = std::min(max_chunk_, kResidentRows);
+  if (resident < max_chunk_) {
+    std::size_t bytes = 0;
+    Scratch sizing;
+    if (!AllocScratchRows(sizing, max_chunk_, resident, nullptr, &bytes))
+      return Fail(error, "hy4: scratch sizing failed");
+    std::string arena_error;
+    arena_ = mem::ScratchArena::Reserve(bytes, &arena_error);
+  }
+  if (!AllocScratchRows(*scratch_, max_chunk_, arena_ ? resident : max_chunk_,
+                        arena_.get()) ||
       !AllocScratchRows(*decode_scratch_, kVecMax))
     return Fail(error, "hy4: scratch allocation failed");
+  if (arena_)
+    std::fprintf(stderr,
+                 "hy4: prompt scratch for %u-row passes, %.2f GiB beyond %u "
+                 "rows mapped only for them\n",
+                 max_chunk_, arena_->transient_bytes() / 1073741824.0,
+                 resident);
   auto* owned = &allocations_;
   hipblasHandle_t blas = nullptr;
   if (hipblasCreate(&blas) != HIPBLAS_STATUS_SUCCESS || hipblasSetStream(blas, stream_) != HIPBLAS_STATUS_SUCCESS) {
@@ -329,7 +414,8 @@ bool Session::Evaluate(std::span<const std::int32_t> tokens,
   } reset{prompt_pass_};
   if (logits) logits->clear();
   std::vector<float> part;
-  const std::size_t chunk = model_->MaxChunk();
+  const std::size_t chunk =
+      prompt ? model_->PassRows(tokens.size()) : model_->MaxChunk();
   for (std::size_t i = 0; i < tokens.size(); i += chunk) {
     const std::size_t n = std::min<std::size_t>(chunk, tokens.size() - i);
     const bool last = i + n == tokens.size();
@@ -344,7 +430,7 @@ bool Session::PromptThrough(std::span<const std::int32_t> tokens,
                             std::span<const std::uint32_t> rows,
                             std::vector<std::vector<float>>* row_logits,
                             std::string* error) {
-  if (tokens.size() > model_->MaxChunk() || !row_logits ||
+  if (tokens.size() > model_->PassRows(tokens.size()) || !row_logits ||
       (!rows.empty() && rows.back() + 1 >= tokens.size()))
     return Fail(error, "hy4: invalid in-pass logits rows");
   row_logits->assign(rows.size(), {});
@@ -557,6 +643,35 @@ bool Session::PrepareRows(std::span<const std::int32_t> tokens,
   return true;
 }
 
+std::uint32_t Model::PassRows(std::size_t tokens) const {
+  const std::uint32_t resident = std::min(max_chunk_, kResidentRows);
+  if (!arena_ || arena_->transient_mapped())
+    return max_chunk_;
+  if (tokens <= resident)
+    return resident;
+  // The wide rows, with room to spare, must fit the device heap after the
+  // state promised to sessions and leave the host its free floor. Mapping
+  // may reclaim clean page cache, never the RAM cache.
+  constexpr std::size_t kSpare = std::size_t{1} << 30;
+  const std::size_t bytes = arena_->transient_bytes() + kSpare;
+  std::size_t free_bytes = 0;
+  std::size_t total_bytes = 0;
+  if (mem::MemGetInfo(&free_bytes, &total_bytes) != hipSuccess) {
+    (void)hipGetLastError();
+    return resident;
+  }
+  if (free_bytes < bytes ||
+      mem::HostAvailableBytes() < mem::HostFreeFloorBytes() + bytes)
+    return resident;
+  return arena_->MapTransient(nullptr) ? max_chunk_ : resident;
+}
+
+void Model::ReleaseWidePasses() const {
+  // Unmapping waits for in-flight GPU work.
+  if (arena_ && arena_->transient_mapped() && !wide_pass_running_)
+    arena_->ReleaseTransient();
+}
+
 bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
   Session& first = *parts.front().session;
   Model& m = *first.model_;
@@ -582,6 +697,24 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
   if (parts.size() > 1 && (prompt || n > Model::kVecMax))
     return Fail(error,
                 "hy4: sessions share only decode passes of up to 16 rows");
+  // A decode pass returns the wide prompt rows' memory; a pass using them
+  // keeps them mapped through its yields.
+  if (!prompt)
+    m.ReleaseWidePasses();
+  if (prompt && n > std::min(m.max_chunk_, Model::kResidentRows) && m.arena_ &&
+      !m.arena_->transient_mapped())
+    return Fail(error, "hy4: a wide prompt pass without its rows mapped");
+  const bool wide_rows = prompt && n > Model::kResidentRows;
+  struct WideRun {
+    bool& flag;
+    bool set;
+    ~WideRun() {
+      if (set)
+        flag = false;
+    }
+  } wide_run{m.wide_pass_running_, wide_rows};
+  if (wide_rows)
+    m.wide_pass_running_ = true;
   // Decode passes take their own scratch; a prompt pass the wide one, which
   // a paused prompt pass holds (only decode rounds run in its yields).
   const bool wide = prompt || n > Model::kVecMax;
@@ -889,10 +1022,8 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
   } else {
     HY4_CHECK(hy4_gemv_q8_0_grouped(l.wk_b.data, s.q, s.qfull, c.kv_lora, nope, heads, n,
                                     std::uint64_t{heads} * c.head_k, c.head_k, std::uint64_t{heads} * dk, dk, st));
-    HY4_CHECK(hipMemcpy2DAsync(s.qfull + c.kv_lora, dk * sizeof(float),
-                               s.q + nope, c.head_k * sizeof(float),
-                               c.n_rot * sizeof(float), std::size_t{n} * heads,
-                               hipMemcpyDeviceToDevice, st));
+    HY4_CHECK(hy4_copy_2d(s.qfull + c.kv_lora, dk, s.q + nope, c.head_k,
+                          c.n_rot, std::uint64_t{n} * heads, st));
   }
   if (c.has_indexer[il] && !IndexerProject(parts, il, n, error))
     return false;
@@ -1013,11 +1144,9 @@ bool Session::IndexerProject(std::span<const Rows> parts, std::uint32_t il,
   HY4_CHECK(hy4_rms_norm(s.ik, l.idx_k_norm.f32(), s.ik, n, d, d, c.rms_eps, st));
   if (!MatVec(l.idx_value, s.ik, s.ffn_a, d, d, n, ex, error)) return false;
   if (!MatVec(l.idx_gate, s.ik, s.ffn_b, d, d, n, ex, error)) return false;
-  HY4_CHECK(hipMemcpy2DAsync(s.ivg, 2 * d * sizeof(float), s.ffn_a, d * sizeof(float), d * sizeof(float), n,
-                             hipMemcpyDeviceToDevice, st));
-  HY4_CHECK(hipMemcpy2DAsync(s.ivg + d, 2 * d * sizeof(float), s.ffn_b,
-                             d * sizeof(float), d * sizeof(float), n,
-                             hipMemcpyDeviceToDevice, st));
+  // The scratch may be demand-mapped, which hipMemcpy2DAsync rejects.
+  HY4_CHECK(hy4_copy_2d(s.ivg, 2 * d, s.ffn_a, d, d, n, st));
+  HY4_CHECK(hy4_copy_2d(s.ivg + d, 2 * d, s.ffn_b, d, d, n, st));
 
   // Query side, when some session's tokens see more pools than the top-k
   // keeps (below that every pool is selected: plain causal attention).

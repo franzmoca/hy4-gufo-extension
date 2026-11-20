@@ -239,6 +239,11 @@ int hy4_gather_indexed(const uint16_t* src, uint32_t ring, const int32_t* idx,
                        uint32_t count, int32_t limit, uint32_t dim, float* dst,
                        float* mask, uint32_t rows, uint32_t n_keys,
                        hipStream_t stream);
+/* dst[r * dst_pitch + i] = src[r * src_pitch + i] for i < width, r < rows
+ * (floats). hipMemcpy2DAsync rejects demand-mapped (VMM) memory. */
+int hy4_copy_2d(float* dst, uint64_t dst_pitch, const float* src,
+                uint64_t src_pitch, uint32_t width, uint64_t rows,
+                hipStream_t stream);
 /* x += a * b, elementwise over `count` floats; b repeats every `period` floats. */
 int hy4_mul_add(float* x, const float* a, const float* b, uint64_t count, uint64_t period, hipStream_t stream);
 /* out [blocks * 32] = dequantized Q8_0 blocks. */

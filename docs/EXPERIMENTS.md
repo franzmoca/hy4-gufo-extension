@@ -56,6 +56,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E48 | Several sessions' decoding in one pass | retained |
 | E49 | Several sessions' drafts in one drafter pass | retained |
 | E50 | Prompt scratch logits for 16 rows | retained |
+| E51 | Wide prompt scratch rows mapped only for wide passes | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1238,3 +1239,31 @@ cache pages and the 1.05 GiB vision tower, which the llama.cpp arm runs
 without, and about 8 GiB of 8,192-row buffers that a narrow resident scratch
 with transiently mapped wide rows (Gufo's `mem::ScratchArena`, #1265) could
 free outside lone prefills.
+
+## E51: Wide prompt scratch rows mapped only for wide passes (2026-11-20)
+
+After E50 the prompt scratch for 8,192-row passes still held 8 GiB for the
+whole life of the server, though only a lone prompt's wide passes use more
+than 2,048 rows (passes beside decoding sessions are 2,048 tokens). The
+scratch is now carved from Gufo's `mem::ScratchArena` (#1265) where device
+memory is demand-mapped: each buffer's first 2,048 rows stay backed, and the
+remaining 5.61 GiB is mapped when a prompt wider than that is planned
+(`Model::PassRows`, when the device heap and the host can spare it plus
+1 GiB) and released by the next decode pass, unless a wide pass is paused
+between layer groups. Without the headroom, or without demand mapping,
+passes stay 2,048 rows or the scratch is allocated whole as before; results
+do not depend on the pass width (E18, E36).
+
+`hipMemcpy2DAsync` rejects demand-mapped memory on ROCm 10.1 (invalid
+argument, from a standalone test), so the three strided copies into the
+scratch now use a small kernel (`hy4_copy_2d`).
+
+Memory above idle (GTT and VRAM, no vision, RAM cache off): 103,039 MiB after
+load with E50, 97,319 MiB now; a 2,408-token prompt peaks at 103,266 MiB and
+the server is back at 97,653 MiB after its reply. Replies are identical to
+E50 for cache-miss prompts of 4.7K, 10K and 18.6K tokens and for the recorded
+agent session (with its 3,355 drafts), and the suites pass as before. Each
+long request pays one map: ABBA prefill 924 to 912 tok/s at 4.7K tokens
+(−1.3%), −0.5% at 10K and −0.3% at 18.6K; the agent session, whose requests
+prefill at most 2,048 tokens, is unchanged
+([artifact](artifacts/2026-11-20-scratch-arena/arena.json)).

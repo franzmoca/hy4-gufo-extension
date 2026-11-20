@@ -1166,6 +1166,16 @@ __global__ void IndexMask(const int32_t* idx, uint32_t count, int32_t limit, flo
   }
 }
 
+__global__ void Copy2d(float* dst, uint64_t dst_pitch, const float* src,
+                       uint64_t src_pitch, uint32_t width, uint64_t count) {
+  for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < count;
+       i += (uint64_t)gridDim.x * blockDim.x) {
+    const uint64_t r = i / width;
+    const uint64_t c = i % width;
+    dst[r * dst_pitch + c] = src[r * src_pitch + c];
+  }
+}
+
 __global__ void MulAdd(float* x, const float* a, const float* b, uint64_t count, uint64_t period) {
   for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < count; i += (uint64_t)gridDim.x * blockDim.x) {
     x[i] += a[i] * b[i % period];
@@ -2133,6 +2143,17 @@ int hy4_gather_indexed(const uint16_t* src, uint32_t ring, const int32_t* idx,
   if (rows && n_keys) {
     IndexMask<<<dim3((n_keys + kBlock - 1) / kBlock, rows), kBlock, 0, stream>>>(idx, count, limit, mask, n_keys);
   }
+  return Status();
+}
+
+int hy4_copy_2d(float* dst, uint64_t dst_pitch, const float* src,
+                uint64_t src_pitch, uint32_t width, uint64_t rows,
+                hipStream_t stream) {
+  const uint64_t count = rows * width;
+  if (count == 0)
+    return 0;
+  Copy2d<<<Blocks(count), kBlock, 0, stream>>>(dst, dst_pitch, src, src_pitch,
+                                               width, count);
   return Status();
 }
 

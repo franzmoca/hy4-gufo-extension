@@ -1,0 +1,70 @@
+{
+ "setup": "cache-miss prompts of 4,741 / 10,080 / 18,583 tokens, 32 tokens generated, fresh gufo serve -c 40960 with DFly2 per arm, ABBA (E50, arena, arena, E50); replies identical in all arms",
+ "arms": {
+  "l1": [
+   {
+    "prefill_tokens": 4741,
+    "tps": 924.7
+   },
+   {
+    "prefill_tokens": 10080,
+    "tps": 915.4
+   },
+   {
+    "prefill_tokens": 18583,
+    "tps": 889.6
+   }
+  ],
+  "a1": [
+   {
+    "prefill_tokens": 4741,
+    "tps": 910.9
+   },
+   {
+    "prefill_tokens": 10080,
+    "tps": 910.5
+   },
+   {
+    "prefill_tokens": 18583,
+    "tps": 887.1
+   }
+  ],
+  "a2": [
+   {
+    "prefill_tokens": 4741,
+    "tps": 913.2
+   },
+   {
+    "prefill_tokens": 10080,
+    "tps": 910.8
+   },
+   {
+    "prefill_tokens": 18583,
+    "tps": 887.9
+   }
+  ],
+  "l2": [
+   {
+    "prefill_tokens": 4741,
+    "tps": 922.9
+   },
+   {
+    "prefill_tokens": 10080,
+    "tps": 915.5
+   },
+   {
+    "prefill_tokens": 18583,
+    "tps": 890.7
+   }
+  ]
+ },
+ "memory_mib_above_idle": {
+  "E49 after load": 106807,
+  "E50 after load": 103039,
+  "arena after load": 97319,
+  "arena peak during a 2,408-token prompt": 103266,
+  "arena after that request": 97653
+ },
+ "memory_setup": "GTT + VRAM in use above idle, context 4096 (8192 for the request), no vision sidecar, --cache-ram-bytes off",
+ "agent_replay": "53/53 replies, 3,355 drafts, prefill 25.9 s, decode 109.0 s in all four ABBA arms against E50 (no request prefills more than 2,048 tokens)"
+}

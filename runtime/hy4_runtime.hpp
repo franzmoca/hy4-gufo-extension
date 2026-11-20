@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <gufo/ext/experimental/state_memory.hpp>
 #include <memory>
 #include <span>
 #include <string>
@@ -160,6 +161,18 @@ public:
   /// Most tokens one evaluation pass takes: kMaxChunk for contexts up to
   /// kWideContext, else 4,096. Results do not depend on it (E18, E36).
   [[nodiscard]] std::uint32_t MaxChunk() const { return max_chunk_; }
+  /// Prompt rows that stay backed. Where device memory is demand-mapped,
+  /// the prompt scratch's rows beyond them take memory only while a wider
+  /// pass needs them.
+  static constexpr std::uint32_t kResidentRows = 2048;
+  /// The widest pass a prompt of `tokens` tokens can take now: MaxChunk()
+  /// once the wide rows are mapped (mapping them for a prompt wider than
+  /// kResidentRows when the device and host can spare them), else
+  /// kResidentRows. Results do not depend on it.
+  [[nodiscard]] std::uint32_t PassRows(std::size_t tokens) const;
+  /// Returns the wide rows' memory unless a wide pass is under way (paused
+  /// between layer groups). Decode passes call it.
+  void ReleaseWidePasses() const;
 
   [[nodiscard]] const Config& config() const { return config_; }
   [[nodiscard]] const Weights& weights() const { return weights_; }
@@ -208,7 +221,14 @@ private:
   // Scratch for one evaluation of up to MaxChunk() tokens (device unless
   // noted).
   struct Scratch;
-  bool AllocScratchRows(Scratch& s, std::uint32_t rows);
+  // `resident` of the `rows` rows backed from `arena` (none: all resident);
+  // `measure` adds up the arena bytes instead of allocating.
+  bool AllocScratchRows(Scratch& s, std::uint32_t rows,
+                        std::uint32_t resident = 0,
+                        mem::ScratchArena* arena = nullptr,
+                        std::size_t* measure = nullptr);
+  std::unique_ptr<mem::ScratchArena> arena_;  // scratch_'s wide rows
+  mutable bool wide_pass_running_ = false;
   std::unique_ptr<Scratch> scratch_;         // prompt passes, MaxChunk() rows
   std::unique_ptr<Scratch> decode_scratch_;  // other passes, kVecMax rows
   // A prompt pass is paused between layer groups and holds scratch_.

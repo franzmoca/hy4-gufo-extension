@@ -95,6 +95,9 @@
   tok/s)
   ([E45](docs/EXPERIMENTS.md#e45-cache-checkpoints-inside-a-prefill-pass-2026-11-20),
   [E46](docs/EXPERIMENTS.md#e46-engram-rows-read-directly-beside-the-layers-2026-11-20)).
+- The server holds 5.6 GiB less device memory outside long prefills: the
+  prompt scratch's wide rows are mapped only while a prompt needs them
+  ([E51](docs/EXPERIMENTS.md#e51-wide-prompt-scratch-rows-mapped-only-for-wide-passes-2026-11-20)).
 - The server holds 3.7 GiB less device memory: the prompt scratch keeps
   logits for 16 rows instead of 8,192
   ([E50](docs/EXPERIMENTS.md#e50-prompt-scratch-logits-for-16-rows-2026-11-20)).

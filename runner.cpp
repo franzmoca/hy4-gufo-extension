@@ -488,7 +488,8 @@ public:
     if (offset >= prompt.size() || offset != hy4.position())
       return std::nullopt;
     const std::size_t end = offset + StepTokens(hy4, prompt, offset, budget);
-    if (end - offset > model_->MaxChunk())
+    // One pass: a wide one maps the prompt scratch's wide rows.
+    if (end - offset > model_->PassRows(end - offset))
       return std::nullopt;
     if (const auto& images = hy4.images()) {
       for (const auto& span : images->Spans())
