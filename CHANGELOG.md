@@ -95,6 +95,10 @@
   tok/s)
   ([E45](docs/EXPERIMENTS.md#e45-cache-checkpoints-inside-a-prefill-pass-2026-11-20),
   [E46](docs/EXPERIMENTS.md#e46-engram-rows-read-directly-beside-the-layers-2026-11-20)).
+- Concurrent requests decode together in one pass: four requests generate
+  39 tokens per second in all (16.5 before), 35 with DFly2 (17.6), with the
+  same replies; a single request is unchanged
+  ([E48](docs/EXPERIMENTS.md#e48-several-sessions-decoding-in-one-pass-2026-11-20)).
 - Other sessions keep decoding while a prompt prefills, between its layer
   groups
   ([E47](docs/EXPERIMENTS.md#e47-decode-rounds-between-a-prompt-passs-layer-groups-2026-11-20)).

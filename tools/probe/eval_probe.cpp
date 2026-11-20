@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
   std::uint32_t ppl = 0;
   std::string kl_path;
   std::uint32_t passcheck = 0;
+  std::uint32_t batchcheck = 0;
   std::uint32_t chunkcheck = 0;
   int repeat =
       1;  // timed prefills, each on a fresh session; the last one decodes
@@ -107,6 +108,8 @@ int main(int argc, char** argv) {
     else if (a == "--ppl") ppl = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--kl") kl_path = argv[i + 1];
     else if (a == "--passcheck") passcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--batchcheck")
+      batchcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--chunkcheck") chunkcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--repeat")
       repeat = std::max(1, std::atoi(argv[i + 1]));
@@ -209,6 +212,84 @@ int main(int argc, char** argv) {
     std::printf("chunkcheck %u: %d/%zu same top, max |dlogit| %.4f, mean KL %.6f\n", split, same, rows, max_diff,
                 sum_kl / double(rows));
     return 0;
+  }
+  if (batchcheck) {
+    // Three sessions over the prompt's first 100%, 60% and 30%: `batchcheck`
+    // rounds of A stepping one token, B verifying three and C stepping one,
+    // each session alone and then all three in one pass (DecodeBatch). Every
+    // logit row must be the same, bit for bit.
+    const std::size_t vocab = model->config().n_vocab;
+    const std::size_t lens[3] = {prompt.size(), prompt.size() * 6 / 10,
+                                 prompt.size() * 3 / 10};
+    const std::size_t widths[3] = {1, 3, 1};
+    std::vector<std::int32_t> toks[3];
+    for (int k = 0; k < 3; ++k) {
+      auto g = model->CreateSession(ctx, &error);
+      if (!g || !g->Prompt(std::span(prompt.data(), lens[k]), &error))
+        return 1;
+      for (std::uint32_t i = 0; i < batchcheck * widths[k]; ++i) {
+        const auto& l = g->LastLogits();
+        toks[k].push_back(static_cast<std::int32_t>(
+            std::max_element(l.begin(), l.end()) - l.begin()));
+        if (!g->Step(std::span(&toks[k].back(), 1), &error))
+          return 1;
+      }
+    }
+    double decode_s[2] = {0, 0};
+    auto run = [&](bool batched, std::vector<float>* out) -> bool {
+      std::unique_ptr<hy4::Session> se[3];
+      for (int k = 0; k < 3; ++k) {
+        se[k] = model->CreateSession(ctx, &error);
+        if (!se[k] || !se[k]->Prompt(std::span(prompt.data(), lens[k]), &error))
+          return false;
+      }
+      const auto d0 = std::chrono::steady_clock::now();
+      for (std::uint32_t r = 0; r < batchcheck; ++r) {
+        std::span<const std::int32_t> t[3];
+        for (int k = 0; k < 3; ++k)
+          t[k] = std::span(toks[k].data() + r * widths[k], widths[k]);
+        if (batched) {
+          hy4::Session* all[3] = {se[0].get(), se[1].get(), se[2].get()};
+          if (!hy4::Session::DecodeBatch(all, t, &error))
+            return false;
+        } else {
+          for (int k = 0; k < 3; ++k) {
+            hy4::Session* one[1] = {se[k].get()};
+            if (!hy4::Session::DecodeBatch(one, std::span(&t[k], 1), &error))
+              return false;
+          }
+        }
+        for (int k = 0; k < 3; ++k) {
+          for (std::size_t i = 0; i + 1 < widths[k]; ++i) {
+            const auto row = se[k]->PassLogits(static_cast<std::uint32_t>(i));
+            out->insert(out->end(), row.begin(), row.end());
+          }
+          const auto& last = se[k]->LastLogits();
+          out->insert(out->end(), last.begin(), last.end());
+        }
+      }
+      decode_s[batched] = Seconds(d0, std::chrono::steady_clock::now());
+      return true;
+    };
+    std::vector<float> alone, together;
+    if (!run(false, &alone)) {
+      std::fprintf(stderr, "batchcheck failed: %s\n", error.c_str());
+      return 1;
+    }
+    if (!run(true, &together)) {
+      std::fprintf(stderr, "batchcheck failed: %s\n", error.c_str());
+      return 1;
+    }
+    std::size_t differ = 0;
+    for (std::size_t r = 0; r < alone.size() / vocab; ++r)
+      differ +=
+          std::memcmp(alone.data() + r * vocab, together.data() + r * vocab,
+                      vocab * sizeof(float)) != 0;
+    std::printf(
+        "batchcheck %u rounds: %zu of %zu logit rows differ; decoding alone "
+        "%.3f s, together %.3f s\n",
+        batchcheck, differ, alone.size() / vocab, decode_s[0], decode_s[1]);
+    return differ == 0 ? 0 : 3;
   }
   if (passcheck) {
     // Greedy tokens one per pass, then the same tokens `passcheck` per pass on

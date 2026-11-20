@@ -53,6 +53,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E45 | Cache checkpoints inside a prefill pass | retained |
 | E46 | Engram rows read directly, beside the layers | retained |
 | E47 | Decode rounds between a prompt pass's layer groups | retained |
+| E48 | Several sessions' decoding in one pass | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1147,3 +1148,35 @@ passes. A short request beside a 4,410-token prompt gives its first token at
 `conversation`, `long-context`, `cache`, `prefill-scheduling` and
 `image-inputs` pass at a 32,768-token context with four sessions (the
 measurement check reports DFly2 drafts on AR requests, as at E37).
+
+## E48: Several sessions' decoding in one pass (2026-11-20)
+
+Sessions decoded one after another, so four users each got a quarter of a
+single user's speed. A pass now takes several sessions' tokens
+(`Session::Pass`): every row goes through the projections, experts, norms
+and LM head together, and each session writes its cache rows, pools and
+selects its indexer keys, attends and fills its taps over its own rows. The
+decode kernels compute each row as a one-token pass does (E3, E28), so every
+session's logits are the same, bit for bit: `--batchcheck` steps one
+session, verifies three tokens of another and steps a third, alone and in
+one pass, and all 80 logit rows match (decoding 3.34 s alone, 1.82 s
+together). The runner implements `DecodeBatch` and lists batched widths up
+to eight: each session samples and proposes as before, proposing at most its
+share of the 16 rows (16 / sessions) so a batch stays one pass, and keeps
+what its own draws agree with. A session decoding alone is unchanged: the
+recorded agent session replays with the same 53 replies, drafts (3,355) and
+times (ABBA). `batch` and the other suites pass (`tools` but the known
+12-token `auto-tools` limit).
+
+Concurrent chat requests, 256 tokens each, four sessions, tok/s in all
+(per request); replies identical between builds
+([artifact](artifacts/2026-11-20-batched-decode/multi-user.json)):
+
+| requests | E47 | E48 | E47, DFly2 | E48, DFly2 |
+| --- | --- | --- | --- | --- |
+| 1 | 16.4 | 16.3 | 17.7 | 17.7 |
+| 2 | 16.5 (8.3) | 26.6 (13.3) | 17.7 (9.1) | 25.8 (13.4) |
+| 4 | 16.5 (4.1) | 39.3 (9.9) | 17.6 (4.5) | 35.1 (8.8) |
+
+DFly2 gains less: its sessions already verify several rows per pass, and
+rows from different sessions name more distinct experts.

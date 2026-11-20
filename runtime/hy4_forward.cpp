@@ -368,6 +368,41 @@ bool Session::Verify(std::span<const std::int32_t> tokens, std::string* error) {
   return true;
 }
 
+bool Session::DecodeBatch(std::span<Session* const> sessions,
+                          std::span<const std::span<const std::int32_t>> tokens,
+                          std::string* error) {
+  if (sessions.size() != tokens.size() || sessions.empty())
+    return Fail(error, "hy4: invalid decode batch");
+  if (sessions.size() == 1) {
+    return tokens[0].size() == 1 ? sessions[0]->Step(tokens[0], error)
+                                 : sessions[0]->Verify(tokens[0], error);
+  }
+  std::vector<PassPart> parts;
+  for (std::size_t i = 0; i < sessions.size(); ++i) {
+    Session& se = *sessions[i];
+    if (tokens[i].empty() || tokens[i].size() > kTapRows)
+      return Fail(error, "hy4: verify takes 1 to 16 tokens");
+    se.prompt_pass_ = false;
+    if (tokens[i].size() == 1) {
+      parts.push_back({&se, tokens[i], &se.last_logits_, false});
+    } else {
+      se.pass_pos0_ = se.Position();
+      se.tap_ready_ = false;
+      parts.push_back({&se, tokens[i], &se.pass_logits_, true});
+    }
+  }
+  if (!Pass(parts, error))
+    return false;
+  for (const PassPart& part : parts) {
+    Session& se = *part.session;
+    if (part.all_logits)
+      se.last_logits_.assign(
+          se.pass_logits_.end() - se.model_->config().n_vocab,
+          se.pass_logits_.end());
+  }
+  return true;
+}
+
 std::span<const float> Session::PassLogits(std::uint32_t row) const {
   const std::size_t v = model_->config().n_vocab;
   return std::span<const float>(pass_logits_).subspan(row * v, v);
@@ -435,32 +470,18 @@ const std::int32_t* Session::TapSelection(std::uint32_t k, std::uint32_t* count)
 
 bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<float>* logits, bool all_logits,
                             std::string* error) {
+  const PassPart part{this, tokens, logits, all_logits};
+  return Pass(std::span(&part, 1), error);
+}
+
+bool Session::PrepareRows(std::span<const std::int32_t> tokens,
+                          std::uint32_t row0, std::string* error) {
   Model& m = *model_;
   const Config& c = m.config_;
-  const Weights& w = m.weights_;
+  Model::Scratch& s = *scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_, prompt_pass_};
   const std::uint32_t n = static_cast<std::uint32_t>(tokens.size());
   const std::uint32_t pos0 = Position();
-  if (n == 0) return true;
-  // Decode passes take their own scratch; a prompt pass the wide one, which
-  // a paused prompt pass holds (only decode rounds run in its yields).
-  const bool wide = prompt_pass_ || n > Model::kVecMax;
-  if (wide && m.prompt_paused_)
-    return Fail(error, "hy4: a paused prompt pass holds the prefill scratch");
-  scratch_ = wide ? m.scratch_.get() : m.decode_scratch_.get();
-  Model::Scratch& s = *scratch_;
-  // Layers after which a prompt pass yields to the host's decode rounds.
-  std::vector<std::uint32_t> yield_after;
-  if (prompt_pass_ && yield_ && yield_groups_ > 1) {
-    for (std::size_t k = 1; k < yield_groups_; ++k) {
-      const auto layer =
-          static_cast<std::uint32_t>(k * c.n_layer / yield_groups_) - 1;
-      if (layer + 1 < c.n_layer &&
-          (yield_after.empty() || yield_after.back() != layer))
-        yield_after.push_back(layer);
-    }
-  }
   if (pos0 + n > max_context_) return Fail(error, "hy4: context full");
   for (const std::int32_t t : tokens) {
     if (t < 0 || static_cast<std::uint32_t>(t) >= c.n_vocab) return Fail(error, "hy4: token out of range");
@@ -469,13 +490,9 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   // Rope positions (decision 19): an image row (r, c) rotates at (s, s + r,
   // s + c), with s the position its image starts at; text continues after
   // the image's square of positions. Committed with the history.
-  struct ImageCopy {
-    std::uint32_t row, image, offset, count;
-  };
-  std::vector<ImageCopy> copies;
+  image_copies_.clear();
   std::vector<std::array<std::int32_t, 3>> rope(n);
   std::int32_t delta = rope_delta_;
-  s.rope_3d = false;
   const std::span<const ImageSpan> spans =
       images_ ? images_->Spans() : std::span<const ImageSpan>{};
   for (std::uint32_t i = 0; i < n; ++i) {
@@ -495,11 +512,11 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
                start + static_cast<std::int32_t>(offset / (it->width + 1)),
                start + static_cast<std::int32_t>(offset % (it->width + 1))};
     s.rope_3d = true;
-    if (!copies.empty() && copies.back().image == k &&
-        copies.back().row + copies.back().count == i) {
-      ++copies.back().count;
+    if (!image_copies_.empty() && image_copies_.back().image == k &&
+        image_copies_.back().row + image_copies_.back().count == row0 + i) {
+      ++image_copies_.back().count;
     } else {
-      copies.push_back({i, k, offset, 1});
+      image_copies_.push_back({row0 + i, k, offset, 1, nullptr});
     }
     if (p + 1 == it->End()) {
       delta = start +
@@ -508,10 +525,9 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
     }
   }
   // Encode before this pass writes any row.
-  std::vector<const float*> image_rows(copies.size());
-  for (std::size_t k = 0; k < copies.size(); ++k) {
-    image_rows[k] = images_->Embeddings(copies[k].image, error);
-    if (image_rows[k] == nullptr)
+  for (ImageCopy& copy : image_copies_) {
+    copy.rows = images_->Embeddings(copy.image, error);
+    if (copy.rows == nullptr)
       return false;
   }
 
@@ -523,18 +539,78 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
     rope_hw[2 * i] = rope[i][1];
     rope_hw[2 * i + 1] = rope[i][2];
   }
-  HY4_CHECK(hipMemcpyAsync(s.tokens, tokens.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-  HY4_CHECK(hipMemcpyAsync(s.pos, pos.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-  HY4_CHECK(hipMemcpyAsync(s.rope, rope_t.data(), n * sizeof(std::int32_t),
+  HY4_CHECK(hipMemcpyAsync(s.tokens + row0, tokens.data(),
+                           n * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                           st));
+  HY4_CHECK(hipMemcpyAsync(s.pos + row0, pos.data(), n * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, st));
-  if (s.rope_3d) {
-    HY4_CHECK(hipMemcpyAsync(s.rope_hw, rope_hw.data(),
-                             2 * n * sizeof(std::int32_t),
-                             hipMemcpyHostToDevice, st));
-  }
-  chunk_rope_ = rope;
+  HY4_CHECK(hipMemcpyAsync(s.rope + row0, rope_t.data(),
+                           n * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                           st));
+  HY4_CHECK(hipMemcpyAsync(s.rope_hw + 2 * row0, rope_hw.data(),
+                           2 * n * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                           st));
+  chunk_rope_ = std::move(rope);
+  chunk_delta_ = delta;
+  return true;
+}
 
-  // Engram rows for every module, gathered on the host from the mapping.
+bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
+  Session& first = *parts.front().session;
+  Model& m = *first.model_;
+  const Config& c = m.config_;
+  const Weights& w = m.weights_;
+  hipStream_t st = m.stream_;
+  const bool prompt = first.prompt_pass_;
+  const Exec ex{st, m.blas_, prompt};
+  // Each part's rows follow the previous part's.
+  std::vector<Rows> rows;
+  std::uint32_t n = 0;
+  for (const PassPart& part : parts) {
+    if (part.session->model_ != &m || part.session->prompt_pass_ != prompt)
+      return Fail(error, "hy4: a pass mixes models or prompt and decode rows");
+    rows.push_back(
+        {part.session, n, static_cast<std::uint32_t>(part.tokens.size())});
+    n += rows.back().n;
+  }
+  if (n == 0)
+    return true;
+  // Several sessions share only decode passes, whose rows compute what a
+  // one-token pass would.
+  if (parts.size() > 1 && (prompt || n > Model::kVecMax))
+    return Fail(error,
+                "hy4: sessions share only decode passes of up to 16 rows");
+  // Decode passes take their own scratch; a prompt pass the wide one, which
+  // a paused prompt pass holds (only decode rounds run in its yields).
+  const bool wide = prompt || n > Model::kVecMax;
+  if (wide && m.prompt_paused_)
+    return Fail(error, "hy4: a paused prompt pass holds the prefill scratch");
+  Model::Scratch& s = wide ? *m.scratch_ : *m.decode_scratch_;
+  s.rope_3d = false;
+  // Batched passes also keep cur in binary16 for the FP16 kernels.
+  s.batched = n > Model::kVecMax || prompt;
+  const bool batched = s.batched;
+  for (const Rows& part : rows) {
+    part.session->scratch_ = &s;
+    if (part.n == 0)
+      continue;
+    const auto& tokens = parts[&part - rows.data()].tokens;
+    if (!part.session->PrepareRows(tokens, part.row0, error))
+      return false;
+  }
+  // Layers after which a prompt pass yields to the host's decode rounds.
+  std::vector<std::uint32_t> yield_after;
+  if (prompt && first.yield_ && first.yield_groups_ > 1) {
+    for (std::size_t k = 1; k < first.yield_groups_; ++k) {
+      const auto layer =
+          static_cast<std::uint32_t>(k * c.n_layer / first.yield_groups_) - 1;
+      if (layer + 1 < c.n_layer &&
+          (yield_after.empty() || yield_after.back() != layer))
+        yield_after.push_back(layer);
+    }
+  }
+
+  // Engram rows for every module, hashed against each session's history.
   const std::uint32_t modules = static_cast<std::uint32_t>(c.engram_layers.size());
   const std::uint32_t cols = modules ? c.EngramCols() : 0;
   // Each module's rows are read from the table by the Engram readers while
@@ -553,8 +629,12 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   } wait_all{modules ? &m.Engram() : nullptr, gathers};
   for (std::uint32_t e = 0; e < modules; ++e) {
     const std::size_t at = std::size_t{e} * n * cols;
-    m.EngramRows(history_, tokens, pos0, e, engram_ids.data() + at,
-                 s.engram_valid_host + at);
+    for (const Rows& part : rows) {
+      const std::size_t row = at + std::size_t{part.row0} * cols;
+      m.EngramRows(part.session->history_, parts[&part - rows.data()].tokens,
+                   part.session->Position(), e, engram_ids.data() + row,
+                   s.engram_valid_host + row);
+    }
     for (std::uint32_t i = 0; i < n; ++i) {
       float any = 0.0f;
       for (std::uint32_t col = 0; col < cols; ++col)
@@ -564,13 +644,13 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
     // A decode pass's rows go before a paused prompt pass's queued reads.
     gathers.push_back(m.Engram().Start(
         std::span(engram_ids).subspan(at, std::size_t{n} * cols),
-        s.engram_host + at * c.engram_dim, !prompt_pass_));
+        s.engram_host + at * c.engram_dim, !prompt));
   }
   const auto engram_ready = [&](std::uint32_t e) -> hipError_t {
     const auto g0 = std::chrono::steady_clock::now();
     const bool read = m.Engram().Wait(*gathers[e]);
     gathers[e].reset();
-    engram_seconds_ +=
+    first.engram_seconds_ +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - g0)
             .count();
     if (!read)
@@ -593,18 +673,17 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   };
 
   HY4_CHECK(hy4_embed_q8_0(w.tok_embd.data, s.tokens, n, c.n_embd, s.x, st));
-  for (std::size_t k = 0; k < copies.size(); ++k) {
-    const ImageCopy& copy = copies[k];
-    HY4_CHECK(
-        hipMemcpyAsync(s.x + std::size_t{copy.row} * c.n_embd,
-                       image_rows[k] + std::size_t{copy.offset} * c.n_embd,
-                       std::size_t{copy.count} * c.n_embd * sizeof(float),
-                       hipMemcpyDeviceToDevice, st));
+  for (const Rows& part : rows) {
+    for (const ImageCopy& copy : part.session->image_copies_) {
+      HY4_CHECK(
+          hipMemcpyAsync(s.x + std::size_t{copy.row} * c.n_embd,
+                         copy.rows + std::size_t{copy.offset} * c.n_embd,
+                         std::size_t{copy.count} * c.n_embd * sizeof(float),
+                         hipMemcpyDeviceToDevice, st));
+    }
   }
   HY4_CHECK(hy4_hc_init(s.x, s.h, n, c.hc, c.n_embd, st));
 
-  // Batched passes also keep cur in binary16 for the FP16 kernels.
-  const bool batched = n > Model::kVecMax || prompt_pass_;
   auto norm_cur = [&](const Tensor& weight) {
     return batched ? hy4_rms_norm_half(s.x, weight.f32(), s.cur, s.cur_half, n,
                                        c.n_embd, c.n_embd, c.rms_eps, st)
@@ -650,23 +729,25 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
     HY4_CHECK(hc_pre(l.hc_attn_fn, l.hc_attn_scale, l.hc_attn_base, s.post,
                      c.hc_magnitude));
     HY4_CHECK(norm_cur(l.attn_norm));
-    if (!Attention(il, n, error)) return false;
+    if (!Attention(rows, il, n, error))
+      return false;
     post_pending = true;
 
     HY4_CHECK(hc_pre(l.hc_ffn_fn, l.hc_ffn_scale, l.hc_ffn_base, s.post,
                      c.hc_magnitude));
     HY4_CHECK(norm_cur(l.ffn_norm));
-    if (!Ffn(il, n, error)) return false;
+    if (!first.Ffn(il, n, error))
+      return false;
     HY4_CHECK(hy4_rms_norm(s.y, l.ffn_post_norm.f32(), s.y, n, c.n_embd, c.n_embd, c.rms_eps, st));
     post_pending = true;
 
-    if (probe_) {
+    if (first.probe_) {
       HY4_CHECK(hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st));
       post_pending = false;
       HY4_CHECK(hipMemcpyAsync(s.host_h, s.h, std::size_t{n} * c.hc * c.n_embd * sizeof(float),
                                hipMemcpyDeviceToHost, st));
       HY4_CHECK(hipStreamSynchronize(st));
-      probe_(probe_user_, static_cast<int>(il), s.host_h, n);
+      first.probe_(first.probe_user_, static_cast<int>(il), s.host_h, n);
     }
     if (std::ranges::binary_search(yield_after, il)) {
       // The queued layers finish first: the host's decode round syncs the
@@ -677,7 +758,7 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
         Model& m;
         ~Resume() { m.prompt_paused_ = false; }
       } resume{m};
-      yield_();
+      first.yield_();
     }
   }
 
@@ -685,51 +766,85 @@ bool Session::EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<fl
   HY4_CHECK(
       hc_pre(w.hc_head_fn, w.hc_head_scale, w.hc_head_base, nullptr, 1.0f));
   HY4_CHECK(hy4_rms_norm(s.x, w.output_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
-  if (tap_hidden_) {
-    const std::uint32_t r = std::min(n, kTapRows);
-    HY4_CHECK(hipMemcpyAsync(tap_hidden_, s.cur + std::size_t{n - r} * c.n_embd, std::size_t{r} * c.n_embd * sizeof(float),
-                             hipMemcpyDeviceToDevice, st));
-    tap_rows_ = r;
-    tap_row_ = r - 1;
-    tap_ready_ = true;
+  for (const Rows& part : rows) {
+    Session& se = *part.session;
+    if (!se.tap_hidden_ || part.n == 0)
+      continue;
+    const std::uint32_t r = std::min(part.n, kTapRows);
+    HY4_CHECK(hipMemcpyAsync(
+        se.tap_hidden_, s.cur + std::size_t{part.row0 + part.n - r} * c.n_embd,
+        std::size_t{r} * c.n_embd * sizeof(float), hipMemcpyDeviceToDevice,
+        st));
+    se.tap_rows_ = r;
+    se.tap_row_ = r - 1;
+    se.tap_ready_ = true;
   }
   // In-pass checkpoints' logits: each row through the head as a pass's last
   // row is (one row per product).
-  for (std::size_t i = 0; through_logits_ && i < through_rows_.size(); ++i) {
-    const std::uint32_t r = through_rows_[i];
+  for (std::size_t i = 0;
+       first.through_logits_ && i < first.through_rows_.size(); ++i) {
+    const std::uint32_t r = first.through_rows_[i];
     if (!MatVec(w.output, s.cur + std::size_t{r} * c.n_embd, s.logits,
                 c.n_vocab, c.n_embd, 1, ex, error)) {
       return false;
     }
-    auto& out = (*through_logits_)[i];
+    auto& out = (*first.through_logits_)[i];
     out.resize(c.n_vocab);
     HY4_CHECK(hipMemcpyAsync(out.data(), s.logits, out.size() * sizeof(float),
                              hipMemcpyDeviceToHost, st));
   }
-  if (logits) {
-    const std::uint32_t first = all_logits ? 0 : n - 1;
-    const std::uint32_t rows = n - first;
-    if (!MatVec(w.output, s.cur + std::size_t{first} * c.n_embd, s.logits, c.n_vocab, c.n_embd, rows, ex, error)) {
-      return false;
+  if (parts.size() == 1) {
+    if (auto* logits = parts.front().logits) {
+      const std::uint32_t first_row = parts.front().all_logits ? 0 : n - 1;
+      const std::uint32_t count = n - first_row;
+      if (!MatVec(w.output, s.cur + std::size_t{first_row} * c.n_embd, s.logits,
+                  c.n_vocab, c.n_embd, count, ex, error)) {
+        return false;
+      }
+      logits->resize(std::size_t{count} * c.n_vocab);
+      HY4_CHECK(hipMemcpyAsync(logits->data(), s.logits,
+                               logits->size() * sizeof(float),
+                               hipMemcpyDeviceToHost, st));
     }
-    logits->resize(std::size_t{rows} * c.n_vocab);
-    HY4_CHECK(hipMemcpyAsync(logits->data(), s.logits, logits->size() * sizeof(float), hipMemcpyDeviceToHost, st));
+  } else {
+    // One head product over every session's rows; each takes its own.
+    if (!MatVec(w.output, s.cur, s.logits, c.n_vocab, c.n_embd, n, ex, error))
+      return false;
+    for (const Rows& part : rows) {
+      auto* logits = parts[&part - rows.data()].logits;
+      if (!logits || part.n == 0)
+        continue;
+      const std::uint32_t first_row =
+          parts[&part - rows.data()].all_logits ? 0 : part.n - 1;
+      logits->resize(std::size_t{part.n - first_row} * c.n_vocab);
+      HY4_CHECK(hipMemcpyAsync(
+          logits->data(),
+          s.logits + std::size_t{part.row0 + first_row} * c.n_vocab,
+          logits->size() * sizeof(float), hipMemcpyDeviceToHost, st));
+    }
   }
   HY4_CHECK(hipStreamSynchronize(st));
-  history_.insert(history_.end(), tokens.begin(), tokens.end());
-  rope_.insert(rope_.end(), rope.begin(), rope.end());
-  rope_delta_ = delta;
+  for (const Rows& part : rows) {
+    Session& se = *part.session;
+    const auto& tokens = parts[&part - rows.data()].tokens;
+    se.history_.insert(se.history_.end(), tokens.begin(), tokens.end());
+    se.rope_.insert(se.rope_.end(), se.chunk_rope_.begin(),
+                    se.chunk_rope_.end());
+    se.rope_delta_ = se.chunk_delta_;
+  }
   return true;
 }
 
-bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
-  Model& m = *model_;
+bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
+                        std::uint32_t n, std::string* error) {
+  Session& first = *parts.front().session;
+  Model& m = *first.model_;
   const Config& c = m.config_;
   const Layer& l = m.weights_.layers[il];
-  Model::Scratch& s = *scratch_;
+  Model::Scratch& s = *first.scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_, prompt_pass_};
-  const bool batched = n > Model::kVecMax || prompt_pass_;
+  const Exec ex{st, m.blas_, first.prompt_pass_};
+  const bool batched = n > Model::kVecMax || first.prompt_pass_;
   const std::uint32_t heads = c.n_head[il];
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::uint32_t nope = c.head_k - c.n_rot;
@@ -772,50 +887,17 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
                                c.n_rot * sizeof(float), std::size_t{n} * heads,
                                hipMemcpyDeviceToDevice, st));
   }
-  HY4_CHECK(
-      hy4_store_rows_half(s.kva, dk, cache_[il], ring_[il], s.pos, n, dk, st));
-
-  const std::int32_t* sel = nullptr;
-  std::uint32_t n_sel = 0;
-  if (c.has_indexer[il] && !Indexer(il, n, Position(), &sel, &n_sel, error)) return false;
-  if (!tap_index_.empty() && tap_index_[il] >= 0) {
-    const auto k = static_cast<std::uint32_t>(tap_index_[il]);
-    const std::uint32_t r = std::min(n, kTapRows);
-    tap_has_sel_[k] = sel != nullptr;
-    if (sel) {
-      if (n_sel != tap_sel_count_) return Fail(error, "hy4: tap selection size mismatch");
-      HY4_CHECK(hipMemcpyAsync(tap_sel_[k], sel + std::size_t{n - r} * n_sel, std::size_t{r} * n_sel * sizeof(std::int32_t),
-                               hipMemcpyDeviceToDevice, st));
-    }
-  }
-
-  const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_k));
-  // Prefill attention output as binary16 bits in att's storage.
-  auto* att_half = reinterpret_cast<std::uint16_t*>(s.att);
-  if (batched) {
-    // Prefill runs each token over exactly its own keys on the matrix cores,
-    // reading the binary16 cache rows, so a token's result does not depend on
-    // how its span was cut into passes. The ring holds the window and the
-    // whole pass.
-    const std::uint32_t window = c.is_swa[il] ? c.swa_window : 0;
-    std::int32_t lo = 0;
-    if (window)
-      lo = std::max<std::int32_t>(0, static_cast<std::int32_t>(Position()) -
-                                         static_cast<std::int32_t>(window) + 1);
-    HY4_CHECK(hy4_mla_prefill(qh, cache_[il], ring_[il], lo, s.pos, window, sel,
-                              n_sel, l.attn_sinks.f32(), scale, att_half, n,
-                              heads, dk, c.kv_lora, st));
-  } else {
-    // Decoding and verify passes: each token over exactly the keys a
-    // one-token pass would see.
-    HY4_CHECK(hy4_mla_attention(
-        s.qfull, cache_[il], ring_[il], s.pos, c.is_swa[il] ? c.swa_window : 0,
-        sel, n_sel, l.attn_sinks.f32(), scale, s.att, n, heads, dk, c.kv_lora,
-        s.attn_work, s.attn_work_floats, st));
+  if (c.has_indexer[il] && !IndexerProject(parts, il, n, error))
+    return false;
+  // Each session's rows: its cache, its keys and its selection.
+  for (const Rows& part : parts) {
+    if (!part.session->Attend(il, part.row0, part.n, error))
+      return false;
   }
   if (batched) {
     // The gate first, so that wv_b's stores apply it and round the gated
     // values to binary16 once, which wo then reads.
+    auto* att_half = reinterpret_cast<std::uint16_t*>(s.att);
     if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex,
                 error, cur_half))
       return false;
@@ -829,9 +911,10 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
     HY4_CHECK(hy4_f16_dense(l.wo.type, l.wo.data, attv_half, s.y, c.n_embd, n,
                             heads * c.head_v, 1, HY4_F16_X_HALF, st));
   } else {
-    HY4_CHECK(hy4_gemv_q8_0_grouped(l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
-                                    std::uint64_t{heads} * c.kv_lora, c.kv_lora, std::uint64_t{heads} * c.head_v,
-                                    c.head_v, st));
+    HY4_CHECK(hy4_gemv_q8_0_grouped(
+        l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
+        std::uint64_t{heads} * c.kv_lora, c.kv_lora,
+        std::uint64_t{heads} * c.head_v, c.head_v, st));
     if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex,
                 error))
       return false;
@@ -840,23 +923,83 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
     if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, ex, error))
       return false;
   }
-  HY4_CHECK(hy4_rms_norm(s.y, l.attn_post_norm.f32(), s.y, n, c.n_embd, c.n_embd, c.rms_eps, st));
+  HY4_CHECK(hy4_rms_norm(s.y, l.attn_post_norm.f32(), s.y, n, c.n_embd,
+                         c.n_embd, c.rms_eps, st));
   return true;
 }
 
-bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, const std::int32_t** sel,
-                      std::uint32_t* n_sel, std::string* error) {
+bool Session::Attend(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
+                     std::string* error) {
   Model& m = *model_;
   const Config& c = m.config_;
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_, prompt_pass_};
+  const bool batched = s.batched;
+  const std::uint32_t heads = c.n_head[il];
+  const std::uint32_t dk = c.kv_lora + c.n_rot;
+  const std::int32_t* pos = s.pos + row0;
+  HY4_CHECK(hy4_store_rows_half(s.kva + std::size_t{row0} * dk, dk, cache_[il],
+                                ring_[il], pos, n, dk, st));
+
+  const std::int32_t* sel = nullptr;
+  std::uint32_t n_sel = 0;
+  if (c.has_indexer[il] &&
+      !Indexer(il, row0, n, Position(), &sel, &n_sel, error))
+    return false;
+  if (!tap_index_.empty() && tap_index_[il] >= 0) {
+    const auto k = static_cast<std::uint32_t>(tap_index_[il]);
+    const std::uint32_t r = std::min(n, kTapRows);
+    tap_has_sel_[k] = sel != nullptr;
+    if (sel) {
+      if (n_sel != tap_sel_count_) return Fail(error, "hy4: tap selection size mismatch");
+      HY4_CHECK(hipMemcpyAsync(tap_sel_[k], sel + std::size_t{n - r} * n_sel, std::size_t{r} * n_sel * sizeof(std::int32_t),
+                               hipMemcpyDeviceToDevice, st));
+    }
+  }
+
+  const float scale = 1.0f / std::sqrt(static_cast<float>(c.head_k));
+  if (batched) {
+    // Prefill runs each token over exactly its own keys on the matrix cores,
+    // reading the binary16 cache rows, so a token's result does not depend on
+    // how its span was cut into passes. The ring holds the window and the
+    // whole pass. A prefill pass is one session's.
+    auto* qh = reinterpret_cast<std::uint16_t*>(s.qfull);
+    auto* att_half = reinterpret_cast<std::uint16_t*>(s.att);
+    const std::uint32_t window = c.is_swa[il] ? c.swa_window : 0;
+    std::int32_t lo = 0;
+    if (window)
+      lo = std::max<std::int32_t>(0, static_cast<std::int32_t>(Position()) -
+                                         static_cast<std::int32_t>(window) + 1);
+    HY4_CHECK(hy4_mla_prefill(qh, cache_[il], ring_[il], lo, s.pos, window, sel,
+                              n_sel, l.attn_sinks.f32(), scale, att_half, n,
+                              heads, dk, c.kv_lora, st));
+  } else {
+    // Decoding and verify passes: each token over exactly the keys a
+    // one-token pass would see.
+    HY4_CHECK(hy4_mla_attention(
+        s.qfull + std::size_t{row0} * heads * dk, cache_[il], ring_[il], pos,
+        c.is_swa[il] ? c.swa_window : 0, sel, n_sel, l.attn_sinks.f32(), scale,
+        s.att + std::size_t{row0} * heads * c.kv_lora, n, heads, dk, c.kv_lora,
+        s.attn_work, s.attn_work_floats, st));
+  }
+  return true;
+}
+
+bool Session::IndexerProject(std::span<const Rows> parts, std::uint32_t il,
+                             std::uint32_t n, std::string* error) {
+  Session& first = *parts.front().session;
+  Model& m = *first.model_;
+  const Config& c = m.config_;
+  const Layer& l = m.weights_.layers[il];
+  Model::Scratch& s = *first.scratch_;
+  hipStream_t st = m.stream_;
+  const Exec ex{st, m.blas_, first.prompt_pass_};
   const std::uint32_t d = c.idx_dim;
   const float base = c.rope_base;  // indexer layers are the sparse ones
 
   // Key side: normed key, then its value and gate projections.
-  const bool batched = n > Model::kVecMax || prompt_pass_;
+  const bool batched = s.batched;
   const std::uint16_t* cur_half = batched ? s.cur_half : nullptr;
   if (!MatVec(l.idx_k, s.cur, s.ik, d, c.n_embd, n, ex, error, cur_half))
     return false;
@@ -865,11 +1008,46 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   if (!MatVec(l.idx_gate, s.ik, s.ffn_b, d, d, n, ex, error)) return false;
   HY4_CHECK(hipMemcpy2DAsync(s.ivg, 2 * d * sizeof(float), s.ffn_a, d * sizeof(float), d * sizeof(float), n,
                              hipMemcpyDeviceToDevice, st));
-  HY4_CHECK(hipMemcpy2DAsync(s.ivg + d, 2 * d * sizeof(float), s.ffn_b, d * sizeof(float), d * sizeof(float), n,
+  HY4_CHECK(hipMemcpy2DAsync(s.ivg + d, 2 * d * sizeof(float), s.ffn_b,
+                             d * sizeof(float), d * sizeof(float), n,
                              hipMemcpyDeviceToDevice, st));
-  HY4_CHECK(hy4_store_rows(s.ivg, 2 * d, idx_rows_[il], Model::kIndexerRing, s.pos, n, 2 * d, st));
 
-  // Pool the groups this chunk completes; a pooled key is roped at its first
+  // Query side, when some session's tokens see more pools than the top-k
+  // keeps (below that every pool is selected: plain causal attention).
+  const std::uint32_t top = c.idx_top_k / c.kpool - 1;
+  const bool select = std::ranges::any_of(parts, [&](const Rows& part) {
+    return (part.session->Position() + part.n - 1) / c.kpool > top;
+  });
+  if (!select)
+    return true;
+  if (!MatVec(l.idx_q_b, s.qr, s.iq, c.idx_heads * d, c.q_lora, n, ex, error,
+              batched ? s.qr_half : nullptr))
+    return false;
+  HY4_CHECK(hy4_rope_3d(s.iq, s.rope, s.rope_3d ? s.rope_hw : nullptr, n,
+                        c.idx_heads, std::uint64_t{c.idx_heads} * d, d,
+                        d - c.n_rot, c.n_rot, base, st));
+  // The 1 / sqrt(d heads) weight scale does not change the selection.
+  if (!MatVec(l.idx_proj, s.cur, s.iw, c.idx_heads, c.n_embd, n, ex, error,
+              cur_half))
+    return false;
+  return true;
+}
+
+bool Session::Indexer(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
+                      std::uint32_t pos0, const std::int32_t** sel,
+                      std::uint32_t* n_sel, std::string* error) {
+  Model& m = *model_;
+  const Config& c = m.config_;
+  const Layer& l = m.weights_.layers[il];
+  Model::Scratch& s = *scratch_;
+  hipStream_t st = m.stream_;
+  const std::uint32_t d = c.idx_dim;
+  const float base = c.rope_base;  // indexer layers are the sparse ones
+  HY4_CHECK(hy4_store_rows(s.ivg + std::size_t{row0} * 2 * d, 2 * d,
+                           idx_rows_[il], Model::kIndexerRing, s.pos + row0, n,
+                           2 * d, st));
+
+  // Pool the groups these rows complete; a pooled key is roped at its first
   // member's position.
   std::vector<std::int32_t> groups, group_pos, group_hw;
   bool group_3d = false;
@@ -908,17 +1086,9 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   if (n_pool_max <= top) return true;
   std::vector<std::int32_t> n_pool(n);
   for (std::uint32_t i = 0; i < n; ++i) n_pool[i] = static_cast<std::int32_t>((pos0 + i) / c.kpool);
-  HY4_CHECK(hipMemcpyAsync(s.n_pool, n_pool.data(), n * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-  if (!MatVec(l.idx_q_b, s.qr, s.iq, c.idx_heads * d, c.q_lora, n, ex, error,
-              batched ? s.qr_half : nullptr))
-    return false;
-  HY4_CHECK(hy4_rope_3d(s.iq, s.rope, s.rope_3d ? s.rope_hw : nullptr, n,
-                        c.idx_heads, std::uint64_t{c.idx_heads} * d, d,
-                        d - c.n_rot, c.n_rot, base, st));
-  // The 1 / sqrt(d heads) weight scale does not change the selection.
-  if (!MatVec(l.idx_proj, s.cur, s.iw, c.idx_heads, c.n_embd, n, ex, error,
-              cur_half))
-    return false;
+  HY4_CHECK(hipMemcpyAsync(s.n_pool + row0, n_pool.data(),
+                           n * sizeof(std::int32_t), hipMemcpyHostToDevice,
+                           st));
   // Scores and selections in slices of kScoreRows tokens, so that the score
   // buffer stays [kScoreRows][pools] however wide the pass; each token's
   // selection depends only on its own visible pools.
@@ -926,11 +1096,11 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, con
   for (std::uint32_t t = 0; t < n; t += Model::kScoreRows) {
     const std::uint32_t rows = std::min(Model::kScoreRows, n - t);
     const std::uint32_t pools_max = (pos0 + t + rows - 1) / c.kpool;
-    HY4_CHECK(hy4_indexer_score(s.iq + std::size_t{t} * c.idx_heads * d,
-                                s.iw + std::size_t{t} * c.idx_heads,
-                                idx_pooled_[il], s.n_pool + t, pools_max,
-                                score_, rows, c.idx_heads, d, st));
-    HY4_CHECK(hy4_kpool_select(score_, s.n_pool + t, pools_max, s.pos + t, top,
+    const std::size_t r = std::size_t{row0} + t;
+    HY4_CHECK(hy4_indexer_score(
+        s.iq + r * c.idx_heads * d, s.iw + r * c.idx_heads, idx_pooled_[il],
+        s.n_pool + r, pools_max, score_, rows, c.idx_heads, d, st));
+    HY4_CHECK(hy4_kpool_select(score_, s.n_pool + r, pools_max, s.pos + r, top,
                                c.kpool, sel_ + std::size_t{t} * n_sel_row, rows,
                                st));
   }

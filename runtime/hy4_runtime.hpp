@@ -255,6 +255,13 @@ public:
   /// Evaluates `tokens` (at most kTapRows) and keeps every one's logits
   /// (PassLogits) until Keep.
   [[nodiscard]] bool Verify(std::span<const std::int32_t> tokens, std::string* error);
+  /// Decode passes of several sessions as one pass: each session's tokens
+  /// as its own Step (one token) or Verify (more), with the same results;
+  /// at most Model::kVecMax tokens in all.
+  [[nodiscard]] static bool DecodeBatch(
+      std::span<Session* const> sessions,
+      std::span<const std::span<const std::int32_t>> tokens,
+      std::string* error);
   /// Logits after token `row` of the last Verify, [n_vocab] on the host.
   [[nodiscard]] std::span<const float> PassLogits(std::uint32_t row) const;
   /// Keeps the first `tokens` (>= 1) tokens of the last Verify and forgets
@@ -356,11 +363,41 @@ public:
 private:
   friend class Model;
   Session(Model* model, std::uint32_t max_context) : model_(model), max_context_(max_context) {}
+  // One session's tokens in a pass, and where its logits go (as
+  // Evaluate's).
+  struct PassPart {
+    Session* session;
+    std::span<const std::int32_t> tokens;
+    std::vector<float>* logits;
+    bool all_logits;
+  };
+  // A part's rows of the pass: [row0, row0 + n) of the scratch.
+  struct Rows {
+    Session* session;
+    std::uint32_t row0;
+    std::uint32_t n;
+  };
   bool EvaluateChunk(std::span<const std::int32_t> tokens, std::vector<float>* logits, bool all_logits,
                      std::string* error);
-  bool Attention(std::uint32_t il, std::uint32_t n, std::string* error);
+  // One pass over every part's tokens, each part's rows after the previous
+  // one's. The projections, experts and head run once over all rows; each
+  // session writes and attends over its own cache with its rows.
+  static bool Pass(std::span<const PassPart> parts, std::string* error);
+  // This session's inputs for the pass: tokens, positions, rope, images.
+  bool PrepareRows(std::span<const std::int32_t> tokens, std::uint32_t row0,
+                   std::string* error);
+  static bool Attention(std::span<const Rows> parts, std::uint32_t il,
+                        std::uint32_t n, std::string* error);
+  // This session's rows of a layer's attention: cache rows, indexer
+  // selection, taps and the attention itself.
+  bool Attend(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
+              std::string* error);
+  // The indexer's projections, over every part's rows.
+  static bool IndexerProject(std::span<const Rows> parts, std::uint32_t il,
+                             std::uint32_t n, std::string* error);
   bool Ffn(std::uint32_t il, std::uint32_t n, std::string* error);
-  bool Indexer(std::uint32_t il, std::uint32_t n, std::uint32_t pos0, const std::int32_t** sel,
+  bool Indexer(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
+               std::uint32_t pos0, const std::int32_t** sel,
                std::uint32_t* n_sel, std::string* error);
 
   Model* model_;
@@ -372,6 +409,14 @@ private:
   std::shared_ptr<ImageInputs> images_;
   // The rope positions of the pass being evaluated, from its first position.
   std::vector<std::array<std::int32_t, 3>> chunk_rope_;
+  std::int32_t chunk_delta_ = 0;
+  // The pass's image rows: scratch row, image, its first row, count, and
+  // the image's embeddings.
+  struct ImageCopy {
+    std::uint32_t row, image, offset, count;
+    const float* rows;
+  };
+  std::vector<ImageCopy> image_copies_;
   [[nodiscard]] std::array<std::int32_t, 3> PassRope(std::uint32_t p,
                                                      std::uint32_t pos0) const;
   // Per layer: latent rows [ring][kv_lora + n_rot] in binary16.

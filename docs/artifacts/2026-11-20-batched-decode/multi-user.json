@@ -1,0 +1,177 @@
+{
+ "setup": "gufo serve -c 32768 --sessions 4; N concurrent chat requests, 256 tokens each, different prompts and seeds; one fresh server per build and drafting mode; replies identical between builds",
+ "runs": [
+  {
+   "build": "E47",
+   "drafting": "DFly2",
+   "n": 1,
+   "aggregate_tps": 17.66,
+   "wall_s": 14.5,
+   "per_request_tps": [
+    17.66
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  },
+  {
+   "build": "E47",
+   "drafting": "DFly2",
+   "n": 2,
+   "aggregate_tps": 17.73,
+   "wall_s": 28.88,
+   "per_request_tps": [
+    9.36,
+    8.87
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  },
+  {
+   "build": "E47",
+   "drafting": "DFly2",
+   "n": 4,
+   "aggregate_tps": 17.61,
+   "wall_s": 58.15,
+   "per_request_tps": [
+    4.68,
+    4.41,
+    4.4,
+    4.47
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  },
+  {
+   "build": "E48",
+   "drafting": "DFly2",
+   "n": 1,
+   "aggregate_tps": 17.65,
+   "wall_s": 14.5,
+   "per_request_tps": [
+    17.65
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  },
+  {
+   "build": "E48",
+   "drafting": "DFly2",
+   "n": 2,
+   "aggregate_tps": 25.77,
+   "wall_s": 19.87,
+   "per_request_tps": [
+    13.9,
+    12.89
+   ],
+   "plans": [
+    "batched-w2/2"
+   ]
+  },
+  {
+   "build": "E48",
+   "drafting": "DFly2",
+   "n": 4,
+   "aggregate_tps": 35.07,
+   "wall_s": 29.2,
+   "per_request_tps": [
+    9.38,
+    8.77,
+    8.79,
+    8.92
+   ],
+   "plans": [
+    "batched-w4/4"
+   ]
+  },
+  {
+   "build": "E48",
+   "drafting": "none",
+   "n": 1,
+   "aggregate_tps": 16.34,
+   "wall_s": 15.67,
+   "per_request_tps": [
+    16.34
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  },
+  {
+   "build": "E48",
+   "drafting": "none",
+   "n": 2,
+   "aggregate_tps": 26.58,
+   "wall_s": 19.26,
+   "per_request_tps": [
+    13.33,
+    13.29
+   ],
+   "plans": [
+    "batched-w2/2"
+   ]
+  },
+  {
+   "build": "E48",
+   "drafting": "none",
+   "n": 4,
+   "aggregate_tps": 39.31,
+   "wall_s": 26.05,
+   "per_request_tps": [
+    9.88,
+    9.88,
+    9.83,
+    9.85
+   ],
+   "plans": [
+    "batched-w4/4"
+   ]
+  },
+  {
+   "build": "E47",
+   "drafting": "none",
+   "n": 1,
+   "aggregate_tps": 16.35,
+   "wall_s": 15.66,
+   "per_request_tps": [
+    16.35
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  },
+  {
+   "build": "E47",
+   "drafting": "none",
+   "n": 2,
+   "aggregate_tps": 16.5,
+   "wall_s": 31.02,
+   "per_request_tps": [
+    8.27,
+    8.25
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  },
+  {
+   "build": "E47",
+   "drafting": "none",
+   "n": 4,
+   "aggregate_tps": 16.51,
+   "wall_s": 62.03,
+   "per_request_tps": [
+    4.15,
+    4.16,
+    4.13,
+    4.13
+   ],
+   "plans": [
+    "serial-fallback/1"
+   ]
+  }
+ ]
+}

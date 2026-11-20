@@ -24,6 +24,8 @@ struct Model::Scratch {
   std::int32_t* rope = nullptr;
   std::int32_t* rope_hw = nullptr;
   bool rope_3d = false;
+  // The pass takes the batched (prompt) kernels.
+  bool batched = false;
   // Engram rows: pinned host staging and device copies.
   std::uint8_t* engram_host = nullptr;  // [modules][chunk][cols][d]
   float* engram_valid_host = nullptr;   // [modules][chunk][cols]

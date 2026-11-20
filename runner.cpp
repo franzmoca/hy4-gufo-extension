@@ -150,6 +150,9 @@ constexpr std::size_t kMaxInPassCheckpoints = 4;
 // arrival waits for one such pass (~2.3 s). With no session free, a prompt
 // takes Model::MaxChunk()-token passes.
 constexpr std::size_t kSharedPassTokens = 2048;
+// Sessions one decode pass serves. They share its Session::kTapRows rows: each
+// proposes at most its share, so a batch stays one pass.
+constexpr std::size_t kMaxBatchWidth = 8;
 // Layer groups a prompt pass may yield between, for other sessions' decode
 // rounds (about five layers each).
 constexpr std::size_t kMaxPrefillLayerGroups = 8;
@@ -299,8 +302,8 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = true,
-                .batched_multi_token_decode = false,
-                .batched_multi_token_decode_max_width = 0u,
+                .batched_multi_token_decode = true,
+                .batched_multi_token_decode_max_width = kMaxBatchWidth,
                 .prefix_reuse = true,
                 .in_pass_checkpoint = true,
                 .max_in_pass_checkpoints = kMaxInPassCheckpoints,
@@ -309,7 +312,7 @@ public:
         .scheduling = {.pass_tokens = std::min<std::size_t>(model_->MaxChunk(),
                                                             kSharedPassTokens),
                        .max_layer_groups = kMaxPrefillLayerGroups,
-                       .max_yield_decode_width = 1u},
+                       .max_yield_decode_width = kMaxBatchWidth},
     };
   }
 
@@ -337,7 +340,12 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    std::vector<TextExecutionPlan> plans{
+        {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    for (std::size_t width = 2; width <= kMaxBatchWidth; ++width)
+      plans.push_back(
+          {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
+    return plans;
   }
 
   [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary> BuildConstraintVocabulary() const override {
@@ -605,63 +613,206 @@ public:
   // one.
   [[nodiscard]] TextDecodeStep DecodeStep(TextRunnerState& state, std::size_t max_tokens,
                                           sampling::SamplerState& sampler) const override {
-    auto& hy4 = RequireState(state);
-    Session& session = hy4.session();
-    TextDecodeStep step;
-    if (max_tokens == 0)
-      return step;
-    if (hy4.position() >= max_context_) {
-      step.stop = true;
-      return step;
+    DecodePlan plan =
+        PrepareDecode(state, max_tokens, sampler, Session::kTapRows);
+    if (!plan.tokens.empty()) {
+      std::string error;
+      Session* session = &plan.hy4->session();
+      const std::span<const std::int32_t> tokens(plan.tokens);
+      if (!Session::DecodeBatch(std::span(&session, 1), std::span(&tokens, 1),
+                                &error))
+        throw std::runtime_error("Hy4 decode failed: " + error);
+      plan.t2 = std::chrono::steady_clock::now();
     }
-    sampling::SamplerState work = sampler;
-    TextDecodeSelection anchor = Select(hy4, work);
-    const std::size_t room = std::min<std::size_t>(
-        max_tokens - 1, max_context_ - hy4.position() - 1);
+    return FinishDecode(plan);
+  }
+
+  // Several sessions' steps: each samples and proposes as DecodeStep does,
+  // their passes share one pass of up to Session::kTapRows rows (packed in
+  // order), and each keeps what its own draws agree with. Every session gets
+  // the tokens it would get alone.
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    std::vector<TextDecodeStep> steps(decodes.size());
+    std::vector<std::optional<DecodePlan>> plans(decodes.size());
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      try {
+        plans[i] = PrepareDecode(
+            decodes[i].state.get(), decodes[i].max_tokens,
+            decodes[i].sampler.get(),
+            std::max<std::size_t>(1, Session::kTapRows / decodes.size()));
+      } catch (...) {
+        steps[i].failure = std::current_exception();
+      }
+    }
+    std::size_t next = 0;
+    while (next < decodes.size()) {
+      std::vector<std::size_t> group;
+      std::size_t rows = 0;
+      for (; next < decodes.size(); ++next) {
+        if (!plans[next] || plans[next]->tokens.empty())
+          continue;
+        const std::size_t n = plans[next]->tokens.size();
+        if (!group.empty() && rows + n > Session::kTapRows)
+          break;
+        group.push_back(next);
+        rows += n;
+      }
+      if (group.empty())
+        break;
+      std::vector<Session*> sessions;
+      std::vector<std::span<const std::int32_t>> tokens;
+      for (const std::size_t i : group) {
+        sessions.push_back(&plans[i]->hy4->session());
+        tokens.emplace_back(plans[i]->tokens);
+      }
+      std::string error;
+      const bool ok = Session::DecodeBatch(sessions, tokens, &error);
+      const auto t2 = std::chrono::steady_clock::now();
+      for (const std::size_t i : group) {
+        if (!ok) {
+          steps[i].failure = std::make_exception_ptr(
+              std::runtime_error("Hy4 decode failed: " + error));
+          plans[i].reset();
+          continue;
+        }
+        plans[i]->t2 = t2;
+        plans[i]->width = group.size();
+      }
+    }
+    for (std::size_t i = 0; i < decodes.size(); ++i) {
+      if (!plans[i])
+        continue;
+      try {
+        steps[i] = FinishDecode(*plans[i]);
+      } catch (...) {
+        steps[i] = {};
+        steps[i].failure = std::current_exception();
+      }
+    }
+    return steps;
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireState(state).position();
+  }
+
+private:
+  [[nodiscard]] static bool HasImages(const ChatRequest& request) {
+    return std::ranges::any_of(request.messages,
+                               [](const auto& m) { return !m.images.empty(); });
+  }
+  [[nodiscard]] std::shared_ptr<const ImagePrompt> PrepareImages(
+      const ChatRequest& request) const {
+    if (!vision_)
+      throw std::invalid_argument(
+          "image input requires the Hy4 Flash --mmproj BF16 sidecar");
+    return std::make_shared<const ImagePrompt>(PrepareImagePrompt(
+        *tokenizer_, request, vision_->Identity(), max_context_));
+  }
+
+  // A decode step between choosing its tokens and evaluating them: the
+  // sampled anchor and its proposals (tokens empty when no pass is needed).
+  struct DecodePlan {
+    Hy4TextRunnerState* hy4 = nullptr;
+    sampling::SamplerState* sampler = nullptr;
+    sampling::SamplerState work;
+    TextDecodeStep step;
+    std::vector<std::int32_t> tokens;
     std::vector<std::int32_t> proposals;
     lookup::PromptLookup<std::int32_t>::Match copy{};
-    if (!anchor.stop && room > 0) {
-      copy = Copy(hy4, static_cast<std::int32_t>(anchor.token), work, room,
-                  &proposals);
+    bool sampled = false;  // the anchor was drawn
+    bool plain = false;    // the anchor alone: a one-token step
+    std::size_t width = 1;
+    std::chrono::steady_clock::time_point t0, t1, t2;
+  };
+
+  // Sample the anchor from the frontier and propose tokens after it: a
+  // prompt-lookup copy of the session's own tokens when the context repeats
+  // them, else DFly2's drafts; without either the step is a plain one.
+  // At most `max_rows` tokens in all: a session sharing a pass with others
+  // proposes at most its share of the pass's rows.
+  DecodePlan PrepareDecode(TextRunnerState& state, std::size_t max_tokens,
+                           sampling::SamplerState& sampler,
+                           std::size_t max_rows) const {
+    DecodePlan plan{
+        .hy4 = &RequireState(state), .sampler = &sampler, .work = sampler};
+    auto& hy4 = *plan.hy4;
+    Session& session = hy4.session();
+    if (max_tokens == 0)
+      return plan;
+    if (hy4.position() >= max_context_) {
+      plan.step.stop = true;
+      return plan;
     }
-    const bool draft = !anchor.stop && proposals.empty() && drafter_ &&
+    sampling::SamplerState& work = plan.work;
+    TextDecodeSelection anchor = Select(hy4, work);
+    plan.sampled = true;
+    const std::size_t room = std::min<std::size_t>(
+        {max_tokens - 1, max_context_ - hy4.position() - 1, max_rows - 1});
+    if (!anchor.stop && room > 0) {
+      plan.copy = Copy(hy4, static_cast<std::int32_t>(anchor.token), work, room,
+                       &plan.proposals);
+    }
+    const bool draft = !anchor.stop && plan.proposals.empty() && drafter_ &&
                        session.TapsReady() && room > 0;
-    if (anchor.stop || (proposals.empty() && !draft)) {
-      sampler.CopyDrawStateFrom(work);
-      step.stop = anchor.stop;
+    if (anchor.stop || (plan.proposals.empty() && !draft)) {
+      plan.step.stop = anchor.stop;
       if (anchor.stop) {
-        step.terminal_logprobs = std::move(anchor.logprobs);
+        plan.step.terminal_logprobs = std::move(anchor.logprobs);
       } else {
         const TextRunnerToken token = anchor.token;
-        step.selections.push_back(std::move(anchor));
-        Advance(state, token);
+        plan.step.selections.push_back(std::move(anchor));
+        plan.tokens = {EngineTokens(std::span(&token, 1)).front()};
+        plan.plain = true;
       }
-      return step;
+      return plan;
     }
     const auto anchor_token = static_cast<std::int32_t>(anchor.token);
     work.Accept(anchor.token);
-    step.selections.push_back(std::move(anchor));
+    plan.step.selections.push_back(std::move(anchor));
 
     std::string error;
-    const auto t0 = std::chrono::steady_clock::now();
+    plan.t0 = std::chrono::steady_clock::now();
     if (draft) {
       const auto count = static_cast<std::uint32_t>(
           std::min<std::size_t>(draft_tokens_, room));
       if (!drafter_->Draft(session, anchor_token, count, min_accept_,
-                           &proposals, &error)) {
+                           &plan.proposals, &error)) {
         throw std::runtime_error("Hy4 draft failed: " + error);
       }
     }
-    const auto t1 = std::chrono::steady_clock::now();
-    std::vector<std::int32_t> tokens{anchor_token};
-    tokens.insert(tokens.end(), proposals.begin(), proposals.end());
-    if (tokens.size() == 1) {
-      if (!session.Step(tokens, &error))
-        throw std::runtime_error("Hy4 decode failed: " + error);
-    } else if (!session.Verify(tokens, &error)) {
-      throw std::runtime_error("Hy4 verify failed: " + error);
+    plan.t1 = std::chrono::steady_clock::now();
+    plan.tokens = {anchor_token};
+    plan.tokens.insert(plan.tokens.end(), plan.proposals.begin(),
+                       plan.proposals.end());
+    return plan;
+  }
+
+  // Keep the proposals the target's own draws agree with. A disagreeing
+  // draw is deferred to the next step, which samples it from the same
+  // logits, so sampling stays exact.
+  TextDecodeStep FinishDecode(DecodePlan& plan) const {
+    auto& hy4 = *plan.hy4;
+    Session& session = hy4.session();
+    TextDecodeStep& step = plan.step;
+    sampling::SamplerState& work = plan.work;
+    sampling::SamplerState& sampler = *plan.sampler;
+    if (plan.width > 1)
+      step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
+                             .physical_width = plan.width};
+    if (plan.tokens.empty()) {
+      if (plan.sampled)
+        sampler.CopyDrawStateFrom(work);
+      return std::move(step);
     }
-    const auto t2 = std::chrono::steady_clock::now();
+    if (plan.plain) {
+      sampler.CopyDrawStateFrom(work);
+      hy4.set_position(hy4.position() + 1);
+      return std::move(step);
+    }
+    const auto& proposals = plan.proposals;
     std::uint32_t kept = 1;
     for (std::uint32_t i = 0; i < proposals.size(); ++i) {
       const auto logits = session.PassLogits(i);
@@ -683,19 +834,19 @@ public:
                                  .piece = DecodeToken(token),
                                  .logprobs = std::move(logprobs)});
     }
-    if (tokens.size() > 1)
+    if (plan.tokens.size() > 1)
       session.Keep(kept);
     hy4.set_position(session.Position());
-    if (copy.length != 0)
-      hy4.lookup().Observe(copy.start, proposals.size(), kept - 1);
+    if (plan.copy.length != 0)
+      hy4.lookup().Observe(plan.copy.start, proposals.size(), kept - 1);
     if (profile_) {
       Profile& p = *profile_;
       p.rounds += 1;
-      (copy.length != 0 ? p.copy_rounds : p.draft_rounds) += 1;
-      (copy.length != 0 ? p.copied : p.drafted) += proposals.size();
-      (copy.length != 0 ? p.copy_accepted : p.accepted) += kept - 1;
-      p.draft_s += std::chrono::duration<double>(t1 - t0).count();
-      p.verify_s += std::chrono::duration<double>(t2 - t1).count();
+      (plan.copy.length != 0 ? p.copy_rounds : p.draft_rounds) += 1;
+      (plan.copy.length != 0 ? p.copied : p.drafted) += proposals.size();
+      (plan.copy.length != 0 ? p.copy_accepted : p.accepted) += kept - 1;
+      p.draft_s += std::chrono::duration<double>(plan.t1 - plan.t0).count();
+      p.verify_s += std::chrono::duration<double>(plan.t2 - plan.t1).count();
       if (p.rounds % 64 == 0) {
         const double draft_rounds = std::max<double>(1, p.draft_rounds);
         server::Logger::Info(
@@ -715,25 +866,7 @@ public:
     step.draft_rounds = 1;
     step.draft_tokens = proposals.size();
     step.draft_accepted_tokens = kept - 1;
-    return step;
-  }
-
-  [[nodiscard]] std::size_t CheckpointPosition(const TextRunnerState& state) const override {
-    return RequireState(state).position();
-  }
-
-private:
-  [[nodiscard]] static bool HasImages(const ChatRequest& request) {
-    return std::ranges::any_of(request.messages,
-                               [](const auto& m) { return !m.images.empty(); });
-  }
-  [[nodiscard]] std::shared_ptr<const ImagePrompt> PrepareImages(
-      const ChatRequest& request) const {
-    if (!vision_)
-      throw std::invalid_argument(
-          "image input requires the Hy4 Flash --mmproj BF16 sidecar");
-    return std::make_shared<const ImagePrompt>(PrepareImagePrompt(
-        *tokenizer_, request, vision_->Identity(), max_context_));
+    return std::move(step);
   }
 
   [[nodiscard]] std::string DecodeToken(std::int32_t token) const { return tokenizer_->Decode(token); }

@@ -613,8 +613,11 @@ point, and so their prompts, differ. See "Prefill batch invariance" below.
   Engram rows are cached. The Engram table bounds cold prompts by the
   drive's random reads (0.15 s per pass on the KIOXIA, 0.045 s on the 990
   PRO). Open: start a short arrival's prefill inside a long prompt's layer
-  yields (the host yields only decode rounds today), and batched decoding
-  across sessions.
+  yields (the host yields only decode rounds today).
+
+- **Batched decoding** (E48). Up to eight sessions share a decode pass of
+  16 rows. Open: more rows per pass (the decode kernels' 16-row limit) for
+  wider DFly2 batches, and batching the drafters' passes.
 
 ## Open questions
 
