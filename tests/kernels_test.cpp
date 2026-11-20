@@ -1238,6 +1238,31 @@ void TestF16Matmul() {
     (void)hipFree(dyh);
   }
 
+  {  // Gated: outputs times sigmoid(gate), stored as binary16.
+    const uint32_t m = 48, k = 256, n = 140, groups = 2;
+    const auto w = RandomQuant(HY4_TYPE_Q8_0, (std::size_t)m * groups, k);
+    const auto x = Random((std::size_t)n * groups * k);
+    const auto g = Random((std::size_t)n * groups * m, -4.0f, 4.0f);
+    auto want =
+        project(Dequant(HY4_TYPE_Q8_0, w), half_round(x), m, n, k, groups);
+    for (std::size_t i = 0; i < want.size(); ++i)
+      want[i] *= Sigmoid(g[i]);
+    auto* dw = Device(w);
+    auto* dx = Device(x);
+    auto* dg = Device(g);
+    auto* dy = Device(std::vector<uint16_t>(want.size()));
+    Expect(hy4_f16_dense_gated(HY4_TYPE_Q8_0, dw, dx, dy, m, n, k, groups,
+                               HY4_F16_OUT_HALF, dg, nullptr) == 0,
+           "f16_dense_gated status");
+    const auto bits = Host(dy, want.size());
+    std::vector<float> got(bits.size());
+    for (std::size_t i = 0; i < bits.size(); ++i)
+      got[i] = (float)HalfValue(bits[i]);
+    Near(got, want, 3e-3, "f16_dense_gated");
+    for (void* p : {(void*)dw, (void*)dx, (void*)dg, (void*)dy})
+      (void)hipFree(p);
+  }
+
   {  // Pair of different heights, both partial 256-row blocks.
     const uint32_t m1 = 32, m2 = 48, k = 256, n = 140;
     const auto w1 = RandomQuant(HY4_TYPE_Q4_K, m1, k),

@@ -26,6 +26,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E18 | Prompt passes on the batched kernels at any size | retained |
 | E19 | Prefill attention output in binary16 | retained |
 | E20 | FP32 GEMM for the router instead of hipBLAS | retained |
+| E21 | Attention gate applied in the value projection's stores, binary16 input to `wo` | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -396,3 +397,17 @@ gone. The sum order differs from hipBLAS's: KL 0.0842 ± 0.0081, same top
 91.9%, PPL 15.117 (E19: 0.0828 ± 0.0085); `--passcheck 8` and `--chunkcheck`
 at 517 and 999 exact. 3,712-token prefill 5.43 → 5.355 s (693 tok/s; both
 runs). Retained.
+
+## E21: Attention gate applied in the value projection's stores, binary16 input to `wo` (2026-11-20)
+
+The batched attention tail wrote `wv_b`'s output in FP32, multiplied it by
+sigmoid(gate) in a separate pass (`SigmoidMul`, 0.12 s), and `wo` read it
+back in FP32 to round it to binary16 as it staged it. The gate projection
+only reads the layer input, so it now runs before `wv_b`, whose stores
+(`hy4_f16_dense_gated`) multiply by sigmoid(gate) and store binary16, which
+`wo` reads as such: one pass less, and the 134 MB `attv` write and read per
+2,048-token pass of a 64-head layer halve. Bit-identical to E20 (KL 0.08424,
+PPL 15.1167 to the last digit: the FP32 gated value is rounded to binary16
+exactly as `wo`'s staging rounded it); `--passcheck 8` and `--chunkcheck` at
+517 and 999 exact. 3,712-token prefill 5.355 → 5.18, 5.14 s (about
+720 tok/s). Retained.

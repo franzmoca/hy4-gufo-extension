@@ -239,6 +239,12 @@ int hy4_sgemm_nt(const float* x, const float* w, float* y, uint32_t n,
 int hy4_f16_dense(int type, const void* w, const void* x, void* out, uint32_t m,
                   uint32_t n, uint32_t k, uint32_t groups, uint32_t io,
                   hipStream_t stream);
+/* hy4_f16_dense with each output multiplied by sigmoid(gate) before it is
+ * stored (and rounded, with HY4_F16_OUT_HALF); gate is FP32 in out's layout,
+ * [n][groups * m]. */
+int hy4_f16_dense_gated(int type, const void* w, const void* x, void* out,
+                        uint32_t m, uint32_t n, uint32_t k, uint32_t groups,
+                        uint32_t io, const float* gate, hipStream_t stream);
 /* out1 = W1 x and out2 = W2 x in one launch, the same results as two
  * hy4_f16_dense calls of one group: W1 [m1][k] and W2 [m2][k] of one type. */
 int hy4_f16_dense_pair(int type, const void* w1, void* out1, uint32_t m1,

@@ -678,16 +678,32 @@ bool Session::Attention(std::uint32_t il, std::uint32_t n, std::string* error) {
                               c.kv_lora, st));
   }
   if (batched) {
-    HY4_CHECK(hy4_f16_dense(l.wv_b.type, l.wv_b.data, att_half, s.attv,
-                            c.head_v, n, c.kv_lora, heads, HY4_F16_X_HALF, st));
+    // The gate first, so that wv_b's stores apply it and round the gated
+    // values to binary16 once, which wo then reads.
+    if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex,
+                error))
+      return false;
+    if (l.wo.type != HY4_TYPE_Q8_0 && l.wo.type != HY4_TYPE_Q4_K &&
+        l.wo.type != HY4_TYPE_Q6_K)
+      return Fail(error, "hy4: wo must be Q8_0, Q4_K or Q6_K");
+    auto* attv_half = reinterpret_cast<std::uint16_t*>(s.attv);
+    HY4_CHECK(hy4_f16_dense_gated(
+        l.wv_b.type, l.wv_b.data, att_half, attv_half, c.head_v, n, c.kv_lora,
+        heads, HY4_F16_X_HALF | HY4_F16_OUT_HALF, s.gate, st));
+    HY4_CHECK(hy4_f16_dense(l.wo.type, l.wo.data, attv_half, s.y, c.n_embd, n,
+                            heads * c.head_v, 1, HY4_F16_X_HALF, st));
   } else {
     HY4_CHECK(hy4_gemv_q8_0_grouped(l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
                                     std::uint64_t{heads} * c.kv_lora, c.kv_lora, std::uint64_t{heads} * c.head_v,
                                     c.head_v, st));
+    if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex,
+                error))
+      return false;
+    HY4_CHECK(hy4_sigmoid_mul(s.attv, s.gate,
+                              std::uint64_t{n} * heads * c.head_v, st));
+    if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, ex, error))
+      return false;
   }
-  if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex, error)) return false;
-  HY4_CHECK(hy4_sigmoid_mul(s.attv, s.gate, std::uint64_t{n} * heads * c.head_v, st));
-  if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, ex, error)) return false;
   HY4_CHECK(hy4_rms_norm(s.y, l.attn_post_norm.f32(), s.y, n, c.n_embd, c.n_embd, c.rms_eps, st));
   return true;
 }

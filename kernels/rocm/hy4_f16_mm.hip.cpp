@@ -384,14 +384,15 @@ constexpr int kTile = 128;
  * groups * k values of X, out rows groups * m of Y. Row blocks past the first
  * matrix's row blocks take a second [m2][k] matrix w2 of one group on the same
  * rows of x, into out2. Rows past m (m a multiple of 16) are computed from the
- * last row and not stored. */
+ * last row and not stored. With `gate` (FP32, the layout of out), each output
+ * is multiplied by sigmoid(gate) before it is stored. */
 template<typename F, bool kFull, typename X, typename Y>
 __global__ __launch_bounds__(kThreads) void dense_f16_kernel(
     const uint8_t* __restrict__ w, const X* __restrict__ x, Y* __restrict__ out,
     uint32_t m, uint32_t n, uint32_t k, uint32_t groups, uint32_t tile0,
     const uint8_t* __restrict__ w2, Y* __restrict__ out2, uint32_t m2,
     uint32_t row_blocks, uint32_t tiles, uint32_t chunk_rows,
-    uint32_t chunk_tiles) {
+    uint32_t chunk_tiles, const float* __restrict__ gate) {
   __shared__ __attribute__((aligned(16))) _Float16 act[2 * kTile * kPitch];
   const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32, h = lane / 16;
   const uint64_t row_bytes = (uint64_t)k / 256 * F::kBlockBytes;
@@ -463,8 +464,18 @@ __global__ __launch_bounds__(kThreads) void dense_f16_kernel(
           stage + s_token * kStagePitch + s_col);
       const float4 hi = *reinterpret_cast<const float4*>(
           stage + s_token * kStagePitch + s_col + 4);
-      Y* o = out + token * out_stride + (uint64_t)z * m + block * kRows + s_col;
-      const float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+      const uint64_t at =
+          token * out_stride + (uint64_t)z * m + block * kRows + s_col;
+      Y* o = out + at;
+      float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+      if (gate) {
+        const float4 g0 = *reinterpret_cast<const float4*>(gate + at);
+        const float4 g1 = *reinterpret_cast<const float4*>(gate + at + 4);
+        const float g[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          v[i] *= 1.0f / (1.0f + __builtin_expf(-g[i]));
+      }
       if constexpr (sizeof(Y) == 4) {
         *reinterpret_cast<float4*>(o) =
             float4{finite_or_zero(v[0]), finite_or_zero(v[1]),
@@ -491,6 +502,7 @@ struct DenseArgs {
   const uint8_t* w2;
   void* out2;
   uint32_t m2;
+  const float* gate = nullptr;
 };
 
 struct DenseChunks {
@@ -535,13 +547,13 @@ int dense_launch(const DenseArgs& a, hipStream_t stream) {
     dense_f16_kernel<F, true, X, Y>
         <<<dim3(blocks * full * a.groups), kThreads, 0, stream>>>(
             a.w, xt, yt, a.m, a.n, a.k, a.groups, 0, a.w2, y2, a.m2, blocks,
-            full, std::min(c.rows, blocks), std::min(c.tiles, full));
+            full, std::min(c.rows, blocks), std::min(c.tiles, full), a.gate);
   }
   if (a.n % kTile)
     dense_f16_kernel<F, false, X, Y>
         <<<dim3(blocks * a.groups), kThreads, 0, stream>>>(
             a.w, xt, yt, a.m, a.n, a.k, a.groups, full, a.w2, y2, a.m2, blocks,
-            1, blocks, 1);
+            1, blocks, 1, a.gate);
   return hipGetLastError() == hipSuccess ? 0 : 1;
 }
 
@@ -724,6 +736,17 @@ int hy4_f16_dense(int type, const void* w, const void* x, void* out, uint32_t m,
   return dense_run(type,
                    {static_cast<const uint8_t*>(w), x, out, m, n, k, groups,
                     nullptr, nullptr, 0},
+                   io, stream);
+}
+
+int hy4_f16_dense_gated(int type, const void* w, const void* x, void* out,
+                        uint32_t m, uint32_t n, uint32_t k, uint32_t groups,
+                        uint32_t io, const float* gate, hipStream_t stream) {
+  if (m % 16 != 0)
+    return 1;
+  return dense_run(type,
+                   {static_cast<const uint8_t*>(w), x, out, m, n, k, groups,
+                    nullptr, nullptr, 0, gate},
                    io, stream);
 }
 
