@@ -22,7 +22,7 @@
     "fingerprintId": "d95cf8ed0540f18010f09b38f08ee3ed292c9d17a7100ce4d0273dd287de1c7f",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-11-20",
+  "measuredOn": "2026-11-21",
   "mode": null,
   "model": {
     "id": "Hy4-Flash",
@@ -30,102 +30,103 @@
   },
   "notes": [
     "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
-    "synthetic text: 1.154 tokens/word, template overhead 24 tokens"
+    "synthetic text: 1.154 tokens/word, template overhead 24 tokens",
+    "rows not measured on 2026-11-21 retain values from 2026-11-20"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "0": {
-      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "command": "gufo serve --port 42447 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
       "counts": [
         {
           "cache_n": 0,
-          "completion_sha256": "1b3ed0427b45bd47a122102a136e3da3ad86f84e5d6048d02eeba5ee0f726f31",
+          "completion_sha256": "e25c7e9f08ebccc669c2f2aa2652819ac69abc4a8e374726cce91aa4d067d445",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2044
         }
       ],
-      "pp": 869.99,
+      "pp": 872.2,
       "pp_sd": null,
       "samples": 1,
-      "tg": 16.36,
+      "tg": 18.83,
       "tg_sd": null,
       "workload": "prose"
     },
     "16384": {
-      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "command": "gufo serve --port 42447 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
       "counts": [
         {
           "cache_n": 16311,
-          "completion_sha256": "40587d0f2eb53d718117d2f0e76d52be0880372cafec7ce80c4536fe6c46f1e7",
+          "completion_sha256": "2d271ae17e536ceb1b5f2dba214874ed7e63ac808522dfd0bfd22230553ab712",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2044
         }
       ],
-      "pp": 795.81,
+      "pp": 796.51,
       "pp_sd": null,
       "samples": 1,
-      "tg": 16.28,
+      "tg": 18.75,
       "tg_sd": null,
       "workload": "prose"
     },
     "32768": {
-      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "command": "gufo serve --port 42447 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
       "counts": [
         {
           "cache_n": 32752,
-          "completion_sha256": "68af090df713d6d3e013f001437b8a63c43dbdb6b7b1a3a1e480ea62c03b343f",
+          "completion_sha256": "b0018a367c962d1c75e45616d2016bf7751eee0b3f4d959ea5495be636c6adfe",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2016
         }
       ],
-      "pp": 758.38,
+      "pp": 761.97,
       "pp_sd": null,
       "samples": 1,
-      "tg": 16.18,
+      "tg": 18.6,
       "tg_sd": null,
       "workload": "prose"
     },
     "4096": {
-      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "command": "gufo serve --port 42447 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
       "counts": [
         {
           "cache_n": 4097,
-          "completion_sha256": "61d4cabed6fb565df38b123b726f2ef2b920bcc38dd5e4be5237e20967b32440",
+          "completion_sha256": "e51c652a2340d027455bed4fd3121c7ee12935c8cb55ca6f83eede3ed0b2b484",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2043
         }
       ],
-      "pp": 825.61,
+      "pp": 825.72,
       "pp_sd": null,
       "samples": 1,
-      "tg": 16.38,
+      "tg": 18.86,
       "tg_sd": null,
       "workload": "prose"
     },
     "8192": {
-      "command": "gufo serve --port 46755 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
+      "command": "gufo serve --port 42447 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off",
       "counts": [
         {
           "cache_n": 8190,
-          "completion_sha256": "21a452c5f2054fa40e4c156cba0d368b3a95b6cd9054bfb3b6045b71dd54de91",
+          "completion_sha256": "58aa6f5c0d077b5bfbd90926c491a5f3df190fa7e58496b373515aa7bdee1488",
           "draft_n": 0,
           "draft_n_accepted": 0,
           "predicted_n": 128,
           "prompt_n": 2023
         }
       ],
-      "pp": 817.72,
+      "pp": 816.56,
       "pp_sd": null,
       "samples": 1,
-      "tg": 16.34,
+      "tg": 18.81,
       "tg_sd": null,
       "workload": "prose"
     }
@@ -136,7 +137,7 @@
       "gufo",
       "serve",
       "--port",
-      "46755",
+      "42447",
       "--sessions",
       "1",
       "llm",

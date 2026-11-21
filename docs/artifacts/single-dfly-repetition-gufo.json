@@ -22,7 +22,7 @@
     "fingerprintId": "d95cf8ed0540f18010f09b38f08ee3ed292c9d17a7100ce4d0273dd287de1c7f",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-11-20",
+  "measuredOn": "2026-11-21",
   "mode": "dfly",
   "model": {
     "id": "Hy4-Flash",
@@ -30,8 +30,7 @@
   },
   "notes": [
     "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task is recorded per row; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
-    "synthetic text: 1.154 tokens/word, template overhead 24 tokens",
-    "not measured, d4096: depth 4096: server generated 120 of 128 tokens (cache_n 4137, prompt_n 2032); either the model stopped at EOS despite the continuation request, or prefix + prompt + output exceed the table's `context`"
+    "synthetic text: 1.154 tokens/word, template overhead 24 tokens"
   ],
   "referenceName": "llama.cpp",
   "rows": {
@@ -40,7 +39,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 11.8,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "command": "gufo serve --port 33629 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
       "counts": [
         {
           "cache_n": 0,
@@ -48,84 +47,107 @@
           "draft_n": 119,
           "draft_n_accepted": 118,
           "predicted_n": 128,
-          "prompt_n": 2042
+          "prompt_n": 2046
         }
       ],
-      "pp": 863.82,
+      "pp": 865.69,
       "pp_sd": null,
       "samples": 1,
-      "tg": 63.69,
+      "tg": 67.86,
       "tg_sd": null,
-      "workload": "repetition"
+      "workload": "copy"
     },
     "16384": {
-      "acceptance": 92.86,
+      "acceptance": 100.0,
       "acceptance_sd": null,
-      "accepted_per_step": 10.64,
+      "accepted_per_step": 11.8,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "command": "gufo serve --port 33629 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
       "counts": [
         {
-          "cache_n": 16316,
-          "completion_sha256": "7d5e75fceaed189980845ce3e183392509dc367635e60893db445c691828beaa",
-          "draft_n": 126,
-          "draft_n_accepted": 117,
+          "cache_n": 16308,
+          "completion_sha256": "feabbf7a97b0f534ff3ea683bfe7f0eaf7bca76e05d20289c9381767883b6c0b",
+          "draft_n": 118,
+          "draft_n_accepted": 118,
           "predicted_n": 128,
-          "prompt_n": 2041
+          "prompt_n": 2045
         }
       ],
-      "pp": 795.56,
+      "pp": 797.2,
       "pp_sd": null,
       "samples": 1,
-      "tg": 58.57,
+      "tg": 68.08,
       "tg_sd": null,
-      "workload": "repetition"
+      "workload": "copy"
     },
     "32768": {
-      "acceptance": 95.12,
+      "acceptance": 99.16,
+      "acceptance_sd": null,
+      "accepted_per_step": 11.8,
+      "accepted_per_step_sd": null,
+      "command": "gufo serve --port 33629 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "counts": [
+        {
+          "cache_n": 32748,
+          "completion_sha256": "40cc3ed51554cddc4e959bb485208b3f9fde8beaed496981e2a32fefc1181af0",
+          "draft_n": 119,
+          "draft_n_accepted": 118,
+          "predicted_n": 128,
+          "prompt_n": 2016
+        }
+      ],
+      "pp": 740.79,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 65.33,
+      "tg_sd": null,
+      "workload": "copy"
+    },
+    "4096": {
+      "acceptance": 92.13,
       "acceptance_sd": null,
       "accepted_per_step": 10.64,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "command": "gufo serve --port 33629 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
       "counts": [
         {
-          "cache_n": 32771,
-          "completion_sha256": "3ac633e8e1eff93f0c460ded1a100586f7466119fa0d30f63f77906a04ed0d4a",
-          "draft_n": 123,
+          "cache_n": 4096,
+          "completion_sha256": "695fd29c51c76e7f58c168b20f435674c3d4824f2760315d02130b764e5dd5d9",
+          "draft_n": 127,
           "draft_n_accepted": 117,
           "predicted_n": 128,
           "prompt_n": 2044
         }
       ],
-      "pp": 741.0,
+      "pp": 823.58,
       "pp_sd": null,
       "samples": 1,
-      "tg": 57.78,
+      "tg": 61.59,
       "tg_sd": null,
-      "workload": "repetition"
+      "workload": "copy"
     },
     "8192": {
-      "acceptance": 92.06,
+      "acceptance": 98.33,
       "acceptance_sd": null,
-      "accepted_per_step": 9.67,
+      "accepted_per_step": 11.8,
       "accepted_per_step_sd": null,
-      "command": "gufo serve --port 52613 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "command": "gufo serve --port 33629 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 40960 --served-model-name bench --think off --dfly-model tencent-dfly2",
       "counts": [
         {
-          "cache_n": 8194,
+          "cache_n": 8190,
           "completion_sha256": "d41deb81970acd64ba9ad9f5e72a070a0c979e8f4a94cca94acae44c9f5e61f9",
-          "draft_n": 126,
-          "draft_n_accepted": 116,
+          "draft_n": 120,
+          "draft_n_accepted": 118,
           "predicted_n": 128,
-          "prompt_n": 2020
+          "prompt_n": 2023
         }
       ],
-      "pp": 814.6,
+      "pp": 813.28,
       "pp_sd": null,
       "samples": 1,
-      "tg": 57.51,
+      "tg": 67.46,
       "tg_sd": null,
-      "workload": "repetition"
+      "workload": "copy"
     }
   },
   "schemaVersion": 1,
@@ -134,7 +156,7 @@
       "gufo",
       "serve",
       "--port",
-      "52613",
+      "33629",
       "--sessions",
       "1",
       "llm",

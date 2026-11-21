@@ -82,7 +82,7 @@
     },
     "single-dfly-repetition": {
      "label": "repetitive",
-     "workload": "repetition"
+     "workload": "copy"
     }
    }
   },
