@@ -87,6 +87,7 @@ if(TARGET gufo_hy4flash_hip)
   gufo_extension_hip_sources(gufo_hy4flash_hip
     SOURCES
       kernels/rocm/hy4_f16_mm.hip.cpp
+      kernels/rocm/hy4_gemv.hip.cpp
       kernels/rocm/hy4_kernels.hip.cpp
       kernels/rocm/hy4_vision.hip.cpp
   )

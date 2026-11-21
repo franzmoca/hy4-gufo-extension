@@ -546,7 +546,7 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
   const Weights& tw = target_.weights();
   Buffers& b = *buf_;
   hipStream_t st = target_.stream();
-  const Exec ex{st, target_.blas_};
+  const Exec ex{st, target_.blas_, false, target_.gemv_scratch_};
   auto* blas = static_cast<hipblasHandle_t>(target_.blas_);
   // Session s's block is rows s * kBlock .. s * kBlock + kBlock - 1.
   const std::uint32_t n = ns * kBlock;

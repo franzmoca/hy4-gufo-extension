@@ -216,6 +216,7 @@ private:
   std::uint32_t max_chunk_ = 4096;
   hipStream_t stream_ = nullptr;
   void* blas_ = nullptr;  // hipblasHandle_t
+  void* gemv_scratch_ = nullptr;                 // hy4_gemv's, for stream_
   std::unique_ptr<EngramReader> engram_reader_;  // FP8 rows, direct reads
   std::int32_t image_token_ = -1;
 

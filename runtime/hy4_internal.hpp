@@ -83,6 +83,7 @@ struct Exec {
   hipStream_t stream;
   void* blas_handle;
   bool prompt = false;  // a prompt pass: GEMMs at any token count
+  void* gemv_scratch = nullptr;  // the stream's hy4_gemv scratch
 };
 
 /// y[t] = W x[t] for any weight type the model uses (n tokens, W [m][k]):
