@@ -21,6 +21,7 @@ enum {
   HY4_TYPE_Q8_0 = 8,
   HY4_TYPE_Q4_K = 12,
   HY4_TYPE_Q6_K = 14,
+  HY4_TYPE_BF16 = 30,
   HY4_TYPE_F8_E4M3 = 43,
 };
 
@@ -69,7 +70,10 @@ int hy4_hc_post_pre(const float* y, const float* post_prev, float* h,
 /* h[t, i] = x[t] for every stream i. */
 int hy4_hc_init(const float* x, float* h, uint32_t n, uint32_t hc, uint32_t dim, hipStream_t stream);
 
-/* y[t, r] = W[r] . x[t] for F32 or F16 W [m][k] (row-major), n tokens. */
+/* y[t, r] = W[r] . x[t] for F32, F16 or BF16 W [m][k] (row-major), n
+ * tokens. BF16 splits each row's k over four waves (k a multiple of 32), each
+ * summing its quarter in order before the quarters add in order: a token's
+ * result does not depend on n. */
 int hy4_gemv_float(int type, const void* w, const float* x, float* y, uint32_t m, uint32_t k,
                    uint32_t n, hipStream_t stream);
 
@@ -262,6 +266,15 @@ int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst,
  * multiple of 32. */
 int hy4_sgemm_nt(const float* x, const float* w, float* y, uint32_t n,
                  uint32_t m, uint32_t k, hipStream_t stream);
+/* hy4_sgemm_nt for BF16 w: each weight widens exactly to FP32, so the result
+ * equals hy4_sgemm_nt on the widened weights. */
+int hy4_sgemm_nt_bf16(const float* x, const uint16_t* w, float* y, uint32_t n,
+                      uint32_t m, uint32_t k, hipStream_t stream);
+/* dst [count] = src as BF16 bits, rounded to nearest even. *inexact (device)
+ * is set to 1 when some value is not exactly a BF16 value; the caller zeroes
+ * it first. dst must not overlap src. */
+int hy4_f32_to_bf16(const float* src, uint64_t count, uint16_t* dst,
+                    int32_t* inexact, hipStream_t stream);
 
 /* Batched Q8_0, Q4_K and Q6_K projections on the FP16 matrix cores
  * (hy4_f16_mm.hip.cpp). For each group z < groups, out[t, z m + r] =

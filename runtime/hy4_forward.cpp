@@ -96,6 +96,13 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m,
     case HY4_TYPE_F16:
       HY4_CHECK(hy4_gemv_float(w.type, w.data, x, y, m, k, n, stream));
       return true;
+    case HY4_TYPE_BF16:
+      if (batched)
+        HY4_CHECK(hy4_sgemm_nt_bf16(
+            x, static_cast<const std::uint16_t*>(w.data), y, n, m, k, stream));
+      else
+        HY4_CHECK(hy4_gemv_float(w.type, w.data, x, y, m, k, n, stream));
+      return true;
     case HY4_TYPE_Q8_0:
     case HY4_TYPE_Q4_K:
     case HY4_TYPE_Q6_K:
@@ -351,6 +358,63 @@ bool Model::AllocScratch(std::string* error) {
   }
   if (hipStreamSynchronize(stream_) != hipSuccess)
     return Fail(error, "hy4: wk_b split failed");
+  return RouterToBf16(error);
+}
+
+// The router is stored as F32 whose values are BF16 (the checkpoint's): kept
+// as BF16 it is the same matrix at half the bytes per token. A router with
+// values BF16 cannot hold stays F32.
+bool Model::RouterToBf16(std::string* error) {
+  std::uint16_t* tmp = nullptr;
+  std::int32_t* inexact = nullptr;
+  std::uint64_t tmp_count = 0;
+  struct Free {
+    std::uint16_t*& tmp;
+    std::int32_t*& inexact;
+    ~Free() {
+      if (tmp)
+        (void)hipFree(tmp);
+      if (inexact)
+        (void)hipFree(inexact);
+    }
+  } free_all{tmp, inexact};
+  if (hipMalloc(&inexact, sizeof(std::int32_t)) != hipSuccess)
+    return Fail(error, "hy4: router conversion failed");
+  std::uint32_t converted = 0;
+  for (Layer& l : weights_.layers) {
+    Tensor& w = l.gate_inp;
+    if (!w || w.type != HY4_TYPE_F32)
+      continue;
+    const std::uint64_t count = w.dims[0] * w.dims[1];
+    if (count > tmp_count) {
+      if (tmp)
+        (void)hipFree(tmp);
+      tmp = nullptr;
+      if (hipMalloc(&tmp, count * sizeof(std::uint16_t)) != hipSuccess)
+        return Fail(error, "hy4: router conversion failed");
+      tmp_count = count;
+    }
+    std::int32_t flag = 0;
+    if (hipMemsetAsync(inexact, 0, sizeof(flag), stream_) != hipSuccess ||
+        hy4_f32_to_bf16(w.f32(), count, tmp, inexact, stream_) != 0 ||
+        hipMemcpyAsync(&flag, inexact, sizeof(flag), hipMemcpyDeviceToHost,
+                       stream_) != hipSuccess ||
+        hipStreamSynchronize(stream_) != hipSuccess)
+      return Fail(error, "hy4: router conversion failed");
+    if (flag)
+      continue;
+    // The BF16 rows take the first half of the tensor's own allocation.
+    if (hipMemcpyAsync(const_cast<void*>(w.data), tmp,
+                       count * sizeof(std::uint16_t), hipMemcpyDeviceToDevice,
+                       stream_) != hipSuccess)
+      return Fail(error, "hy4: router conversion failed");
+    w.type = HY4_TYPE_BF16;
+    ++converted;
+  }
+  if (hipStreamSynchronize(stream_) != hipSuccess)
+    return Fail(error, "hy4: router conversion failed");
+  if (converted)
+    std::fprintf(stderr, "hy4: %u routers kept as BF16\n", converted);
   return true;
 }
 

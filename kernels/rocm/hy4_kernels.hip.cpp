@@ -349,6 +349,72 @@ __global__ void GemvFloat(const W* w, const float* x, float* y, uint32_t m,
     }
 }
 
+// BF16 rows (the router), one row per block of kBf16Split waves: wave j sums
+// the j-th of kBf16Split equal slices of k in order, 8 values per lane, then
+// the slices add in order. Each token sums the same way at any n. A single
+// wave per row left the router's 512 rows to 64 blocks on 40 CUs and read at
+// about 130 GB/s; four waves per row reach about 180.
+constexpr uint32_t kBf16Split = 4;
+__device__ __forceinline__ void Load8Bf16(const uint16_t* w, float* out) {
+  const uint4 raw = *(const uint4*)w;
+  const uint32_t* u = (const uint32_t*)&raw;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    out[2 * i] = __uint_as_float(u[i] << 16);
+    out[2 * i + 1] = __uint_as_float(u[i] & 0xffff0000u);
+  }
+}
+__global__ void GemvBf16Split(const uint16_t* w, const float* x, float* y,
+                              uint32_t m, uint32_t k, uint32_t n) {
+  __shared__ float part[kBf16Split][kMaxTok];
+  const uint32_t lane = threadIdx.x % warpSize;
+  const uint32_t wave = threadIdx.x / warpSize;
+  const uint32_t r = blockIdx.x;
+  const uint32_t len = k / kBf16Split, i0 = wave * len;
+  const uint16_t* wr = w + (uint64_t)r * k;
+  float acc[kMaxTok] = {};
+  for (uint32_t i = i0 + lane * 8; i < i0 + len; i += warpSize * 8) {
+    float wv[8];
+    Load8Bf16(wr + i, wv);
+#pragma unroll
+    for (uint32_t t = 0; t < kMaxTok; ++t) {
+      if (t >= n)
+        break;
+      const float4 xa = *(const float4*)(x + (uint64_t)t * k + i);
+      const float4 xb = *(const float4*)(x + (uint64_t)t * k + i + 4);
+      acc[t] += wv[0] * xa.x + wv[1] * xa.y + wv[2] * xa.z + wv[3] * xa.w +
+                wv[4] * xb.x + wv[5] * xb.y + wv[6] * xb.z + wv[7] * xb.w;
+    }
+  }
+#pragma unroll
+  for (uint32_t t = 0; t < kMaxTok; ++t) {
+    if (t >= n)
+      break;
+    const float v = WarpSum(acc[t]);
+    if (lane == 0)
+      part[wave][t] = v;
+  }
+  __syncthreads();
+  if (threadIdx.x < n) {
+    float v = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < kBf16Split; ++j)
+      v += part[j][threadIdx.x];
+    y[(uint64_t)threadIdx.x * m + r] = v;
+  }
+}
+
+__global__ void F32ToBf16(const float* src, uint64_t count, uint16_t* dst,
+                          int32_t* inexact) {
+  for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+       i += (uint64_t)gridDim.x * blockDim.x) {
+    const uint32_t bits = __float_as_uint(src[i]);
+    if (bits & 0xffffu)
+      *inexact = 1;
+    dst[i] = (uint16_t)((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+  }
+}
+
 // R rows per warp of group blockIdx.y: each lane reads 4 quants (two 16-bit
 // loads, the quants sit at an even offset) so 8 lanes cover a Q8_0 block.
 // Each row sums as with R = 1; R > 1 shares the activation loads.
@@ -1197,8 +1263,18 @@ __global__ void DequantQ8_0(const BlockQ8_0* src, uint64_t blocks, float* out) {
 // in order in one accumulator, so a token's result does not depend on the
 // pass or the other tokens. k must be a multiple of 32.
 constexpr uint32_t kSgTok = 64, kSgRows = 128, kSgK = 32;
+__device__ __forceinline__ float4 Load4(const float* w) {
+  return *reinterpret_cast<const float4*>(w);
+}
+__device__ __forceinline__ float4 Load4(const uint16_t* w) {
+  const uint2 raw = *reinterpret_cast<const uint2*>(w);
+  return make_float4(
+      __uint_as_float(raw.x << 16), __uint_as_float(raw.x & 0xffff0000u),
+      __uint_as_float(raw.y << 16), __uint_as_float(raw.y & 0xffff0000u));
+}
+template<typename W>
 __global__ void __launch_bounds__(256)
-    SgemmNt(const float* __restrict__ x, const float* __restrict__ w,
+    SgemmNt(const float* __restrict__ x, const W* __restrict__ w,
             float* __restrict__ y, uint32_t n, uint32_t m, uint32_t k) {
   __shared__ __align__(16) float xs[kSgK][kSgTok + 4];
   __shared__ __align__(16) float ws[kSgK][kSgRows + 4];
@@ -1221,8 +1297,7 @@ __global__ void __launch_bounds__(256)
 #pragma unroll
     for (uint32_t i = 0; i < 4; ++i) {
       const uint32_t r = r0 + lrow + 32 * i;
-      wv[i] = r < m ? *reinterpret_cast<const float4*>(w + (uint64_t)r * k +
-                                                       c0 + lcol)
+      wv[i] = r < m ? Load4(w + (uint64_t)r * k + c0 + lcol)
                     : make_float4(0.f, 0.f, 0.f, 0.f);
     }
   };
@@ -1897,8 +1972,19 @@ int hy4_hc_init(const float* x, float* h, uint32_t n, uint32_t hc, uint32_t dim,
 int hy4_gemv_float(int type, const void* w, const float* x, float* y, uint32_t m, uint32_t k, uint32_t n,
                    hipStream_t stream) {
   if (k % 8) return 1;
-  if (type != HY4_TYPE_F32 && type != HY4_TYPE_F16)
+  if (type != HY4_TYPE_F32 && type != HY4_TYPE_F16 && type != HY4_TYPE_BF16)
     return 1;
+  if (type == HY4_TYPE_BF16) {
+    if (k % (kBf16Split * 8))
+      return 1;
+    for (uint32_t t0 = 0; t0 < n; t0 += kMaxTok) {
+      const uint32_t nt = n - t0 < kMaxTok ? n - t0 : kMaxTok;
+      GemvBf16Split<<<m, kBf16Split * 32, 0, stream>>>(
+          (const uint16_t*)w, x + (uint64_t)t0 * k, y + (uint64_t)t0 * m, m, k,
+          nt);
+    }
+    return Status();
+  }
   for (uint32_t t0 = 0; t0 < n; t0 += kMaxTok) {
     const uint32_t nt = n - t0 < kMaxTok ? n - t0 : kMaxTok;
     const float* xt = x + (uint64_t)t0 * k;
@@ -2216,8 +2302,30 @@ int hy4_sgemm_nt(const float* x, const float* w, float* y, uint32_t n,
     return 0;
   if (k % kSgK != 0)
     return 1;
-  SgemmNt<<<dim3((m + kSgRows - 1) / kSgRows, (n + kSgTok - 1) / kSgTok), 256,
-            0, stream>>>(x, w, y, n, m, k);
+  SgemmNt<float><<<dim3((m + kSgRows - 1) / kSgRows, (n + kSgTok - 1) / kSgTok),
+                   256, 0, stream>>>(x, w, y, n, m, k);
+  return Status();
+}
+
+int hy4_sgemm_nt_bf16(const float* x, const uint16_t* w, float* y, uint32_t n,
+                      uint32_t m, uint32_t k, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (k % kSgK != 0)
+    return 1;
+  SgemmNt<uint16_t>
+      <<<dim3((m + kSgRows - 1) / kSgRows, (n + kSgTok - 1) / kSgTok), 256, 0,
+         stream>>>(x, w, y, n, m, k);
+  return Status();
+}
+
+int hy4_f32_to_bf16(const float* src, uint64_t count, uint16_t* dst,
+                    int32_t* inexact, hipStream_t stream) {
+  if (count == 0)
+    return 0;
+  const uint64_t blocks = (count + kBlock - 1) / kBlock;
+  F32ToBf16<<<(uint32_t)(blocks < 4096 ? blocks : 4096), kBlock, 0, stream>>>(
+      src, count, dst, inexact);
   return Status();
 }
 

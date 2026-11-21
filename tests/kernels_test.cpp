@@ -1409,6 +1409,85 @@ void TestSgemm() {
          "sgemm_nt rejects k % 32");
 }
 
+// BF16 weights (the router): the conversion's exactness flag and rounding,
+// the split GEMV against double precision and its one-token calls, and the
+// batched GEMM against the F32 GEMM on the widened weights.
+void TestBf16() {
+  const auto bf16 = [](float v) {
+    uint32_t u;
+    std::memcpy(&u, &v, 4);
+    return static_cast<uint16_t>(u >> 16);
+  };
+  const auto widen = [](uint16_t b) {
+    const uint32_t u = static_cast<uint32_t>(b) << 16;
+    float v;
+    std::memcpy(&v, &u, 4);
+    return v;
+  };
+  const uint32_t m = 37, k = 256;
+  auto w = Random(m * k);
+  std::vector<uint16_t> wb(m * k);
+  for (std::size_t i = 0; i < w.size(); ++i) {
+    wb[i] = bf16(w[i]);
+    w[i] = widen(wb[i]);
+  }
+  int32_t* flag = Device(std::vector<int32_t>(1, 0));
+  uint16_t* conv = Device(std::vector<uint16_t>(m * k));
+  Expect(hy4_f32_to_bf16(Device(w), m * k, conv, flag, nullptr) == 0,
+         "f32_to_bf16 status");
+  Expect(Host(flag, 1)[0] == 0, "f32_to_bf16 exact values");
+  Expect(Host(conv, m * k) == wb, "f32_to_bf16 exact bits");
+  // 1 + 2^-8 + 2^-9 rounds up to 1 + 2^-7; 1 + 2^-8 ties to even (1).
+  const std::vector<float> odd = {1.0f + 0x1p-8f + 0x1p-9f, 1.0f + 0x1p-8f};
+  uint16_t* oc = Device(std::vector<uint16_t>(2));
+  Expect(hy4_f32_to_bf16(Device(odd), 2, oc, flag, nullptr) == 0,
+         "f32_to_bf16 inexact status");
+  Expect(Host(flag, 1)[0] == 1, "f32_to_bf16 flags inexact values");
+  const auto ob = Host(oc, 2);
+  Expect(ob[0] == bf16(1.0f + 0x1p-7f) && ob[1] == bf16(1.0f),
+         "f32_to_bf16 rounds to nearest even");
+
+  const uint16_t* dwb = Device(wb);
+  for (uint32_t n : {1u, 3u, 11u}) {
+    const auto x = Random(n * k);
+    float* dx = Device(x);
+    float* y = Device(std::vector<float>(n * m));
+    Expect(hy4_gemv_float(HY4_TYPE_BF16, dwb, dx, y, m, k, n, nullptr) == 0,
+           "gemv_float bf16 status");
+    std::vector<double> want(n * m, 0.0);
+    for (uint32_t t = 0; t < n; ++t)
+      for (uint32_t r = 0; r < m; ++r)
+        for (uint32_t i = 0; i < k; ++i)
+          want[t * m + r] += (double)w[r * k + i] * x[t * k + i];
+    const auto many = Host(y, n * m);
+    Near(many, want, 1e-5, "gemv_float bf16 n=" + std::to_string(n));
+    bool same = true;
+    for (uint32_t t = 0; t < n; ++t) {
+      float* y1 = Device(std::vector<float>(m));
+      Expect(hy4_gemv_float(HY4_TYPE_BF16, dwb, dx + t * k, y1, m, k, 1,
+                            nullptr) == 0,
+             "gemv_float bf16 one-token status");
+      same &= std::memcmp(Host(y1, m).data(), many.data() + t * m, m * 4) == 0;
+    }
+    Expect(same, "gemv_float bf16 tokens equal one-token calls n=" +
+                     std::to_string(n));
+  }
+  Expect(hy4_gemv_float(HY4_TYPE_BF16, dwb, nullptr, nullptr, m, 72, 1,
+                        nullptr) != 0,
+         "gemv_float bf16 rejects k % 32");
+
+  const uint32_t n = 70;
+  const auto x = Random(n * k);
+  float* dx = Device(x);
+  float* a = Device(std::vector<float>(n * m));
+  float* b = Device(std::vector<float>(n * m));
+  Expect(hy4_sgemm_nt(dx, Device(w), a, n, m, k, nullptr) == 0 &&
+             hy4_sgemm_nt_bf16(dx, dwb, b, n, m, k, nullptr) == 0,
+         "sgemm_nt_bf16 status");
+  Expect(Host(a, n * m) == Host(b, n * m),
+         "sgemm_nt_bf16 equals sgemm_nt on the widened weights");
+}
+
 void TestF16Matmul() {
   const auto half_round = [](const std::vector<float>& x) {
     std::vector<double> r(x.size());
@@ -1706,6 +1785,7 @@ int main() {
   TestAttnSoftmax();
   TestF16Matmul();
   TestSgemm();
+  TestBf16();
   TestMoeShared();
   if (g_failures) {
     std::fprintf(stderr, "%d failures\n", g_failures);
