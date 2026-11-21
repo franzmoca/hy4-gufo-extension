@@ -338,6 +338,66 @@ void TestHyperConnections() {
     }
 }
 
+// hy4_hc_decode: bit-identical to the kernels it replaces (rms_norm of y,
+// hc_post_pre or hc_pre, rms_norm of the mix) at the model's width, with and
+// without the post, norm weights and post output, for 1, 3 and 11 tokens.
+void TestHcDecode() {
+  const uint32_t hc = 4, dim = 3072, flat = hc * dim;
+  const float eps = 1e-6f, hc_eps = 1e-6f, magnitude = 2.0f;
+  const auto scale = Random(2, 0.5f, 1.5f);
+  const auto base = Random(2 * hc);
+  const auto wy = Random(dim, 0.5f, 1.5f), wx = Random(dim, 0.5f, 1.5f);
+  for (uint32_t n : {1u, 3u, 11u})
+    for (bool with_y : {true, false})
+      for (bool layer : {true, false})
+        for (bool weights : {true, false}) {
+          const std::string what =
+              "hc_decode n=" + std::to_string(n) + (with_y ? " post" : "") +
+              (layer ? " layer" : " head") + (weights ? " weights" : "");
+          const uint32_t n_mix = layer ? 2 * hc : hc;
+          const auto fn = Random(n_mix * flat, -0.1f, 0.1f);
+          const auto h = Random(n * flat, -2, 2), y = Random(n * dim, -3, 3);
+          const auto post0 = Random(n * hc, 0, 2);
+          const float* dwy = weights ? Device(wy) : nullptr;
+          const float* dwx = weights ? Device(wx) : nullptr;
+          // The kernels it replaces.
+          float *y_a = Device(y), *h_a = Device(h), *p_a = Device(post0);
+          float *x_a = Device(std::vector<float>(n * dim)),
+                *o_a = Device(std::vector<float>(n * dim));
+          bool ok = true;
+          if (with_y) {
+            ok &= hy4_rms_norm(y_a, dwy, y_a, n, dim, dim, eps, nullptr) == 0;
+            ok &=
+                hy4_hc_post_pre(y_a, p_a, h_a, Device(fn), Device(scale),
+                                Device(base), x_a, layer ? p_a : nullptr, n, hc,
+                                dim, eps, hc_eps, magnitude, nullptr) == 0;
+          } else {
+            ok &= hy4_hc_pre(h_a, Device(fn), Device(scale), Device(base), x_a,
+                             layer ? p_a : nullptr, n, hc, dim, eps, hc_eps,
+                             magnitude, nullptr) == 0;
+          }
+          ok &= hy4_rms_norm(x_a, dwx, o_a, n, dim, dim, eps, nullptr) == 0;
+          // The fused boundary.
+          float *y_b = Device(y), *h_b = Device(h), *p_b = Device(post0);
+          float *x_b = Device(std::vector<float>(n * dim)),
+                *o_b = Device(std::vector<float>(n * dim));
+          ok &= hy4_hc_decode(with_y ? y_b : nullptr, dwy, p_b, h_b, Device(fn),
+                              Device(scale), Device(base), x_b, o_b, dwx,
+                              layer ? p_b : nullptr, n, hc, dim, eps, hc_eps,
+                              magnitude, nullptr) == 0;
+          Expect(ok, what + " status");
+          Expect(Host(h_a, n * flat) == Host(h_b, n * flat),
+                 what + " streams identical");
+          Expect(Host(x_a, n * dim) == Host(x_b, n * dim),
+                 what + " mix identical");
+          Expect(Host(o_a, n * dim) == Host(o_b, n * dim),
+                 what + " normed mix identical");
+          Expect(Host(p_a, n * hc) == Host(p_b, n * hc),
+                 what + " post identical");
+          Expect(Host(y_b, n * dim) == y, what + " leaves y");
+        }
+}
+
 void TestGemv() {
   const uint32_t m = 37, k = 256;
   for (uint32_t n : {1u, 3u, 11u}) {
@@ -1878,6 +1938,7 @@ int main() {
   TestQ8_0();
   TestRmsNorm();
   TestHyperConnections();
+  TestHcDecode();
   TestGemv();
   TestRope();
   TestMlaAttention();

@@ -272,6 +272,116 @@ __global__ void HcPost(const float* y, const float* residual, const float* post,
   }
 }
 
+// Decode half-layer boundary in two launches (hy4_hc_decode). Each thread
+// does what RmsNorm, HcPost, HcMix, HcApply and RmsNorm do, with their
+// thread layouts and reduction orders, so the results are theirs bit for bit.
+// HcPostMix, grid (kHcSlices, n): every block takes y's RMS scale (RmsNorm's
+// loop and BlockSum), adds the normed y times post_prev into its slice of h,
+// stores it and sums the slice's mixes (HcMix). y == NULL skips the post.
+__global__ void __launch_bounds__(kBlock)
+    HcPostMix(const float* y, const float* y_norm, const float* post_prev,
+              float* h, const float* fn, float* partial, uint32_t hc,
+              uint32_t dim, uint32_t n_mix, float eps) {
+  __shared__ float scratch[32];
+  const uint32_t t = blockIdx.y;
+  const uint32_t flat = hc * dim;
+  float scale = 0.0f;
+  const float* yt = y ? y + (uint64_t)t * dim : nullptr;
+  if (yt) {
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+      ss += yt[i] * yt[i];
+    ss = BlockSum(ss, scratch);
+    scale = rsqrtf(ss / (float)dim + eps);
+  }
+  const uint32_t per = (flat + kHcSlices - 1) / kHcSlices;
+  const uint32_t lo = blockIdx.x * per;
+  const uint32_t hi = min(flat, lo + per);
+  float* ht = h + (uint64_t)t * flat;
+  float mix[kHcMaxMix];
+  for (uint32_t m = 0; m < n_mix; ++m)
+    mix[m] = 0.0f;
+  float ss = 0.0f;
+  for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+    float v = ht[i];
+    if (yt) {
+      const uint32_t stream = i / dim, c = i - stream * dim;
+      const float yv = yt[c] * scale;
+      const float yn = y_norm ? yv * y_norm[c] : yv;
+      v = v + yn * post_prev[(uint64_t)t * hc + stream];
+      ht[i] = v;
+    }
+    ss += v * v;
+    for (uint32_t m = 0; m < n_mix; ++m)
+      mix[m] += fn[(uint64_t)m * flat + i] * v;
+  }
+  float* out =
+      partial + ((uint64_t)t * kHcSlices + blockIdx.x) * (kHcMaxMix + 1);
+  for (uint32_t m = 0; m < n_mix; ++m) {
+    const float r = BlockSum(mix[m], scratch);
+    if (threadIdx.x == 0)
+      out[m] = r;
+  }
+  const float r = BlockSum(ss, scratch);
+  if (threadIdx.x == 0)
+    out[n_mix] = r;
+}
+
+// HcApplyNorm, grid (1, n): HcApply's mix for all of the token's columns in
+// one block (each column sums its streams alone, so the layout does not
+// change it), then RmsNorm of the mixed row into out (weight may be NULL). x
+// keeps the mixed row.
+__global__ void __launch_bounds__(kBlock)
+    HcApplyNorm(const float* h, const float* partial, const float* scale,
+                const float* base, float* x, float* out, const float* weight,
+                float* post, uint32_t hc, uint32_t dim, float eps, float hc_eps,
+                float magnitude) {
+  __shared__ float mix_s[kHcMaxMix + 1];
+  __shared__ float pre_s[8];
+  __shared__ float scratch[32];
+  const uint32_t t = blockIdx.y;
+  const uint32_t n_mix = post ? 2 * hc : hc;
+  const float* part = partial + (uint64_t)t * kHcSlices * (kHcMaxMix + 1);
+  if (threadIdx.x <= n_mix) {
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < kHcSlices; ++b)
+      acc += part[b * (kHcMaxMix + 1) + threadIdx.x];
+    mix_s[threadIdx.x] = acc;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const float rs = rsqrtf(mix_s[n_mix] / (float)(hc * dim) + eps);
+    for (uint32_t i = 0; i < hc; ++i) {
+      pre_s[i] = Sigmoid(mix_s[i] * rs * scale[0] + base[i]) + hc_eps;
+      if (post)
+        post[(uint64_t)t * hc + i] =
+            Sigmoid(mix_s[hc + i] * rs * scale[1] + base[hc + i]) * magnitude +
+            hc_eps;
+    }
+  }
+  __syncthreads();
+  const float* ht = h + (uint64_t)t * hc * dim;
+  float* xt = x + (uint64_t)t * dim;
+  for (uint32_t c = threadIdx.x; c < dim; c += blockDim.x) {
+    float acc = 0.0f;
+    for (uint32_t i = 0; i < hc; ++i)
+      acc += ht[(uint64_t)i * dim + c] * pre_s[i];
+    xt[c] = acc;
+  }
+  // RmsNorm reads the row back as written, in its own loop order.
+  __syncthreads();
+  float ss = 0.0f;
+  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+    ss += xt[i] * xt[i];
+  ss = BlockSum(ss, scratch);
+  const float rscale = rsqrtf(ss / (float)dim + eps);
+  float* yt = out + (uint64_t)t * dim;
+  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float v = xt[i] * rscale;
+    yt[i] = weight ? v * weight[i] : v;
+  }
+}
+
 __global__ void HcInit(const float* x, float* h, uint32_t hc, uint32_t dim) {
   const uint32_t t = blockIdx.y;
   for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
@@ -1953,6 +2063,28 @@ int hy4_hc_post_pre(const float* y, const float* post_prev, float* h,
         h, fn, partial, hc * dim, n, y, post_prev, hc, dim);
   HcApply<<<dim3(Blocks(dim, 64), n), kBlock, 0, stream>>>(
       h, partial, scale, base, out, post, hc, dim, eps, hc_eps, magnitude);
+  return Status();
+}
+
+int hy4_hc_decode(const float* y, const float* y_norm, const float* post_prev,
+                  float* h, const float* fn, const float* scale,
+                  const float* base, float* x, float* out,
+                  const float* out_norm, float* post, uint32_t n, uint32_t hc,
+                  uint32_t dim, float eps, float hc_eps, float magnitude,
+                  hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (hc > 8)
+    return 1;
+  float* partial = HcPartial(n);
+  if (!partial)
+    return 1;
+  const uint32_t n_mix = post ? 2 * hc : hc;
+  HcPostMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(
+      y, y_norm, post_prev, h, fn, partial, hc, dim, n_mix, eps);
+  HcApplyNorm<<<dim3(1, n), kBlock, 0, stream>>>(h, partial, scale, base, x,
+                                                 out, out_norm, post, hc, dim,
+                                                 eps, hc_eps, magnitude);
   return Status();
 }
 

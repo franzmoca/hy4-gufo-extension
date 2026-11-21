@@ -67,6 +67,19 @@ int hy4_hc_post_pre(const float* y, const float* post_prev, float* h,
                     uint32_t dim, float eps, float hc_eps, float magnitude,
                     hipStream_t stream);
 
+/* A decode pass's half-layer boundary in two launches, with the results of
+ * hy4_rms_norm(y, y_norm) (in place), hy4_hc_post_pre(y, post_prev, h, fn,
+ * scale, base, x, post) and hy4_rms_norm(x, out_norm, out), all with eps, bit
+ * for bit. y == NULL skips the post (hy4_hc_pre); post == NULL is the head
+ * reduce. y itself is left as it was. Each token runs alone, so a token's
+ * results do not depend on n. */
+int hy4_hc_decode(const float* y, const float* y_norm, const float* post_prev,
+                  float* h, const float* fn, const float* scale,
+                  const float* base, float* x, float* out,
+                  const float* out_norm, float* post, uint32_t n, uint32_t hc,
+                  uint32_t dim, float eps, float hc_eps, float magnitude,
+                  hipStream_t stream);
+
 /* h[t, i] = x[t] for every stream i. */
 int hy4_hc_init(const float* x, float* h, uint32_t n, uint32_t hc, uint32_t dim, hipStream_t stream);
 
