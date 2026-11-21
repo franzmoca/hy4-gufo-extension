@@ -15,6 +15,10 @@
 #include "hy4_gemv_tasks.hpp"
 #include "hy4_kernels.h"
 
+#ifndef HY4_EXPERT_SLICES
+#define HY4_EXPERT_SLICES 2
+#endif
+
 namespace {
 
 using namespace hy4_gemv_tasks;
@@ -411,6 +415,197 @@ __global__ void __launch_bounds__(kWave* kWaves)
   }
 }
 
+/* Routed experts: grid (row blocks, slots). Slot j's expert is ids[j], its
+ * input row x + (j / slots_per_x) * k and its output row y + j * m. With
+ * kCols == 1 every slot is its own launch row. With kCols > 1 (verify
+ * passes, at most kCols slots per expert, n_slots <= 256) the block of the
+ * first slot with an expert takes every slot with it, in slot order, and
+ * decodes the expert's rows once for them; the other blocks exit. Each
+ * slot's sums run as gemv_kernel runs one token: the same bits for any
+ * kCols. With kSwiGLU the outputs are SwiGLU(gate, up) times route_w[j]. */
+template<int kType, int S, bool kSwiGLU, int kCols>
+__global__ void __launch_bounds__(kWave* kWaves)
+    expert_gemv_kernel(const uint8_t* __restrict__ w,
+                       const uint8_t* __restrict__ w_up, uint64_t expert_bytes,
+                       float limit, const float* __restrict__ x,
+                       uint32_t slots_per_x, const int32_t* __restrict__ ids,
+                       const float* __restrict__ route_w, float* __restrict__ y,
+                       uint32_t m, uint32_t k, uint32_t n_slots) {
+  using F = Format<kType>;
+  constexpr int kRowsPerWave = kWave / F::kTasks;
+  constexpr int kGroups = kWaves / S;
+  __shared__ float partial[S > 1 ? kCols : 1][kWaves][kWave];
+  __shared__ float partial_up[S > 1 && kSwiGLU ? kCols : 1][kWaves][kWave];
+  const uint32_t slot0 = blockIdx.y;
+  const int32_t expert = ids[slot0];
+  uint32_t slot[kCols];
+  int cols = 1;
+  slot[0] = slot0;
+  if constexpr (kCols > 1) {
+    __shared__ uint32_t match[kWaves];
+    const uint32_t j = threadIdx.x;
+    const bool hit = j < n_slots && ids[j] == expert;
+    const uint32_t mask = __ballot(hit);
+    if (threadIdx.x % kWave == 0)
+      match[threadIdx.x / kWave] = mask;
+    __syncthreads();
+    // An earlier slot with this expert does the work.
+    for (uint32_t wv = 0; wv * kWave < slot0; ++wv) {
+      const uint32_t below =
+          slot0 >= (wv + 1) * kWave ? ~0u : (1u << (slot0 % kWave)) - 1u;
+      if (match[wv] & below)
+        return;
+    }
+    cols = 0;
+    for (uint32_t wv = slot0 / kWave; wv < kWaves; ++wv) {
+      uint32_t bits = match[wv];
+      if (wv == slot0 / kWave)
+        bits &= ~0u << (slot0 % kWave);
+      while (bits && cols < kCols) {
+        const int b = __builtin_ctz(bits);
+        bits &= bits - 1;
+#pragma unroll
+        for (int c = 0; c < kCols; ++c)
+          if (c == cols)
+            slot[c] = wv * kWave + b;
+        ++cols;
+      }
+    }
+  }
+  const int lane = threadIdx.x % kWave;
+  const int wave = threadIdx.x / kWave;
+  const int group = wave / S;
+  const int sl = wave % S;
+  const int t = lane % F::kTasks;
+  const uint32_t row =
+      (blockIdx.x * kGroups + group) * kRowsPerWave + lane / F::kTasks;
+  const uint32_t blocks_per_row = k / 256;
+  float acc[kCols] = {};
+  float acc_up[kCols] = {};
+  if (row < m) {
+    const uint64_t offset = (uint64_t)expert * expert_bytes +
+                            (uint64_t)row * blocks_per_row * F::kBlockBytes;
+    const uint8_t* base = w + offset;
+    const float* xr[kCols];
+#pragma unroll
+    for (int c = 0; c < kCols; ++c)
+      xr[c] = x + (uint64_t)(slot[c < cols ? c : 0] / slots_per_x) * k;
+#pragma unroll 2
+    for (uint32_t blk = sl; blk < blocks_per_row; blk += S) {
+      float wv[32];
+      F::Decode(base + (uint64_t)blk * F::kBlockBytes, t, wv);
+#pragma unroll
+      for (int c = 0; c < kCols; ++c)
+        if (c < cols)
+          acc[c] = F::Dot(acc[c], wv, t, xr[c] + blk * 256);
+      if constexpr (kSwiGLU) {
+        F::Decode(w_up + offset + (uint64_t)blk * F::kBlockBytes, t, wv);
+#pragma unroll
+        for (int c = 0; c < kCols; ++c)
+          if (c < cols)
+            acc_up[c] = F::Dot(acc_up[c], wv, t, xr[c] + blk * 256);
+      }
+    }
+  }
+#pragma unroll
+  for (int c = 0; c < kCols; ++c) {
+#pragma unroll
+    for (int offset = F::kTasks / 2; offset > 0; offset >>= 1) {
+      acc[c] += __shfl_xor(acc[c], offset, kWave);
+      if constexpr (kSwiGLU)
+        acc_up[c] += __shfl_xor(acc_up[c], offset, kWave);
+    }
+  }
+  if constexpr (S > 1) {
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+      partial[c][wave][lane] = acc[c];
+      if constexpr (kSwiGLU)
+        partial_up[c][wave][lane] = acc_up[c];
+    }
+    __syncthreads();
+    if (sl != 0)
+      return;
+#pragma unroll
+    for (int c = 0; c < kCols; ++c) {
+#pragma unroll
+      for (int s = 1; s < S; ++s) {
+        acc[c] += partial[c][wave + s][lane];
+        if constexpr (kSwiGLU)
+          acc_up[c] += partial_up[c][wave + s][lane];
+      }
+    }
+  }
+  if (t != 0 || row >= m)
+    return;
+#pragma unroll
+  for (int c = 0; c < kCols; ++c) {
+    if (c >= cols)
+      continue;
+    float v = acc[c];
+    if constexpr (kSwiGLU) {
+      float g = acc[c];
+      float u = acc_up[c];
+      if (limit > 0.0f) {
+        u = fminf(fmaxf(u, -limit), limit);
+        g = fminf(g, limit);
+      }
+      v = g / (1.0f + expf(-g)) * u;
+      if (route_w)
+        v *= route_w[slot[c]];
+    }
+    y[(uint64_t)slot[c] * m + row] = v;
+  }
+}
+
+/* The slices of expert_gemv_kernel: fixed, so that every pass sums alike. */
+constexpr int kExpertSlices = HY4_EXPERT_SLICES;
+
+template<int kType, int kCols>
+void launch_experts(const void* w, const void* w_up, uint64_t expert_bytes,
+                    float limit, const float* x, uint32_t slots_per_x,
+                    const int32_t* ids, const float* route_w, float* y,
+                    uint32_t m, uint32_t k, uint32_t n_slots,
+                    hipStream_t stream) {
+  constexpr int S = kExpertSlices;
+  constexpr uint32_t kRows = (kWave / Format<kType>::kTasks) * (kWaves / S);
+  const dim3 grid((m + kRows - 1) / kRows, n_slots);
+  const auto* wg = static_cast<const uint8_t*>(w);
+  const auto* wu = static_cast<const uint8_t*>(w_up);
+  if (w_up)
+    expert_gemv_kernel<kType, S, true, kCols>
+        <<<grid, kWave * kWaves, 0, stream>>>(wg, wu, expert_bytes, limit, x,
+                                              slots_per_x, ids, route_w, y, m,
+                                              k, n_slots);
+  else
+    expert_gemv_kernel<kType, S, false, kCols>
+        <<<grid, kWave * kWaves, 0, stream>>>(wg, nullptr, expert_bytes, 0.0f,
+                                              x, slots_per_x, ids, nullptr, y,
+                                              m, k, n_slots);
+}
+
+template<int kType>
+void dispatch_experts(const void* w, const void* w_up, uint64_t expert_bytes,
+                      float limit, const float* x, uint32_t slots_per_x,
+                      const int32_t* ids, const float* route_w, float* y,
+                      uint32_t m, uint32_t k, uint32_t n_slots,
+                      uint32_t max_cols, hipStream_t stream) {
+#define HY4_EXPERTS(C)                                                        \
+  launch_experts<kType, C>(w, w_up, expert_bytes, limit, x, slots_per_x, ids, \
+                           route_w, y, m, k, n_slots, stream)
+  if (max_cols == 1)
+    HY4_EXPERTS(1);
+  else if (max_cols == 2)
+    HY4_EXPERTS(2);
+  else if (max_cols <= 4)
+    HY4_EXPERTS(4);
+  else if (max_cols <= 8)
+    HY4_EXPERTS(8);
+  else
+    HY4_EXPERTS(16);
+#undef HY4_EXPERTS
+}
+
 /* Slice results and per-tile counters of split_gemv_kernel, in the caller's
  * scratch (hy4_gemv_scratch_bytes): the launches that share one run on one
  * stream, in turn. Without scratch every launch takes the lane layout, which
@@ -607,6 +802,40 @@ extern "C" int hy4_gemv_gate(int type, const void* w, const float* x, float* y,
                              hipStream_t stream) {
   return run(type, w, nullptr, 0.0f, x, y, m, k, Second{nullptr, nullptr, 0},
              Tokens{n, k, m, nullptr, true}, scratch, stream);
+}
+
+extern "C" int hy4_gemv_experts(int type, const void* w, const void* w_up,
+                                uint64_t expert_bytes, const float* x,
+                                uint32_t slots_per_x, const int32_t* ids,
+                                const float* route_w, float limit, float* y,
+                                uint32_t m, uint32_t k, uint32_t n_slots,
+                                uint32_t max_cols, hipStream_t stream) {
+  if (k % 256 != 0 || m == 0 || n_slots == 0 || slots_per_x == 0 ||
+      max_cols == 0 || max_cols > HY4_GEMV_MAX_TOKENS ||
+      (max_cols > 1 && n_slots > kWave * kWaves))
+    return 1;
+  switch (type) {
+    case HY4_TYPE_Q8_0:
+      dispatch_experts<8>(w, w_up, expert_bytes, limit, x, slots_per_x, ids,
+                          route_w, y, m, k, n_slots, max_cols, stream);
+      break;
+    case HY4_TYPE_Q4_K:
+      dispatch_experts<12>(w, w_up, expert_bytes, limit, x, slots_per_x, ids,
+                           route_w, y, m, k, n_slots, max_cols, stream);
+      break;
+    case HY4_TYPE_Q6_K:
+      dispatch_experts<14>(w, w_up, expert_bytes, limit, x, slots_per_x, ids,
+                           route_w, y, m, k, n_slots, max_cols, stream);
+      break;
+    default:
+      return 1;
+  }
+  const hipError_t err = hipGetLastError();
+  if (err == hipSuccess)
+    return 0;
+  fprintf(stderr, "hy4: expert gemv launch failed: %s\n",
+          hipGetErrorString(err));
+  return 1;
 }
 
 extern "C" int hy4_gemv_pair(int type, const void* w1, float* y1, uint32_t m1,

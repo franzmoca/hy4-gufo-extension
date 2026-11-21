@@ -1633,6 +1633,93 @@ void TestBf16() {
 // dispatch distinguishes, each token equal to a one-token call, the split
 // layout (scratch) equal to the lane layout (none), pairs equal to single
 // calls, and the fused SwiGLU.
+// hy4_gemv_experts against a double reference, and verify passes (slots
+// sharing experts) bit for bit against one-slot launches.
+void TestExpertGemv() {
+  const uint32_t m = 70, k = 512;
+  std::mt19937 rng(17);
+  for (int type : {HY4_TYPE_Q8_0, HY4_TYPE_Q4_K, HY4_TYPE_Q6_K})
+    for (auto [n_exp, used] : {std::pair<uint32_t, uint32_t>{6, 3}, {24, 16}}) {
+      const std::string name = "experts type " + std::to_string(type) +
+                               " used " + std::to_string(used);
+      const uint64_t bytes = RandomQuant(type, m, k).size();
+      std::vector<uint8_t> gq, uq, dq;
+      for (uint32_t e = 0; e < n_exp; ++e) {
+        for (auto* v : {&gq, &uq}) {
+          const auto q = RandomQuant(type, m, k);
+          v->insert(v->end(), q.begin(), q.end());
+        }
+        // The down matrices: also m x k, over their own input rows.
+        const auto q = RandomQuant(type, m, k);
+        dq.insert(dq.end(), q.begin(), q.end());
+      }
+      const auto gd = Dequant(type, gq), ud = Dequant(type, uq),
+                 dd = Dequant(type, dq);
+      const uint8_t *dg = Device(gq), *du = Device(uq), *ddn = Device(dq);
+      for (uint32_t n : {1u, 2u, 3u, 5u, 8u, 16u}) {
+        const uint32_t slots = n * used;
+        std::vector<int32_t> ids(slots);
+        for (uint32_t t = 0; t < n; ++t) {
+          std::vector<int32_t> p(n_exp);
+          for (uint32_t e = 0; e < n_exp; ++e)
+            p[e] = (int32_t)e;
+          std::shuffle(p.begin(), p.end(), rng);
+          for (uint32_t j = 0; j < used; ++j)
+            ids[t * used + j] = p[j];
+        }
+        const auto x = Random(n * k), rw = Random(slots, 0.1f, 1.0f);
+        const auto mid = Random(slots * k);
+        int32_t* did = Device(ids);
+        float *dx = Device(x), *drw = Device(rw), *dmid = Device(mid);
+        for (float limit : {0.0f, 0.05f}) {
+          std::vector<double> want(slots * m), want_d(slots * m);
+          for (uint32_t j = 0; j < slots; ++j) {
+            const uint64_t e = ids[j];
+            const float* xr = x.data() + (j / used) * k;
+            for (uint32_t r = 0; r < m; ++r) {
+              double g = 0, u = 0, d = 0;
+              for (uint32_t i = 0; i < k; ++i) {
+                g += gd[(e * m + r) * k + i] * xr[i];
+                u += ud[(e * m + r) * k + i] * xr[i];
+                d += dd[(e * m + r) * k + i] * mid[j * k + i];
+              }
+              if (limit > 0) {
+                u = std::min(std::max(u, (double)-limit), (double)limit);
+                g = std::min(g, (double)limit);
+              }
+              want[j * m + r] = g / (1 + std::exp(-g)) * u * rw[j];
+              want_d[j * m + r] = d;
+            }
+          }
+          std::vector<float> one, one_d;
+          for (uint32_t cols : {1u, n}) {
+            float *y = Device(std::vector<float>(slots * m)),
+                  *yd = Device(std::vector<float>(slots * m));
+            Expect(
+                hy4_gemv_experts(type, dg, du, bytes, dx, used, did, drw, limit,
+                                 y, m, k, slots, cols, nullptr) == 0 &&
+                    hy4_gemv_experts(type, ddn, nullptr, bytes, dmid, 1, did,
+                                     nullptr, 0.0f, yd, m, k, slots, cols,
+                                     nullptr) == 0,
+                name + " status");
+            const auto got = Host(y, slots * m), got_d = Host(yd, slots * m);
+            const std::string what = name + " n=" + std::to_string(n) +
+                                     " limit=" + std::to_string(limit);
+            if (cols == 1) {
+              Near(got, want, 1e-5, what + " swiglu");
+              Near(got_d, want_d, 1e-5, what + " down");
+              one = got;
+              one_d = got_d;
+            } else {
+              Expect(got == one && got_d == one_d,
+                     what + " shared experts equal one-slot launches");
+            }
+          }
+        }
+      }
+    }
+}
+
 void TestDecodeGemv() {
   const uint32_t k = 512;
   void* scratch = nullptr;
@@ -2071,6 +2158,7 @@ int main() {
   TestAttnSoftmax();
   TestF16Matmul();
   TestDecodeGemv();
+  TestExpertGemv();
   TestSgemm();
   TestBf16();
   TestMoeShared();
