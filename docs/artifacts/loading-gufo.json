@@ -22,21 +22,22 @@
     "fingerprintId": "d95cf8ed0540f18010f09b38f08ee3ed292c9d17a7100ce4d0273dd287de1c7f",
     "schemaVersion": "1.0.0"
   },
-  "measuredOn": "2026-11-20",
+  "measuredOn": "2026-11-21",
   "mode": "dfly",
   "model": {
     "id": "Hy4-Flash",
     "variant": null
   },
   "notes": [
-    "file cache reset before each launch with `echo 3 > /proc/sys/vm/drop_caches`",
-    "readiness = HTTP 200 on /ready"
+    "file cache reset before each launch with the supplied --drop-caches command",
+    "readiness = HTTP 200 on /ready",
+    "rows not measured on 2026-11-21 retain values from 2026-11-20"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "default": {
-      "command": "gufo serve --port 39067 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 262144 --served-model-name bench --think off --dfly-model tencent-dfly2",
-      "ready_s": 21.964,
+      "command": "gufo serve --port 39609 --sessions 1 llm --model Hy4-flash-Q4_K_M-00001-of-00002.gguf --context 262144 --served-model-name bench --think off --dfly-model tencent-dfly2",
+      "ready_s": 21.606,
       "ready_s_sd": null,
       "samples": 1
     }
@@ -47,7 +48,7 @@
       "gufo",
       "serve",
       "--port",
-      "39067",
+      "39609",
       "--sessions",
       "1",
       "llm",
