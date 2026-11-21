@@ -901,8 +901,11 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
   };
 
   // A half's hy4_hc_post is deferred into the next pre-mix
-  // (hy4_hc_post_pre) unless something reads h in between.
+  // (hy4_hc_post_pre) unless something reads h in between. Decode passes
+  // also defer the half's output norm (weight y_norm) and run the boundary,
+  // norms included, as hy4_hc_decode.
   bool post_pending = false;
+  const float* y_norm = nullptr;
   auto hc_pre = [&](const Tensor& fn, const Tensor& scale, const Tensor& base,
                     float* post, float magnitude) {
     if (!post_pending)
@@ -913,14 +916,41 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
                            s.x, post, n, c.hc, c.n_embd, c.rms_eps, c.hc_eps,
                            magnitude, st);
   };
+  // The boundary into a half (or the head): pre-mix into s.x, then s.cur =
+  // rms_norm(s.x, norm).
+  auto boundary = [&](const Tensor& fn, const Tensor& scale, const Tensor& base,
+                      float* post, float magnitude, const Tensor& norm,
+                      bool half) {
+    if (!batched) {
+      const float* y = post_pending ? s.y : nullptr;
+      post_pending = false;
+      const float* yn = y_norm;
+      y_norm = nullptr;
+      return hy4_hc_decode(y, yn, s.post, s.h, fn.f32(), scale.f32(),
+                           base.f32(), s.x, s.cur, norm.f32(), post, n, c.hc,
+                           c.n_embd, c.rms_eps, c.hc_eps, magnitude, st);
+    }
+    if (int rc = hc_pre(fn, scale, base, post, magnitude))
+      return rc;
+    return half ? norm_cur(norm)
+                : hy4_rms_norm(s.x, norm.f32(), s.cur, n, c.n_embd, c.n_embd,
+                               c.rms_eps, st);
+  };
+  // A pending post applied now, for something that reads h.
+  auto apply_post = [&]() {
+    if (y_norm &&
+        hy4_rms_norm(s.y, y_norm, s.y, n, c.n_embd, c.n_embd, c.rms_eps, st))
+      return 1;
+    y_norm = nullptr;
+    post_pending = false;
+    return hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st);
+  };
 
   for (std::uint32_t il = 0; il < c.n_layer; ++il) {
     const Layer& l = w.layers[il];
     const int e = c.EngramIndex(il);
-    if (e >= 0 && post_pending) {
-      HY4_CHECK(hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st));
-      post_pending = false;
-    }
+    if (e >= 0 && post_pending)
+      HY4_CHECK(apply_post());
     if (e >= 0) {
       HY4_CHECK(engram_ready(static_cast<std::uint32_t>(e)));
       const std::uint32_t width = cols * c.engram_dim;
@@ -935,24 +965,28 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
                                  kEngramEps, st));
     }
 
-    HY4_CHECK(hc_pre(l.hc_attn_fn, l.hc_attn_scale, l.hc_attn_base, s.post,
-                     c.hc_magnitude));
-    HY4_CHECK(norm_cur(l.attn_norm));
+    HY4_CHECK(boundary(l.hc_attn_fn, l.hc_attn_scale, l.hc_attn_base, s.post,
+                       c.hc_magnitude, l.attn_norm, true));
     if (!Attention(rows, il, n, error))
       return false;
+    // Attention normed s.y in batched passes only.
     post_pending = true;
+    if (!batched)
+      y_norm = l.attn_post_norm.f32();
 
-    HY4_CHECK(hc_pre(l.hc_ffn_fn, l.hc_ffn_scale, l.hc_ffn_base, s.post,
-                     c.hc_magnitude));
-    HY4_CHECK(norm_cur(l.ffn_norm));
+    HY4_CHECK(boundary(l.hc_ffn_fn, l.hc_ffn_scale, l.hc_ffn_base, s.post,
+                       c.hc_magnitude, l.ffn_norm, true));
     if (!first.Ffn(il, n, error))
       return false;
-    HY4_CHECK(hy4_rms_norm(s.y, l.ffn_post_norm.f32(), s.y, n, c.n_embd, c.n_embd, c.rms_eps, st));
     post_pending = true;
+    if (batched)
+      HY4_CHECK(hy4_rms_norm(s.y, l.ffn_post_norm.f32(), s.y, n, c.n_embd,
+                             c.n_embd, c.rms_eps, st));
+    else
+      y_norm = l.ffn_post_norm.f32();
 
     if (first.probe_) {
-      HY4_CHECK(hy4_hc_post(s.y, s.h, s.post, s.h, n, c.hc, c.n_embd, st));
-      post_pending = false;
+      HY4_CHECK(apply_post());
       HY4_CHECK(hipMemcpyAsync(s.host_h, s.h, std::size_t{n} * c.hc * c.n_embd * sizeof(float),
                                hipMemcpyDeviceToHost, st));
       HY4_CHECK(hipStreamSynchronize(st));
@@ -972,9 +1006,8 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
   }
 
   // Head: reduce the streams, norm, project.
-  HY4_CHECK(
-      hc_pre(w.hc_head_fn, w.hc_head_scale, w.hc_head_base, nullptr, 1.0f));
-  HY4_CHECK(hy4_rms_norm(s.x, w.output_norm.f32(), s.cur, n, c.n_embd, c.n_embd, c.rms_eps, st));
+  HY4_CHECK(boundary(w.hc_head_fn, w.hc_head_scale, w.hc_head_base, nullptr,
+                     1.0f, w.output_norm, false));
   for (const Rows& part : rows) {
     Session& se = *part.session;
     if (!se.tap_hidden_ || part.n == 0)
@@ -1135,8 +1168,10 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
     if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, ex, error))
       return false;
   }
-  HY4_CHECK(hy4_rms_norm(s.y, l.attn_post_norm.f32(), s.y, n, c.n_embd,
-                         c.n_embd, c.rms_eps, st));
+  // Decode passes norm s.y in the next boundary (hy4_hc_decode).
+  if (batched)
+    HY4_CHECK(hy4_rms_norm(s.y, l.attn_post_norm.f32(), s.y, n, c.n_embd,
+                           c.n_embd, c.rms_eps, st));
   return true;
 }
 
