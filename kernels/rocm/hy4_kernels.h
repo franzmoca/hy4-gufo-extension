@@ -102,6 +102,15 @@ int hy4_gemv_float(int type, const void* w, const float* x, float* y, uint32_t m
 uint64_t hy4_gemv_scratch_bytes(void);
 int hy4_gemv(int type, const void* w, const float* x, float* y, uint32_t m,
              uint32_t k, uint32_t n, void* scratch, hipStream_t stream);
+/* hy4_gemv with add [n][m] added to each output as it is stored (the sum
+ * hy4_add of the two would compute); add must not overlap y. */
+int hy4_gemv_add(int type, const void* w, const float* x, const float* add,
+                 float* y, uint32_t m, uint32_t k, uint32_t n, void* scratch,
+                 hipStream_t stream);
+/* hy4_gemv whose outputs scale y instead of replacing it: y[t, r] *=
+ * sigmoid(W[r] . x[t]), as hy4_sigmoid_mul(y, hy4_gemv's output) would. */
+int hy4_gemv_gate(int type, const void* w, const float* x, float* y, uint32_t m,
+                  uint32_t k, uint32_t n, void* scratch, hipStream_t stream);
 /* Two matrices of one type and width k over the same x in one launch:
  * y1 = W1 x (m1 rows), y2 = W2 x (m2 rows), each as hy4_gemv computes it. */
 int hy4_gemv_pair(int type, const void* w1, float* y1, uint32_t m1,
@@ -150,6 +159,21 @@ int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
                 uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
                 uint32_t offset, uint32_t n_rot, float base,
                 hipStream_t stream);
+/* hy4_rope_3d that also stores each rotated row (t, h) at dst + t * dst_tok
+ * + h * dst_head. */
+int hy4_rope_3d_copy(float* x, const int32_t* pos, const int32_t* pos_hw,
+                     uint32_t n, uint32_t heads, uint64_t tok_stride,
+                     uint64_t head_stride, uint32_t offset, uint32_t n_rot,
+                     float base, float* dst, uint64_t dst_tok,
+                     uint64_t dst_head, hipStream_t stream);
+/* The decode MLA's latent norms in one launch, bit for bit as
+ * hy4_rms_norm(qr, q_norm, qr, n, q_lora, q_lora, eps),
+ * hy4_rms_norm(kva, kv_norm, kva, n, kv_lora, dk, eps) and hy4_rope_3d(kva,
+ * pos, pos_hw, n, 1, dk, 0, kv_lora, n_rot, base) compute them. */
+int hy4_mla_prep(float* qr, const float* q_norm, uint32_t q_lora, float* kva,
+                 const float* kv_norm, uint32_t kv_lora, uint32_t dk,
+                 const int32_t* pos, const int32_t* pos_hw, uint32_t n_rot,
+                 float base, float eps, uint32_t n, hipStream_t stream);
 
 /* MLA attention with learnable sinks over latent rows (llama.cpp
  * build_attn_mha with wv_b applied by the caller). q[t, h, 0:dk] holds the

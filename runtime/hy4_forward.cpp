@@ -179,6 +179,63 @@ bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
          MatVec(w2, x, y2, m2, k, n, ex, error, xh);
 }
 
+namespace {
+
+// A decode pass's quantized matvec with k % 256 == 0: hy4_gemv's shapes.
+bool DecodeGemv(const Tensor& w, std::uint32_t m, std::uint32_t k,
+                std::uint32_t n, const Exec& ex) {
+  return n <= Model::kVecMax && !ex.prompt && k % 256 == 0 &&
+         (w.type == HY4_TYPE_Q8_0 || w.type == HY4_TYPE_Q4_K ||
+          w.type == HY4_TYPE_Q6_K) &&
+         w.dims.size() >= 2 && w.dims[0] == k && w.dims[1] == m;
+}
+
+}  // namespace
+
+bool SwigluVec(const Tensor& gate, const Tensor& up, float* a, float* b,
+               float* y, std::uint32_t f, const float* x, std::uint32_t k,
+               std::uint32_t n, const Exec& ex, std::string* error,
+               const std::uint16_t* xh) {
+  if (DecodeGemv(gate, f, k, n, ex) && up.type == gate.type &&
+      DecodeGemv(up, f, k, n, ex)) {
+    HY4_CHECK(hy4_gemv_swiglu(gate.type, gate.data, up.data, x, y, f, k, 0.0f,
+                              n, ex.gemv_scratch, ex.stream));
+    return true;
+  }
+  if (!MatVecPair(gate, a, f, up, b, f, x, k, n, ex, error, xh))
+    return false;
+  HY4_CHECK(hy4_swiglu(a, b, nullptr, y, n, f, 0.0f, ex.stream));
+  return true;
+}
+
+bool MatVecGate(const Tensor& w, const float* x, float* gate, float* y,
+                std::uint32_t m, std::uint32_t k, std::uint32_t n,
+                const Exec& ex, std::string* error) {
+  if (DecodeGemv(w, m, k, n, ex)) {
+    HY4_CHECK(hy4_gemv_gate(w.type, w.data, x, y, m, k, n, ex.gemv_scratch,
+                            ex.stream));
+    return true;
+  }
+  if (!MatVec(w, x, gate, m, k, n, ex, error))
+    return false;
+  HY4_CHECK(hy4_sigmoid_mul(y, gate, std::uint64_t{n} * m, ex.stream));
+  return true;
+}
+
+bool MatVecAdd(const Tensor& w, const float* x, const float* add, float* y,
+               std::uint32_t m, std::uint32_t k, std::uint32_t n,
+               const Exec& ex, std::string* error) {
+  if (DecodeGemv(w, m, k, n, ex)) {
+    HY4_CHECK(hy4_gemv_add(w.type, w.data, x, add, y, m, k, n, ex.gemv_scratch,
+                           ex.stream));
+    return true;
+  }
+  if (!MatVec(w, x, y, m, k, n, ex, error))
+    return false;
+  HY4_CHECK(hy4_add(y, add, y, std::uint64_t{n} * m, ex.stream));
+  return true;
+}
+
 bool Model::AllocScratchRows(Scratch& s, std::uint32_t n,
                              std::uint32_t resident, mem::ScratchArena* arena,
                              std::size_t* measure) {
@@ -1102,22 +1159,33 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
   if (!MatVecPair(l.wq_a, s.qr, c.q_lora, l.wkv_a, s.kva, dk, s.cur, c.n_embd,
                   n, ex, error, cur_half))
     return false;
-  if (batched)
+  const std::int32_t* hw = s.rope_3d ? s.rope_hw : nullptr;
+  if (!batched) {
+    // Decode: both latent norms and the key's rope in one launch, then the
+    // query's rope, which also stores its tail in qfull.
+    HY4_CHECK(hy4_mla_prep(s.qr, l.q_a_norm.f32(), c.q_lora, s.kva,
+                           l.kv_a_norm.f32(), c.kv_lora, dk, s.rope, hw,
+                           c.n_rot, base, c.rms_eps, n, st));
+    if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error))
+      return false;
+    HY4_CHECK(hy4_rope_3d_copy(s.q, s.rope, hw, n, heads,
+                               std::uint64_t{heads} * c.head_k, c.head_k, nope,
+                               c.n_rot, base, s.qfull + c.kv_lora,
+                               std::uint64_t{heads} * dk, dk, st));
+  } else {
     HY4_CHECK(hy4_rms_norm_half(s.qr, l.q_a_norm.f32(), s.qr, s.qr_half, n,
                                 c.q_lora, c.q_lora, c.rms_eps, st));
-  else
-    HY4_CHECK(hy4_rms_norm(s.qr, l.q_a_norm.f32(), s.qr, n, c.q_lora, c.q_lora,
+    if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error,
+                qr_half))
+      return false;
+    HY4_CHECK(hy4_rms_norm(s.kva, l.kv_a_norm.f32(), s.kva, n, c.kv_lora, dk,
                            c.rms_eps, st));
-  if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error,
-              qr_half))
-    return false;
-  HY4_CHECK(hy4_rms_norm(s.kva, l.kv_a_norm.f32(), s.kva, n, c.kv_lora, dk, c.rms_eps, st));
-  const std::int32_t* hw = s.rope_3d ? s.rope_hw : nullptr;
-  HY4_CHECK(hy4_rope_3d(s.kva, s.rope, hw, n, 1, dk, 0, c.kv_lora, c.n_rot,
-                        base, st));
-  HY4_CHECK(hy4_rope_3d(s.q, s.rope, hw, n, heads,
-                        std::uint64_t{heads} * c.head_k, c.head_k, nope,
-                        c.n_rot, base, st));
+    HY4_CHECK(hy4_rope_3d(s.kva, s.rope, hw, n, 1, dk, 0, c.kv_lora, c.n_rot,
+                          base, st));
+    HY4_CHECK(hy4_rope_3d(s.q, s.rope, hw, n, heads,
+                          std::uint64_t{heads} * c.head_k, c.head_k, nope,
+                          c.n_rot, base, st));
+  }
 
   // Absorb wk_b into the query: q_abs[h] = wk_b[h] (512 x 192) q_nope[h].
   if (l.wk_b.type != HY4_TYPE_Q8_0 || l.wv_b.type != HY4_TYPE_Q8_0) return Fail(error, "hy4: wk_b/wv_b must be Q8_0");
@@ -1129,8 +1197,6 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
   } else {
     HY4_CHECK(hy4_gemv_q8_0_grouped(l.wk_b.data, s.q, s.qfull, c.kv_lora, nope, heads, n,
                                     std::uint64_t{heads} * c.head_k, c.head_k, std::uint64_t{heads} * dk, dk, st));
-    HY4_CHECK(hy4_copy_2d(s.qfull + c.kv_lora, dk, s.q + nope, c.head_k,
-                          c.n_rot, std::uint64_t{n} * heads, st));
   }
   if (c.has_indexer[il] && !IndexerProject(parts, il, n, error))
     return false;
@@ -1160,11 +1226,9 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
         l.wv_b.data, s.att, s.attv, c.head_v, c.kv_lora, heads, n,
         std::uint64_t{heads} * c.kv_lora, c.kv_lora,
         std::uint64_t{heads} * c.head_v, c.head_v, st));
-    if (!MatVec(l.attn_gate, s.cur, s.gate, heads * c.head_v, c.n_embd, n, ex,
-                error))
+    if (!MatVecGate(l.attn_gate, s.cur, s.gate, s.attv, heads * c.head_v,
+                    c.n_embd, n, ex, error))
       return false;
-    HY4_CHECK(hy4_sigmoid_mul(s.attv, s.gate,
-                              std::uint64_t{n} * heads * c.head_v, st));
     if (!MatVec(l.wo, s.attv, s.y, c.n_embd, heads * c.head_v, n, ex, error))
       return false;
   }
@@ -1366,20 +1430,18 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
 
   if (il < c.n_dense_lead) {
     const std::uint32_t f = c.n_ff_dense;
-    if (!MatVecPair(l.ffn_gate, s.ffn_a, f, l.ffn_up, s.ffn_b, f, s.cur,
-                    c.n_embd, n, ex, error, cur_half))
+    if (!SwigluVec(l.ffn_gate, l.ffn_up, s.ffn_a, s.ffn_b, s.ffn_c, f, s.cur,
+                   c.n_embd, n, ex, error, cur_half))
       return false;
-    HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
     return MatVec(l.ffn_down, s.ffn_c, s.y, c.n_embd, f, n, ex, error);
   }
 
   const std::uint32_t f = c.n_ff_exp;
   const std::uint32_t used = c.n_expert_used;
   // Shared expert first, into its own buffer.
-  if (!MatVecPair(l.gate_shexp, s.ffn_a, f, l.up_shexp, s.ffn_b, f, s.cur,
-                  c.n_embd, n, ex, error, cur_half))
+  if (!SwigluVec(l.gate_shexp, l.up_shexp, s.ffn_a, s.ffn_b, s.ffn_c, f, s.cur,
+                 c.n_embd, n, ex, error, cur_half))
     return false;
-  HY4_CHECK(hy4_swiglu(s.ffn_a, s.ffn_b, nullptr, s.ffn_c, n, f, 0.0f, st));
   if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, ex, error)) return false;
 
   // Router on the full-width input; experts in the latent space.
@@ -1456,10 +1518,8 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
                                           s.ffn_c, s.ids, s.ffn_a, k_, f_,
                                           static_cast<int>(n * used), e_, st));
     HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
-    if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error))
-      return false;
-    HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
-    return true;
+    return MatVecAdd(l.routed_up, s.moe, s.shared, s.y, c.n_embd, c.n_latent, n,
+                     ex, error);
   }
   // One-token decoding: one token per launch.
   for (std::uint32_t t = 0; t < n; ++t) {
@@ -1479,9 +1539,8 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
                                   static_cast<int>(c.n_latent), static_cast<int>(f), static_cast<int>(n * used),
                                   static_cast<int>(c.n_expert), 1, st));
   HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
-  if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
-  HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
-  return true;
+  return MatVecAdd(l.routed_up, s.moe, s.shared, s.y, c.n_embd, c.n_latent, n,
+                   ex, error);
 }
 
 }  // namespace gufo::models::hy4_flash

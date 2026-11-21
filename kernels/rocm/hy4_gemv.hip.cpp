@@ -126,15 +126,23 @@ struct Format<8> {  // Q8_0, eight 34-byte blocks per 256 values
  * r - m1, token stride m - m1); the others to y (token stride y_stride). With
  * kSwiGLU, w_up holds a second matrix of the same shape whose rows are taken
  * in the same pass, and row r stores silu(min(gate, limit)) * clamp(up,
- * +-limit). Each lane decodes its weights once for all tokens; every token
- * sees the FMA order of a single-token pass. */
+ * +-limit). With add (y's layout), rows stored to y are acc + add; with
+ * gate, y[row] is scaled by sigmoid(acc) instead (Gate). Each lane
+ * decodes its weights once for all tokens; every token sees the FMA order of
+ * a single-token pass. */
+/* y scaled by the sigmoid of a gate, as hy4_sigmoid_mul computes it. */
+__device__ __forceinline__ float Gate(float y, float g) {
+  return y * (1.0f / (1.0f + expf(-g)));
+}
+
 template<int kType, int S, bool kSwiGLU, int kCols>
 __global__ void __launch_bounds__(kWave* kWaves)
     gemv_kernel(const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_up,
                 float limit, const float* __restrict__ x, uint64_t x_stride,
                 float* __restrict__ y, uint32_t y_stride, uint32_t m,
                 uint32_t k, uint32_t rows_per_x, const uint8_t* __restrict__ w2,
-                float* __restrict__ y2, uint32_t m1, uint32_t n) {
+                float* __restrict__ y2, uint32_t m1, uint32_t n,
+                const float* __restrict__ add, bool gate) {
   using F = Format<kType>;
   constexpr int kRowsPerWave = kWave / F::kTasks;
   constexpr int kGroups = kWaves / S;
@@ -254,7 +262,8 @@ __global__ void __launch_bounds__(kWave* kWaves)
     } else if (second) {
       y2[(uint64_t)c * (m - m1) + row - m1] = acc[c];
     } else {
-      y[(uint64_t)c * y_stride + row] = acc[c];
+      const uint64_t at = (uint64_t)c * y_stride + row;
+      y[at] = gate ? Gate(y[at], acc[c]) : add ? acc[c] + add[at] : acc[c];
     }
   }
 }
@@ -281,7 +290,8 @@ __global__ void __launch_bounds__(kWave* kWaves)
                       uint32_t k, uint32_t rows_per_x,
                       const uint8_t* __restrict__ w2, float* __restrict__ y2,
                       uint32_t m1, uint32_t n, float* __restrict__ part,
-                      uint32_t* __restrict__ counter) {
+                      uint32_t* __restrict__ counter,
+                      const float* __restrict__ add, bool gate) {
   using F = Format<kType>;
   static_assert(F::kTasks == kWaves, "one wave per task");
   constexpr int kMats = kSwiGLU ? 2 : 1;
@@ -393,7 +403,10 @@ __global__ void __launch_bounds__(kWave* kWaves)
     } else if (second) {
       y2[(uint64_t)c * (m - m1) + row0 + lane - m1] = total[0];
     } else {
-      y[(uint64_t)c * y_stride + row0 + lane] = total[0];
+      const uint64_t at = (uint64_t)c * y_stride + row0 + lane;
+      y[at] = gate  ? Gate(y[at], total[0])
+              : add ? total[0] + add[at]
+                    : total[0];
     }
   }
 }
@@ -416,11 +429,15 @@ struct Second {
   uint32_t m1;
 };
 
-/* Tokens of one launch: x rows x_stride floats apart, y rows y_stride apart. */
+/* Tokens of one launch: x rows x_stride floats apart, y rows y_stride apart;
+ * add (NULL or y's layout) is added to y's rows as they are stored, and with
+ * gate the rows scale y by their sigmoid instead. */
 struct Tokens {
   uint32_t n;
   uint64_t x_stride;
   uint32_t y_stride;
+  const float* add = nullptr;
+  bool gate = false;
 };
 
 template<int kType, int S, int kCols>
@@ -448,13 +465,13 @@ void launch(const void* w, const void* w_up, float limit, const float* x,
               <<<grid, kWave * kWaves, 0, stream>>>(
                   wg, wu, limit, x, tokens.x_stride, y, tokens.y_stride, m, k,
                   rows_per_x, w2, second.y, second.m1, tokens.n, scratch.part,
-                  scratch.counter);
+                  scratch.counter, tokens.add, tokens.gate);
         else
           split_gemv_kernel<kType, S, false, kCols>
               <<<grid, kWave * kWaves, 0, stream>>>(
                   wg, nullptr, 0.0f, x, tokens.x_stride, y, tokens.y_stride, m,
                   k, rows_per_x, w2, second.y, second.m1, tokens.n,
-                  scratch.part, scratch.counter);
+                  scratch.part, scratch.counter, tokens.add, tokens.gate);
         return;
       }
     }
@@ -463,11 +480,12 @@ void launch(const void* w, const void* w_up, float limit, const float* x,
     gemv_kernel<kType, S, true, kCols><<<blocks, kWave * kWaves, 0, stream>>>(
         static_cast<const uint8_t*>(w), static_cast<const uint8_t*>(w_up),
         limit, x, tokens.x_stride, y, tokens.y_stride, m, k, rows_per_x, w2,
-        second.y, second.m1, tokens.n);
+        second.y, second.m1, tokens.n, tokens.add, tokens.gate);
   else
     gemv_kernel<kType, S, false, kCols><<<blocks, kWave * kWaves, 0, stream>>>(
         static_cast<const uint8_t*>(w), nullptr, 0.0f, x, tokens.x_stride, y,
-        tokens.y_stride, m, k, rows_per_x, w2, second.y, second.m1, tokens.n);
+        tokens.y_stride, m, k, rows_per_x, w2, second.y, second.m1, tokens.n,
+        tokens.add, tokens.gate);
 }
 
 template<int kType, int kCols>
@@ -575,6 +593,20 @@ extern "C" int hy4_gemv(int type, const void* w, const float* x, float* y,
                         hipStream_t stream) {
   return run(type, w, nullptr, 0.0f, x, y, m, k, Second{nullptr, nullptr, 0},
              Tokens{n, k, m}, scratch, stream);
+}
+
+extern "C" int hy4_gemv_add(int type, const void* w, const float* x,
+                            const float* add, float* y, uint32_t m, uint32_t k,
+                            uint32_t n, void* scratch, hipStream_t stream) {
+  return run(type, w, nullptr, 0.0f, x, y, m, k, Second{nullptr, nullptr, 0},
+             Tokens{n, k, m, add}, scratch, stream);
+}
+
+extern "C" int hy4_gemv_gate(int type, const void* w, const float* x, float* y,
+                             uint32_t m, uint32_t k, uint32_t n, void* scratch,
+                             hipStream_t stream) {
+  return run(type, w, nullptr, 0.0f, x, y, m, k, Second{nullptr, nullptr, 0},
+             Tokens{n, k, m, nullptr, true}, scratch, stream);
 }
 
 extern "C" int hy4_gemv_pair(int type, const void* w1, float* y1, uint32_t m1,

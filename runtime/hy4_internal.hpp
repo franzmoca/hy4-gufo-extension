@@ -94,6 +94,24 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m,
             std::uint32_t k, std::uint32_t n, const Exec& ex,
             std::string* error, const std::uint16_t* xh = nullptr);
 
+/// y = silu(gate x) * (up x) (f rows, no clamp): one fused launch in decode
+/// passes, else MatVecPair into a and b and hy4_swiglu.
+bool SwigluVec(const Tensor& gate, const Tensor& up, float* a, float* b,
+               float* y, std::uint32_t f, const float* x, std::uint32_t k,
+               std::uint32_t n, const Exec& ex, std::string* error,
+               const std::uint16_t* xh = nullptr);
+
+/// y *= sigmoid(W x), the scaling in the matvec's stores in decode passes
+/// (else W x into gate first).
+bool MatVecGate(const Tensor& w, const float* x, float* gate, float* y,
+                std::uint32_t m, std::uint32_t k, std::uint32_t n,
+                const Exec& ex, std::string* error);
+
+/// y = W x + add, the add in the matvec's stores in decode passes.
+bool MatVecAdd(const Tensor& w, const float* x, const float* add, float* y,
+               std::uint32_t m, std::uint32_t k, std::uint32_t n,
+               const Exec& ex, std::string* error);
+
 /// A batched y = W x on the FP16 kernels (hy4_f16_dense, io as there) for a
 /// quantized W [m][k] with k % 256 == 0 and m % 16 == 0; fails otherwise.
 bool DenseF16(const Tensor& w, const void* x, void* y, std::uint32_t m,

@@ -12,6 +12,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kernels/rocm/hy4_kernels.h"
@@ -341,8 +342,8 @@ void TestHyperConnections() {
 // hy4_hc_decode: bit-identical to the kernels it replaces (rms_norm of y,
 // hc_post_pre or hc_pre, rms_norm of the mix) at the model's width, with and
 // without the post, norm weights and post output, for 1, 3 and 11 tokens.
-void TestHcDecode() {
-  const uint32_t hc = 4, dim = 3072, flat = hc * dim;
+void TestHcDecodeShape(uint32_t hc, uint32_t dim) {
+  const uint32_t flat = hc * dim;
   const float eps = 1e-6f, hc_eps = 1e-6f, magnitude = 2.0f;
   const auto scale = Random(2, 0.5f, 1.5f);
   const auto base = Random(2 * hc);
@@ -352,8 +353,10 @@ void TestHcDecode() {
       for (bool layer : {true, false})
         for (bool weights : {true, false}) {
           const std::string what =
-              "hc_decode n=" + std::to_string(n) + (with_y ? " post" : "") +
-              (layer ? " layer" : " head") + (weights ? " weights" : "");
+              "hc_decode hc=" + std::to_string(hc) +
+              " dim=" + std::to_string(dim) + " n=" + std::to_string(n) +
+              (with_y ? " post" : "") + (layer ? " layer" : " head") +
+              (weights ? " weights" : "");
           const uint32_t n_mix = layer ? 2 * hc : hc;
           const auto fn = Random(n_mix * flat, -0.1f, 0.1f);
           const auto h = Random(n * flat, -2, 2), y = Random(n * dim, -3, 3);
@@ -396,6 +399,13 @@ void TestHcDecode() {
                  what + " post identical");
           Expect(Host(y_b, n * dim) == y, what + " leaves y");
         }
+}
+
+// The model's shape (the fast kernels), and two the general ones take.
+void TestHcDecode() {
+  TestHcDecodeShape(4, 3072);
+  TestHcDecodeShape(3, 96);
+  TestHcDecodeShape(4, 3500);
 }
 
 void TestGemv() {
@@ -624,6 +634,54 @@ std::vector<double> MlaReference(const std::vector<float>& q,
 // wrapping the ring, and selections with empty, future and repeated slots.
 // A token's result is bitwise the same alone or in a pass, and selecting
 // every visible key gives the causal result bitwise.
+// The decode MLA's fused prep and query rope: bit for bit what the norms,
+// ropes and copy they replace compute, with 1-D and 3-D positions.
+void TestMlaPrep() {
+  const uint32_t n = 3, q_lora = 1024, kv_lora = 512, n_rot = 64,
+                 dk = kv_lora + n_rot, heads = 8, head_k = 192,
+                 nope = head_k - n_rot;
+  const float base = 10000.0f, eps = 1e-6f;
+  const std::vector<int32_t> pos = {5, 900, 70000};
+  const std::vector<int32_t> hw = {1, 2, 30, 40, 7, 9};
+  const auto qn = Random(q_lora, 0.5f, 1.5f), kn = Random(kv_lora, 0.5f, 1.5f);
+  for (bool three_d : {false, true}) {
+    const int32_t* dhw = three_d ? Device(hw) : nullptr;
+    const auto qr = Random(n * q_lora, -3, 3), kva = Random(n * dk, -3, 3);
+    float *qa = Device(qr), *ka = Device(kva), *qb = Device(qr),
+          *kb = Device(kva);
+    bool ok =
+        hy4_rms_norm(qa, Device(qn), qa, n, q_lora, q_lora, eps, nullptr) ==
+            0 &&
+        hy4_rms_norm(ka, Device(kn), ka, n, kv_lora, dk, eps, nullptr) == 0 &&
+        hy4_rope_3d(ka, Device(pos), dhw, n, 1, dk, 0, kv_lora, n_rot, base,
+                    nullptr) == 0;
+    ok &= hy4_mla_prep(qb, Device(qn), q_lora, kb, Device(kn), kv_lora, dk,
+                       Device(pos), dhw, n_rot, base, eps, n, nullptr) == 0;
+    Expect(ok, "mla_prep status");
+    Expect(Host(qa, n * q_lora) == Host(qb, n * q_lora),
+           std::string("mla_prep query latent") + (three_d ? " 3-D" : ""));
+    Expect(Host(ka, n * dk) == Host(kb, n * dk),
+           std::string("mla_prep key latent") + (three_d ? " 3-D" : ""));
+
+    const auto q = Random(n * heads * head_k, -3, 3);
+    const auto full = Random(n * heads * dk);
+    float *q1 = Device(q), *q2 = Device(q), *f1 = Device(full),
+          *f2 = Device(full);
+    ok = hy4_rope_3d(q1, Device(pos), dhw, n, heads, heads * head_k, head_k,
+                     nope, n_rot, base, nullptr) == 0 &&
+         hy4_copy_2d(f1 + kv_lora, dk, q1 + nope, head_k, n_rot, n * heads,
+                     nullptr) == 0;
+    ok &= hy4_rope_3d_copy(q2, Device(pos), dhw, n, heads, heads * head_k,
+                           head_k, nope, n_rot, base, f2 + kv_lora, heads * dk,
+                           dk, nullptr) == 0;
+    Expect(ok, "rope_3d_copy status");
+    Expect(Host(q1, n * heads * head_k) == Host(q2, n * heads * head_k),
+           std::string("rope_3d_copy rows") + (three_d ? " 3-D" : ""));
+    Expect(Host(f1, n * heads * dk) == Host(f2, n * heads * dk),
+           std::string("rope_3d_copy copies") + (three_d ? " 3-D" : ""));
+  }
+}
+
 void TestMlaAttention() {
   const uint32_t dk = 576, dv = 512, ring = 2600;
   const float scale = 1.0f / 16.0f;
@@ -1102,6 +1160,28 @@ void TestRoute() {
     Near(Host(weights, n * k), want_w, 1e-6,
          std::string("route weights") + (norm ? "" : " unnormalized"));
   }
+  // Ties pick the lowest index first; 512 experts, the model's count, and
+  // 16 picks. Logits take 24 distinct values, so every pick ties.
+  {
+    const uint32_t ne = 512, kk = 16;
+    std::vector<float> tied(ne);
+    for (uint32_t e = 0; e < ne; ++e)
+      tied[e] = (float)((e * 7) % 24) / 8.0f - 1.5f;
+    int32_t* ids = Device(std::vector<int32_t>(kk));
+    float* weights = Device(std::vector<float>(kk));
+    Expect(hy4_route(Device(tied), nullptr, ids, weights, 1, ne, kk, 1, 1.0f,
+                     nullptr) == 0,
+           "route ties status");
+    std::vector<int32_t> order(ne);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](int32_t x, int32_t y) { return tied[x] > tied[y]; });
+    order.resize(kk);
+    Expect(Host(ids, kk) == order, "route ties pick the lowest index");
+  }
+  Expect(hy4_route(nullptr, nullptr, nullptr, nullptr, 1, 8, 9, 1, 1.0f,
+                   nullptr) != 0,
+         "route rejects k > experts");
 }
 
 void TestEngram() {
@@ -1641,9 +1721,45 @@ void TestDecodeGemv() {
         Near(Host(y, cols * m1), want, 1e-6,
              name + " swiglu n=" + std::to_string(cols) +
                  " limit=" + std::to_string(limit));
+        // As hy4_gemv's gate and up then hy4_swiglu compute it.
+        float* s2 = Device(std::vector<float>(cols * m1));
+        Expect(hy4_swiglu(b1, u, nullptr, s2, cols, m1, limit, nullptr) == 0,
+               name + " swiglu reference status");
+        Expect(Host(y, cols * m1) == Host(s2, cols * m1),
+               name + " swiglu equals hy4_swiglu n=" + std::to_string(cols));
       }
     }
   }
+  for (int type : {HY4_TYPE_Q8_0, HY4_TYPE_Q4_K, HY4_TYPE_Q6_K})
+    for (uint32_t n : {1u, 2u, 6u, 16u}) {  // the lane and split layouts
+      const uint32_t m = 96;
+      const auto wq = RandomQuant(type, m, k);
+      const auto x = Random(n * k), add = Random(n * m);
+      float *a = Device(std::vector<float>(n * m)),
+            *b = Device(std::vector<float>(n * m));
+      Expect(hy4_gemv(type, Device(wq), Device(x), a, m, k, n, scratch,
+                      nullptr) == 0 &&
+                 hy4_add(a, Device(add), a, n * m, nullptr) == 0 &&
+                 hy4_gemv_add(type, Device(wq), Device(x), Device(add), b, m, k,
+                              n, scratch, nullptr) == 0,
+             "gemv_add status");
+      Expect(Host(a, n * m) == Host(b, n * m),
+             "gemv_add equals gemv then add, type " + std::to_string(type) +
+                 " n=" + std::to_string(n));
+      // The gate mode: y *= sigmoid(W x), as hy4_sigmoid_mul scales it.
+      const auto y0 = Random(n * m, -2, 2);
+      float *g = Device(std::vector<float>(n * m)), *ya = Device(y0),
+            *yb = Device(y0);
+      Expect(hy4_gemv(type, Device(wq), Device(x), g, m, k, n, scratch,
+                      nullptr) == 0 &&
+                 hy4_sigmoid_mul(ya, g, n * m, nullptr) == 0 &&
+                 hy4_gemv_gate(type, Device(wq), Device(x), yb, m, k, n,
+                               scratch, nullptr) == 0,
+             "gemv_gate status");
+      Expect(Host(ya, n * m) == Host(yb, n * m),
+             "gemv_gate equals gemv then sigmoid_mul, type " +
+                 std::to_string(type) + " n=" + std::to_string(n));
+    }
   Expect(hy4_gemv(HY4_TYPE_Q8_0, nullptr, nullptr, nullptr, 32, 96, 1, scratch,
                   nullptr) != 0,
          "gemv rejects k % 256");
@@ -1941,6 +2057,7 @@ int main() {
   TestHcDecode();
   TestGemv();
   TestRope();
+  TestMlaPrep();
   TestMlaAttention();
   TestMlaPrefill();
   TestRows();
