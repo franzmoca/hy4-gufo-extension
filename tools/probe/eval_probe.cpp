@@ -13,7 +13,9 @@
 // scores like llama-perplexity -c N: chunks of N tokens in fresh sessions,
 // the second half of each chunk scored. --kl BASE reads a llama-perplexity
 // --kl-divergence-base file (its tokens and log-probabilities) and reports
-// the KL divergence from it, the same-top-token rate and the perplexity.
+// the KL divergence from it, the same-top-token rate and the perplexity;
+// --kl-decode BASE scores the same way with the scored half run as one-token
+// decoding passes.
 
 #include <algorithm>
 #include <chrono>
@@ -95,6 +97,7 @@ int main(int argc, char** argv) {
   std::string logits_path;
   std::uint32_t ppl = 0;
   std::string kl_path;
+  bool kl_decode = false;
   std::uint32_t passcheck = 0;
   std::uint32_t batchcheck = 0;
   std::uint32_t chunkcheck = 0;
@@ -107,7 +110,11 @@ int main(int argc, char** argv) {
     else if (a == "--logits") logits_path = argv[i + 1];
     else if (a == "--ppl") ppl = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--kl") kl_path = argv[i + 1];
-    else if (a == "--passcheck") passcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--kl-decode") {
+      kl_path = argv[i + 1];
+      kl_decode = true;
+    } else if (a == "--passcheck")
+      passcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--batchcheck")
       batchcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--chunkcheck") chunkcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
@@ -407,12 +414,16 @@ int main(int argc, char** argv) {
       const std::size_t first = n_ctx / 2;
       double chunk_kl = 0.0;
       std::size_t chunk_n = 0;
-      for (std::size_t i = 0; i < n_ctx; i += model->MaxChunk()) {
-        const std::size_t n =
-            std::min<std::size_t>(model->MaxChunk(), n_ctx - i);
+      for (std::size_t i = 0, n = 0; i < n_ctx; i += n) {
+        // Prompt passes, as serving prefills text; with --kl-decode, one
+        // token per decoding pass from the scored half on.
+        const bool decode = kl_decode && i >= first;
+        n = decode      ? 1
+            : kl_decode ? std::min<std::size_t>(model->MaxChunk(), first - i)
+                        : std::min<std::size_t>(model->MaxChunk(), n_ctx - i);
         const bool need = i + n > first;
-        // Prompt passes, as serving prefills text.
-        if (!s->Evaluate(std::span<const std::int32_t>(ct + i, n), need ? &logits : nullptr, true, &error, true)) {
+        if (!s->Evaluate(std::span<const std::int32_t>(ct + i, n),
+                         need ? &logits : nullptr, true, &error, !decode)) {
           std::fprintf(stderr, "kl failed: %s\n", error.c_str());
           return 1;
         }

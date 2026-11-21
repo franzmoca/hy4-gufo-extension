@@ -1493,6 +1493,28 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex,
               error))
     return false;
+  // FP32 expert GEMVs: SwiGLU(gate, up) times the route weight, then down.
+  // A verify pass reads each expert's rows once and gives every slot the
+  // bits of one-token decoding.
+  const auto fp32_type = [](int type) {
+    return type == HY4_TYPE_Q8_0 || type == HY4_TYPE_Q4_K ||
+           type == HY4_TYPE_Q6_K;
+  };
+  if (l.gate_exps.type == l.up_exps.type && fp32_type(l.gate_exps.type) &&
+      fp32_type(l.down_exps.type) && c.n_latent % 256 == 0 && f % 256 == 0) {
+    const std::uint32_t slots = n * used;
+    HY4_CHECK(hy4_gemv_experts(
+        l.gate_exps.type, l.gate_exps.data, l.up_exps.data,
+        ExpertBytes(l.gate_exps), s.latent, used, s.ids, s.route_w,
+        c.swiglu_clamp[il], s.ffn_c, f, c.n_latent, slots, n, st));
+    HY4_CHECK(hy4_gemv_experts(l.down_exps.type, l.down_exps.data, nullptr,
+                               ExpertBytes(l.down_exps), s.ffn_c, 1, s.ids,
+                               nullptr, 0.0f, s.ffn_a, c.n_latent, f, slots, n,
+                               st));
+    HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
+    return MatVecAdd(l.routed_up, s.moe, s.shared, s.y, c.n_embd, c.n_latent, n,
+                     ex, error);
+  }
   // A verify pass must compute what one-token decoding would. The shared
   // kernels give each slot the one-token launches' arithmetic and read each
   // expert's rows once for the pass (consecutive tokens share about a third
