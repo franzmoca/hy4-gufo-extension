@@ -66,6 +66,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E58 | FP32 routed experts in two launches | retained |
 | E59 | Grouped Q8_0 decode rows read as whole blocks | retained |
 | E60 | Decode time after E59 | analysis |
+| E61 | Vision tower GEMMs on hipBLASLt | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1414,3 +1415,39 @@ Retained.
 
 Not tried yet: a quantized head (a quality trade-off), the boundary kernels
 folded into the next GEMV's start, and sampling on the device.
+
+## E61: Vision tower GEMMs on hipBLASLt (2026-11-21)
+
+At 2048² (16,384 patches) the encode took 4.8 s: 2.3 s in the hipBLAS GEMMs,
+1.9 s in attention, 0.6 s in conversions, bias, residual and norms. On
+gfx1151 hipBLAS has no matrix-core kernel for binary16 operands with an FP32
+result and runs a scalar one at about 6 TFLOPS (E5's "non-WMMA kernel").
+hipBLASLt's first heuristic choice is the same kernel, but its fifth reaches
+28 to 39 TFLOPS from 1,024 to 16,384 rows, on every tower shape, with the same
+arithmetic (binary16 operands, FP32 accumulation and result). Gufo's
+EmbeddingGemma 2 encoder found the same and times the candidates.
+
+`VisionGemm` (`runtime/hy4_vision_gemm.cpp`) times each shape's candidates
+once at load, on 1,024 rows, and uses the winner at any row count it
+supports (`matmulIsAlgoSupported`), hipBLAS otherwise; all seven shapes pick
+the same solution. The bias runs as hipBLASLt's epilogue and the residual
+adds as `beta = 1`, and layer norm, attention and GELU (`erf`; hipBLASLt's
+epilogue GELU is the tanh form) write the binary16 the next GEMM reads, so
+the separate conversion, bias and residual passes are gone with the
+rounding points unchanged.
+
+| image | encode before | after | first token before | after |
+| --- | --- | --- | --- | --- |
+| 1024² | 0.80 s | 0.30 s | | |
+| 1920×1088 | 1.78 s | 0.77 s | 4.9 s | 3.3 s |
+| 2048² | 4.79 s | 2.68 s | 9.6 s | 7.5 s |
+| 4032×3024 photo (2336×1760) | | 1.88 s | 8.9 s | 6.7 s |
+
+Each GEMM matches a float64 product within 2e-5 of its range on every shape
+at 48 to 3,000 rows (`vision_kernels`). Against Transformers
+([QUALITY.md](QUALITY.md#vision)) the tower is as close as before: 12 small
+images give a geometric mean of 6.5e-4 relative RMS with hipBLASLt and 6.9e-4
+with hipBLAS, hipBLASLt the worse on 5 of 12. Retained. The first token is
+now half the language model's prefill of the image rows; attention (1.9 s of
+the 2.7 s at 2048², about 17 TFLOPS) is the tower's remaining cost.
+

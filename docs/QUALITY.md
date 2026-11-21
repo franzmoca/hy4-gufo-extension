@@ -59,21 +59,34 @@ between drafter arms.
 
 ## Vision
 
-There is no reference implementation for this projector type in llama.cpp,
-and Transformers has no `hy_v4_flash` model. The gate is a float64 numpy
-transcription of Transformers' `HYV4VLVisionModel` (the same tower and merger)
-run on the GGUF's weights, compared with `hy4_vision_probe` rows:
+The reference is Tencent's Transformers implementation (PR #50903, the
+branch `tools/oracle/reference.py` runs): `HYV4VLImageProcessorPil`, which
+resizes with PIL's bicubic as Tencent's original code does, and
+`HYV4VLVisionModel`, which `HYV4Flash` builds its tower from, run in float64
+on the CPU with the mmproj GGUF's weights and the checkpoint's
+`processor_config.json` (mean and std 0.5, 4,096 to 4,194,304 pixels).
+`tools/oracle/vision_reference.py` writes its rows and the processed image;
+`hy4_vision_probe` encodes that image, or any image file preprocessed as
+prompts are.
 
-| image | patches | FP32 tower | binary16 tower (current) |
-| --- | --- | --- | --- |
-| synthetic 128×96 | 48 | rel. RMS 1.0e-5 | 6.2e-4 |
-| synthetic 352×320 | 440 | 6.4e-6 | 1.3e-3 |
-| owl logo 2048² (against the FP32 tower) | 16,384 | — | 1.1e-3, min cosine 0.99998 |
+| check | result |
+| --- | --- |
+| tower, same pixels: 128×96 (48 patches), 352×320 (440) | relative RMS 1.2e-3, 1.5e-3 |
+| tower, same pixels: 12 images of 48 to 160 patches | geometric mean 6.5e-4 |
+| resize: 1080p and 12 MP JPEG, 1024² PNG, 1000×700, 50×40 (upscaled) | same sizes; 99.7 to 100% of pixels equal, the rest off by 1 |
+| image file to rows: 1000×700 (2,816 patches), 50×40 | 2.4e-3, 6.2e-4 (min cosine 0.99994) |
+
+The float64 transcription that was the gate before agrees with Transformers
+to 1e-7. Above a few thousand patches the float64 tower is too large to run,
+so the 2048² owl logo is compared with the FP32 GPU tower of E4: 1.2e-3, min
+cosine 0.99998. The weights come from the GGUF, so this checks the engine,
+not the conversion.
 
 End to end, the 2048² owl logo is described correctly at full size and at
-`detail: low`, and llama.cpp's matmul diagram (2875×1500) is transcribed
-exactly, axis labels included. The image positions (M-RoPE) and Engram
-treatment follow decision 19; their only check is these answers.
+`detail: low`, two shapes are placed in the right quadrants, and llama.cpp's
+matmul diagram (2875×1500) was transcribed exactly, axis labels included. The
+image positions (M-RoPE) and Engram treatment follow decision 19; their only
+check is these answers.
 
 ## Reproducibility
 

@@ -41,12 +41,23 @@ __device__ float BlockReduce(float v, float* scratch, bool max) {
   return scratch[0];
 }
 
+__device__ __forceinline__ _Float16 ToHalf(float v) {
+  return static_cast<_Float16>(fminf(fmaxf(v, -65504.0f), 65504.0f));
+}
+
+__device__ __forceinline__ void Store(float* y, float v) {
+  *y = v;
+}
+__device__ __forceinline__ void Store(_Float16* y, float v) {
+  *y = ToHalf(v);
+}
+
+template<typename Out>
 __global__ void LayerNorm(const float* x, const float* weight,
-                          const float* bias, float* y, uint32_t dim,
-                          float eps) {
+                          const float* bias, Out* y, uint32_t dim, float eps) {
   __shared__ float scratch[32];
   const float* xr = x + (uint64_t)blockIdx.x * dim;
-  float* yr = y + (uint64_t)blockIdx.x * dim;
+  Out* yr = y + (uint64_t)blockIdx.x * dim;
   float sum = 0.0f;
   for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
     sum += xr[i];
@@ -59,7 +70,7 @@ __global__ void LayerNorm(const float* x, const float* weight,
   const float scale =
       rsqrtf(BlockReduce(var, scratch, false) / (float)dim + eps);
   for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
-    yr[i] = (xr[i] - mean) * scale * weight[i] + bias[i];
+    Store(&yr[i], (xr[i] - mean) * scale * weight[i] + bias[i]);
 }
 
 __global__ void Bias(float* y, const float* bias, uint64_t count, uint32_t dim,
@@ -73,11 +84,11 @@ __global__ void Bias(float* y, const float* bias, uint64_t count, uint32_t dim,
   }
 }
 
-__global__ void Residual(float* x, const float* y, const float* bias,
-                         uint64_t count, uint32_t dim) {
+__global__ void GeluHalf(const float* y, _Float16* out, uint64_t count) {
   for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < count;
        i += (uint64_t)gridDim.x * blockDim.x) {
-    x[i] += y[i] + (bias ? bias[i % dim] : 0.0f);
+    const float v = y[i];
+    out[i] = ToHalf(0.5f * v * (1.0f + erff(v * 0.70710678118654752f)));
   }
 }
 
@@ -126,10 +137,6 @@ constexpr uint32_t kKeyTile = 64;
 using Half16 = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using Float8 = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
-__device__ __forceinline__ _Float16 ToHalf(float v) {
-  return static_cast<_Float16>(fminf(fmaxf(v, -65504.0f), 65504.0f));
-}
-
 // q, k [head][padded][80] and vt [head][80][padded] from FP32 rows; the
 // padding is zeroed by the caller.
 __global__ void AttnPack(const float* q, const float* k, const float* v,
@@ -170,7 +177,7 @@ __device__ __forceinline__ Half16 LoadHalf16(const _Float16* p) {
 // L%16.
 __global__ void __launch_bounds__(32 * kAttentionWaves)
     FusedAttention(const _Float16* q, const _Float16* k, const _Float16* vt,
-                   float* out, uint32_t count, uint32_t padded) {
+                   _Float16* out, uint32_t count, uint32_t padded) {
   __shared__ __align__(16) _Float16 p_lds[kAttentionWaves][16][kKeyTile + 8];
   const uint32_t lane = threadIdx.x % 32;
   const uint32_t wave = threadIdx.x / 32;
@@ -268,7 +275,8 @@ __global__ void __launch_bounds__(32 * kAttentionWaves)
     for (uint32_t i = 0; i < 8; ++i) {
       const uint32_t token = q0 + 2 * i + half;
       if (token < count && d < kHeadDim) {
-        out[(uint64_t)token * kHidden + head * kHeadDim + d] = acc[c][i] / l[i];
+        out[(uint64_t)token * kHidden + head * kHeadDim + d] =
+            ToHalf(acc[c][i] / l[i]);
       }
     }
   }
@@ -289,7 +297,7 @@ uint32_t hy4_vis_attn_padded(uint32_t count) {
 
 int hy4_vis_attention(const float* q, const float* k, const float* v,
                       float scale, uint16_t* qh, uint16_t* kh, uint16_t* vt,
-                      float* out, uint32_t count, hipStream_t stream) {
+                      uint16_t* out, uint32_t count, hipStream_t stream) {
   if (count == 0)
     return 0;
   const uint32_t padded = hy4_vis_attn_padded(count);
@@ -306,8 +314,8 @@ int hy4_vis_attention(const float* q, const float* k, const float* v,
       q, k, v, scale, q16, k16, v16, count, padded);
   const uint32_t per_block = 16 * kAttentionWaves;
   FusedAttention<<<dim3((count + per_block - 1) / per_block, kHeads),
-                   32 * kAttentionWaves, 0, stream>>>(q16, k16, v16, out, count,
-                                                      padded);
+                   32 * kAttentionWaves, 0, stream>>>(
+      q16, k16, v16, reinterpret_cast<_Float16*>(out), count, padded);
   return Status();
 }
 
@@ -329,21 +337,31 @@ int hy4_vis_layer_norm(const float* x, const float* weight, const float* bias,
   return Status();
 }
 
+int hy4_vis_layer_norm_half(const float* x, const float* weight,
+                            const float* bias, uint16_t* y, uint32_t rows,
+                            uint32_t dim, float eps, hipStream_t stream) {
+  if (rows == 0)
+    return 0;
+  LayerNorm<<<rows, kThreads, 0, stream>>>(
+      x, weight, bias, reinterpret_cast<_Float16*>(y), dim, eps);
+  return Status();
+}
+
+int hy4_vis_gelu_half(const float* y, uint16_t* out, uint64_t count,
+                      hipStream_t stream) {
+  if (count == 0)
+    return 0;
+  GeluHalf<<<Blocks(count), kThreads, 0, stream>>>(
+      y, reinterpret_cast<_Float16*>(out), count);
+  return Status();
+}
+
 int hy4_vis_bias(float* y, const float* bias, uint32_t rows, uint32_t dim,
                  int gelu, hipStream_t stream) {
   const uint64_t count = (uint64_t)rows * dim;
   if (count == 0)
     return 0;
   Bias<<<Blocks(count), kThreads, 0, stream>>>(y, bias, count, dim, gelu);
-  return Status();
-}
-
-int hy4_vis_residual(float* x, const float* y, const float* bias, uint32_t rows,
-                     uint32_t dim, hipStream_t stream) {
-  const uint64_t count = (uint64_t)rows * dim;
-  if (count == 0)
-    return 0;
-  Residual<<<Blocks(count), kThreads, 0, stream>>>(x, y, bias, count, dim);
   return Status();
 }
 

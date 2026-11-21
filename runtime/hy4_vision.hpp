@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include "runtime/hy4_vision_gemm.hpp"
+
 namespace gufo::models::hy4_flash {
 
 /// Device rows [rows][width] of FP32 language-model input embeddings.
@@ -49,6 +51,11 @@ public:
   /// SHA-256 (hex) of the GGUF file, computed once.
   [[nodiscard]] const std::string& Identity() const;
   [[nodiscard]] std::uint64_t ResidentBytes() const { return resident_bytes_; }
+  /// GEMM shapes on hipBLASLt, of kGemmShapes; the rest use hipBLAS.
+  [[nodiscard]] std::size_t LtGemmShapes() const {
+    return gemm_->TunedShapes();
+  }
+  static constexpr std::size_t kGemmShapes = 7;
 
   /// Encodes RGB8 pixels [height][width][3]; both sides multiples of
   /// kFactor. Calls are serialized by the caller.
@@ -59,16 +66,13 @@ public:
 private:
   struct Layer;
   VisionEncoder() = default;
-  bool Linear(const std::uint16_t* w, const float* x, float* y,
-              std::uint32_t rows, std::uint32_t out, std::uint32_t in,
-              std::string* error);
 
   std::string path_;
   mutable std::once_flag identity_once_;
   mutable std::string identity_;
   std::uint32_t out_width_ = 0;
   hipStream_t stream_ = nullptr;
-  void* blas_ = nullptr;  // hipblasHandle_t
+  std::unique_ptr<VisionGemm> gemm_;
   std::vector<Layer> layers_;
   // Matrices are binary16 bits.
   const std::uint16_t* patch_w_ = nullptr;  // [hidden][3 * kPatch * kPatch]
@@ -81,7 +85,6 @@ private:
   const std::uint16_t* proj_w_ = nullptr;  // [out_width][4 hidden]
   const float* proj_b_ = nullptr;
   const float* newline_ = nullptr;  // [out_width]
-  std::uint16_t* xh_ = nullptr;     // Encode's binary16 GEMM input
   std::vector<void*> allocations_;
   std::uint64_t resident_bytes_ = 0;
 };

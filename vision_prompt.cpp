@@ -66,6 +66,14 @@ ImageSize SmartResize(std::uint32_t width, std::uint32_t height,
   return {static_cast<std::uint32_t>(w), static_cast<std::uint32_t>(h)};
 }
 
+core::Image PrepareImage(std::span<const std::uint8_t> bytes, bool low_detail) {
+  const core::Image decoded = core::DecodeImage(bytes);
+  const ImageSize size =
+      SmartResize(decoded.width, decoded.height, kMinPixels,
+                  low_detail ? kLowDetailPixels : kMaxPixels);
+  return ResizeBicubic(decoded, size.width, size.height);
+}
+
 std::span<const std::uint8_t> ImagePrompt::IdentityForPrefix(
     std::size_t token_count) const {
   for (auto image = images.rbegin(); image != images.rend(); ++image) {
@@ -131,17 +139,12 @@ ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
     cursor = offsets[i];
     if (!parts[i]->bytes)
       throw std::invalid_argument("image part has no data");
-    const core::Image decoded = core::DecodeImage(*parts[i]->bytes);
-    const std::uint64_t max_pixels =
-        parts[i]->detail == ext::ChatMessage::ImageDetail::kLow
-            ? kLowDetailPixels
-            : kMaxPixels;
-    const ImageSize size =
-        SmartResize(decoded.width, decoded.height, kMinPixels, max_pixels);
-    core::Image pixels = ResizeBicubic(decoded, size.width, size.height);
+    core::Image pixels =
+        PrepareImage(*parts[i]->bytes,
+                     parts[i]->detail == ext::ChatMessage::ImageDetail::kLow);
     const ImageSpan span{static_cast<std::uint32_t>(prompt.tokens.size() + 1),
-                         size.height / VisionEncoder::kFactor,
-                         size.width / VisionEncoder::kFactor};
+                         pixels.height / VisionEncoder::kFactor,
+                         pixels.width / VisionEncoder::kFactor};
     if (std::size_t{span.Rows()} + 2 >
         max_context -
             std::min<std::size_t>(max_context, prompt.tokens.size())) {

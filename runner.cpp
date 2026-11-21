@@ -1097,8 +1097,12 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
     }
     vision = std::move(loaded_vision);
     model->SetImageToken(tokenizer->Find(Hy4Tokens::kImagePad));
-    server::Logger::Info("loader", "event=hy4_vision_loaded resident_bytes=" +
-                                       std::to_string(vision->ResidentBytes()));
+    server::Logger::Info(
+        "loader",
+        "event=hy4_vision_loaded resident_bytes=" +
+            std::to_string(vision->ResidentBytes()) +
+            " hipblaslt_gemm_shapes=" + std::to_string(vision->LtGemmShapes()) +
+            "/" + std::to_string(VisionEncoder::kGemmShapes));
   }
   std::string model_fingerprint = options.disk_cache.model_artifact_fingerprint;
   try {

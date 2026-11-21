@@ -1,7 +1,9 @@
 // The vision tower kernels (kernels/rocm/hy4_vision.h) against double
 // precision host references: norms, GELU, the merger's gather and newline
-// layout, binary16 conversion, and the fused attention over counts that are
-// and are not whole key tiles.
+// layout, binary16 conversion, the fused attention over counts that are
+// and are not whole key tiles, and the tower's GEMMs (runtime/hy4_vision_gemm)
+// on their shapes and with their bias and accumulation, at row counts other
+// than the one their algorithm was timed on.
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -14,6 +16,7 @@
 #include <vector>
 
 #include "kernels/rocm/hy4_vision.h"
+#include "runtime/hy4_vision_gemm.hpp"
 
 namespace {
 
@@ -95,6 +98,13 @@ double HalfValue(uint16_t h) {
   return h & 0x8000 ? -v : v;
 }
 
+std::vector<float> FromHalf(const uint16_t* device, std::size_t count) {
+  std::vector<float> out;
+  for (const uint16_t h : Host(device, count))
+    out.push_back((float)HalfValue(h));
+  return out;
+}
+
 void TestRows() {
   const uint32_t rows = 7, dim = 1152;
   const auto x = Random(rows * dim, -4, 6);
@@ -118,6 +128,20 @@ void TestRows() {
           (x[r * dim + c] - mean) / std::sqrt(var + 1e-5) * w[c] + b[c];
   }
   Near(Host(y, rows * dim), want, 2e-6, "layer_norm");
+  // Into binary16: rounding, at most 2^-11 of the largest value.
+  uint16_t* yh = Device(std::vector<uint16_t>(rows * dim));
+  Expect(hy4_vis_layer_norm_half(Device(x), Device(w), Device(b), yh, rows, dim,
+                                 1e-5f, nullptr) == 0,
+         "layer_norm_half status");
+  Near(FromHalf(yh, rows * dim), want, 5e-4, "layer_norm_half");
+
+  uint16_t* gh = Device(std::vector<uint16_t>(rows * dim));
+  Expect(hy4_vis_gelu_half(Device(x), gh, rows * dim, nullptr) == 0,
+         "gelu_half status");
+  std::vector<double> want_gelu(rows * dim);
+  for (uint32_t i = 0; i < rows * dim; ++i)
+    want_gelu[i] = Gelu(x[i]);
+  Near(FromHalf(gh, rows * dim), want_gelu, 5e-4, "gelu_half");
 
   for (int gelu : {0, 1}) {
     float* z = Device(x);
@@ -129,19 +153,6 @@ void TestRows() {
       want_bias[i] = gelu ? Gelu(v) : v;
     }
     Near(Host(z, rows * dim), want_bias, 1e-6, gelu ? "bias gelu" : "bias");
-  }
-
-  const auto y2 = Random(rows * dim);
-  for (bool with_bias : {true, false}) {
-    float* r = Device(x);
-    Expect(hy4_vis_residual(r, Device(y2), with_bias ? Device(b) : nullptr,
-                            rows, dim, nullptr) == 0,
-           "residual status");
-    std::vector<double> want_res(rows * dim);
-    for (uint32_t i = 0; i < rows * dim; ++i)
-      want_res[i] = (double)x[i] + y2[i] + (with_bias ? b[i % dim] : 0.0);
-    Near(Host(r, rows * dim), want_res, 1e-6,
-         with_bias ? "residual" : "residual without bias");
   }
 }
 
@@ -216,7 +227,7 @@ void TestAttention() {
         (std::size_t)kHeads * 80 * hy4_vis_attn_padded(count);
     // Scratch starts dirty: the kernel must clear its own padding.
     std::vector<uint16_t> dirty(halves, 0x3c00);
-    float* out = Device(std::vector<float>(count * kHidden));
+    uint16_t* out = Device(std::vector<uint16_t>(count * kHidden));
     Expect(hy4_vis_attention(Device(q), Device(k), Device(v), scale,
                              Device(dirty), Device(dirty), Device(dirty), out,
                              count, nullptr) == 0,
@@ -242,9 +253,84 @@ void TestAttention() {
                 s[j] / den * v[j * kHidden + h * kHeadDim + c];
       }
     // Binary16 operands and probabilities: about 1e-3 of the output range.
-    Near(Host(out, count * kHidden), want, 4e-3,
+    Near(FromHalf(out, count * kHidden), want, 4e-3,
          "attention count " + std::to_string(count));
   }
+}
+
+void TestGemm() {
+  struct Shape {
+    uint32_t out, in;
+    bool bias, accumulate;
+  };
+  // patch embedding, q/k/v, attention output, MLP up and down, merger.
+  const Shape shapes[] = {{1152, 768, true, true},  {1152, 1152, true, false},
+                          {1152, 1152, true, true}, {4304, 1152, true, false},
+                          {1152, 4304, true, true}, {4608, 4608, true, false},
+                          {3072, 4608, true, false}};
+  std::string error;
+  auto gemm = gufo::models::hy4_flash::VisionGemm::Create(nullptr, &error);
+  Expect(gemm != nullptr, "VisionGemm::Create: " + error);
+  if (!gemm)
+    return;
+  for (const Shape& s : shapes) {
+    // Binary16 operands; values chosen so the products are exact in FP32.
+    std::vector<uint16_t> w(std::size_t{s.out} * s.in);
+    std::vector<double> wd(w.size());
+    for (std::size_t i = 0; i < w.size(); ++i) {
+      const _Float16 h = (_Float16)Random(1, -0.05f, 0.05f)[0];
+      std::memcpy(&w[i], &h, 2);
+      wd[i] = (double)h;
+    }
+    const auto bias = Random(s.out, -1, 1);
+    uint16_t* w_dev = Device(w);
+    const float* bias_dev = Device(bias);
+    Expect(gemm->Tune(w_dev, s.out, s.in, bias_dev, s.accumulate, 1024, &error),
+           "tune: " + error);
+    for (const uint32_t rows : {48u, 440u, 1024u, 3000u}) {
+      std::vector<uint16_t> x(std::size_t{rows} * s.in);
+      std::vector<double> xd(x.size());
+      for (std::size_t i = 0; i < x.size(); ++i) {
+        const _Float16 h = (_Float16)Random(1, -1, 1)[0];
+        std::memcpy(&x[i], &h, 2);
+        xd[i] = (double)h;
+      }
+      const auto c = Random(std::size_t{rows} * s.out, -4, 4);
+      float* y = Device(s.accumulate ? c : std::vector<float>(c.size()));
+      Expect(gemm->Run(w_dev, Device(x), y, bias_dev,
+                       s.accumulate ? y : nullptr, rows, s.out, s.in, &error),
+             "gemm: " + error);
+      // Every seventh row and the last: all tile positions, at a seventh of
+      // the host reference's cost.
+      const auto all = Host(y, c.size());
+      std::vector<float> got;
+      std::vector<double> want;
+      std::vector<uint32_t> checked;
+      for (uint32_t r = 0; r < rows; r += 7)
+        checked.push_back(r);
+      if (checked.back() != rows - 1)
+        checked.push_back(rows - 1);
+      for (const uint32_t r : checked) {
+        for (uint32_t o = 0; o < s.out; ++o) {
+          double sum =
+              bias[o] + (s.accumulate ? c[std::size_t{r} * s.out + o] : 0.0);
+          for (uint32_t k = 0; k < s.in; ++k)
+            sum +=
+                xd[std::size_t{r} * s.in + k] * wd[std::size_t{o} * s.in + k];
+          want.push_back(sum);
+          got.push_back(all[std::size_t{r} * s.out + o]);
+        }
+      }
+      // FP32 accumulation: about 1e-6 of the range. Binary16 rounding of the
+      // result or of c would show as 2^-11.
+      Near(got, want, 2e-5,
+           "gemm " + std::to_string(s.out) + "x" + std::to_string(s.in) +
+               (s.accumulate ? " +c" : "") + " rows " + std::to_string(rows));
+    }
+  }
+  // The fallback is exact too, so only report which path ran.
+  std::printf("vision GEMM: %zu of %zu shapes on hipBLASLt\n",
+              gemm->TunedShapes(), std::size(shapes));
 }
 
 }  // namespace
@@ -259,6 +345,7 @@ int main() {
   TestMerger();
   TestToHalf();
   TestAttention();
+  TestGemm();
   if (g_failures) {
     std::fprintf(stderr, "%d failures\n", g_failures);
     return 1;

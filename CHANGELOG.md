@@ -14,6 +14,11 @@
   tokenizing that turn's prompt too. Preparing a 72K-token conversation takes
   15.7 ms instead of 31.5 ms (848K tokens: 144 instead of 288 ms), with the
   same tokens and cache prefix, and an image request decodes its images once.
+- Images encode 1.8 to 2.7 times faster: the vision tower's GEMMs run on
+  hipBLASLt (28 to 39 TFLOPS instead of 6) with the bias and residual adds
+  fused into them. A 2048² image's first token takes 7.5 s instead of 9.6 s,
+  a 1080p one 3.3 s instead of 4.9 s. Vision is now checked against Tencent's
+  Transformers implementation (`tools/oracle/vision_reference.py`).
 
 ## 0.2.0 (2026-11-21)
 

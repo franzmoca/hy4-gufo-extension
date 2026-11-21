@@ -28,6 +28,12 @@ struct ImageSize {
                                     std::uint64_t min_pixels,
                                     std::uint64_t max_pixels);
 
+/// An image part's bytes decoded and resized as prompts do: SmartResize into
+/// the processor's pixel range (512² at most with `low_detail`), bicubic.
+/// Throws std::invalid_argument for unreadable images.
+[[nodiscard]] core::Image PrepareImage(std::span<const std::uint8_t> bytes,
+                                       bool low_detail);
+
 struct ImagePrompt {
   struct Image {
     core::Image pixels;  ///< resized RGB8, sides multiples of 32

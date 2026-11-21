@@ -3,7 +3,6 @@
 #include "runtime/hy4_vision.hpp"
 
 #include <hip/hip_runtime.h>
-#include <hipblas/hipblas.h>
 
 #include <algorithm>
 #include <cmath>
@@ -109,8 +108,7 @@ DeviceRows::~DeviceRows() {
 }
 
 VisionEncoder::~VisionEncoder() {
-  if (blas_)
-    (void)hipblasDestroy(static_cast<hipblasHandle_t>(blas_));
+  gemm_.reset();
   for (void* p : allocations_)
     (void)hipFree(p);
 }
@@ -148,13 +146,9 @@ std::unique_ptr<VisionEncoder> VisionEncoder::Load(const std::string& path,
   e->path_ = path;
   e->out_width_ = out_width;
   e->stream_ = stream;
-  hipblasHandle_t blas = nullptr;
-  if (hipblasCreate(&blas) != HIPBLAS_STATUS_SUCCESS) {
-    Fail(error, "hy4 vision: hipblasCreate failed");
+  e->gemm_ = VisionGemm::Create(stream, error);
+  if (!e->gemm_)
     return nullptr;
-  }
-  e->blas_ = blas;
-  (void)hipblasSetStream(blas, stream);
 
   // Every weight is uploaded as FP32.
   std::vector<float> host;
@@ -262,6 +256,23 @@ std::unique_ptr<VisionEncoder> VisionEncoder::Load(const std::string& path,
     return nullptr;
   }
   e->positions_ = std::move(host);
+
+  // One algorithm per GEMM shape, timed on 1,024 rows (VisionGemm).
+  constexpr std::uint32_t kTuneRows = 1024;
+  const Layer& l = e->layers_[0];
+  VisionGemm& g = *e->gemm_;
+  if (!g.Tune(e->patch_w_, kHidden, kPatchValues, e->patch_b_, true, kTuneRows,
+              error) ||
+      !g.Tune(l.q_w, kHidden, kHidden, l.q_b, false, kTuneRows, error) ||
+      !g.Tune(l.o_w, kHidden, kHidden, l.o_b, true, kTuneRows, error) ||
+      !g.Tune(l.up_w, kFfn, kHidden, l.up_b, false, kTuneRows, error) ||
+      !g.Tune(l.down_w, kHidden, kFfn, l.down_b, true, kTuneRows, error) ||
+      !g.Tune(e->merge_w_, 4 * kHidden, 4 * kHidden, e->merge_b_, false,
+              kTuneRows / 4, error) ||
+      !g.Tune(e->proj_w_, out_width, 4 * kHidden, e->proj_b_, false,
+              kTuneRows / 4, error)) {
+    return nullptr;
+  }
   return e;
 }
 
@@ -269,27 +280,6 @@ const std::string& VisionEncoder::Identity() const {
   std::call_once(identity_once_,
                  [&] { identity_ = crypto::Sha256FileHex(path_); });
   return identity_;
-}
-
-bool VisionEncoder::Linear(const std::uint16_t* w, const float* x, float* y,
-                           std::uint32_t rows, std::uint32_t out,
-                           std::uint32_t in, std::string* error) {
-  // Binary16 operands, FP32 accumulation and output.
-  if (hy4_vis_to_half(x, xh_, std::uint64_t{rows} * in, stream_) != 0) {
-    return Fail(error, "hy4 vision: conversion failed");
-  }
-  const float one = 1.0f;
-  const float zero = 0.0f;
-  if (hipblasGemmEx(static_cast<hipblasHandle_t>(blas_), HIPBLAS_OP_T,
-                    HIPBLAS_OP_N, static_cast<int>(out), static_cast<int>(rows),
-                    static_cast<int>(in), &one, w, HIP_R_16F,
-                    static_cast<int>(in), xh_, HIP_R_16F, static_cast<int>(in),
-                    &zero, y, HIP_R_32F, static_cast<int>(out),
-                    HIPBLAS_COMPUTE_32F,
-                    HIPBLAS_GEMM_DEFAULT) != HIPBLAS_STATUS_SUCCESS) {
-    return Fail(error, "hy4 vision: GEMM failed");
-  }
-  return true;
 }
 
 std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
@@ -372,12 +362,12 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
   // Binary16 attention operands, in floats.
   const std::uint64_t packed =
       std::uint64_t{kHeads} * 80 * hy4_vis_attn_padded(n) / 2;
-  Buffer in, x, t, q, k, v, att, ffn, qh, kh, vt, m1, m2, out, xh;
+  Buffer in, x, t, q, k, v, ffn, qh, kh, vt, m1, m2, out, xh;
   const std::uint64_t rows = std::uint64_t{n} * kHidden;
   if (!in.Allocate(std::uint64_t{n} * kPatchValues, error) ||
       !x.Allocate(rows, error) || !t.Allocate(rows, error) ||
       !q.Allocate(rows, error) || !k.Allocate(rows, error) ||
-      !v.Allocate(rows, error) || !att.Allocate(rows, error) ||
+      !v.Allocate(rows, error) ||
       !ffn.Allocate(std::uint64_t{n} * kFfn, error) ||
       !qh.Allocate(packed, error) || !kh.Allocate(packed, error) ||
       !vt.Allocate(packed, error) ||
@@ -387,7 +377,10 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
       !out.Allocate(std::uint64_t{oh} * (ow + 1) * out_width_, error)) {
     return nullptr;
   }
-  xh_ = reinterpret_cast<std::uint16_t*>(xh.data);
+  // Every GEMM reads its input from h as binary16, written by the step before
+  // it: rounded where an FP32 copy was converted before.
+  auto* h = reinterpret_cast<std::uint16_t*>(xh.data);
+  VisionGemm& g = *gemm_;
   const auto run = [&]() -> bool {
     if (hipMemcpyAsync(in.data, patches.data(), patches.size() * sizeof(float),
                        hipMemcpyHostToDevice, st) != hipSuccess ||
@@ -395,38 +388,44 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
                        hipMemcpyHostToDevice, st) != hipSuccess) {
       return Fail(error, "hy4 vision: upload failed");
     }
-    if (!Linear(patch_w_, in.data, x.data, n, kHidden, kPatchValues, error))
+    // x = patches W^T + b + positions.
+    HY4V_CHECK(
+        hy4_vis_to_half(in.data, h, std::uint64_t{n} * kPatchValues, st));
+    if (!g.Run(patch_w_, h, x.data, patch_b_, t.data, n, kHidden, kPatchValues,
+               error)) {
       return false;
-    HY4V_CHECK(hy4_vis_residual(x.data, t.data, patch_b_, n, kHidden, st));
+    }
 
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
     for (const Layer& l : layers_) {
-      HY4V_CHECK(hy4_vis_layer_norm(x.data, l.ln1_w, l.ln1_b, t.data, n,
-                                    kHidden, kNormEps, st));
-      if (!Linear(l.q_w, t.data, q.data, n, kHidden, kHidden, error) ||
-          !Linear(l.k_w, t.data, k.data, n, kHidden, kHidden, error) ||
-          !Linear(l.v_w, t.data, v.data, n, kHidden, kHidden, error)) {
+      HY4V_CHECK(hy4_vis_layer_norm_half(x.data, l.ln1_w, l.ln1_b, h, n,
+                                         kHidden, kNormEps, st));
+      if (!g.Run(l.q_w, h, q.data, l.q_b, nullptr, n, kHidden, kHidden,
+                 error) ||
+          !g.Run(l.k_w, h, k.data, l.k_b, nullptr, n, kHidden, kHidden,
+                 error) ||
+          !g.Run(l.v_w, h, v.data, l.v_b, nullptr, n, kHidden, kHidden,
+                 error)) {
         return false;
       }
-      HY4V_CHECK(hy4_vis_bias(q.data, l.q_b, n, kHidden, 0, st));
-      HY4V_CHECK(hy4_vis_bias(k.data, l.k_b, n, kHidden, 0, st));
-      HY4V_CHECK(hy4_vis_bias(v.data, l.v_b, n, kHidden, 0, st));
       HY4V_CHECK(hy4_vis_attention(
           q.data, k.data, v.data, scale, reinterpret_cast<uint16_t*>(qh.data),
           reinterpret_cast<uint16_t*>(kh.data),
-          reinterpret_cast<uint16_t*>(vt.data), att.data, n, st));
-      if (!Linear(l.o_w, att.data, t.data, n, kHidden, kHidden, error))
+          reinterpret_cast<uint16_t*>(vt.data), h, n, st));
+      if (!g.Run(l.o_w, h, x.data, l.o_b, x.data, n, kHidden, kHidden, error))
         return false;
-      HY4V_CHECK(hy4_vis_residual(x.data, t.data, l.o_b, n, kHidden, st));
 
-      HY4V_CHECK(hy4_vis_layer_norm(x.data, l.ln2_w, l.ln2_b, t.data, n,
-                                    kHidden, kNormEps, st));
-      if (!Linear(l.up_w, t.data, ffn.data, n, kFfn, kHidden, error))
+      HY4V_CHECK(hy4_vis_layer_norm_half(x.data, l.ln2_w, l.ln2_b, h, n,
+                                         kHidden, kNormEps, st));
+      if (!g.Run(l.up_w, h, ffn.data, l.up_b, nullptr, n, kFfn, kHidden,
+                 error)) {
         return false;
-      HY4V_CHECK(hy4_vis_bias(ffn.data, l.up_b, n, kFfn, 1, st));
-      if (!Linear(l.down_w, ffn.data, t.data, n, kHidden, kFfn, error))
+      }
+      HY4V_CHECK(hy4_vis_gelu_half(ffn.data, h, std::uint64_t{n} * kFfn, st));
+      if (!g.Run(l.down_w, h, x.data, l.down_b, x.data, n, kHidden, kFfn,
+                 error)) {
         return false;
-      HY4V_CHECK(hy4_vis_residual(x.data, t.data, l.down_b, n, kHidden, st));
+      }
     }
 
     // Merger: RMSNorm, the 2x2 convolution, GELU, the 1x1 convolution, and a
@@ -434,14 +433,17 @@ std::shared_ptr<const DeviceRows> VisionEncoder::Encode(const std::uint8_t* rgb,
     HY4V_CHECK(hy4_rms_norm(x.data, merge_norm_, t.data, n, kHidden, kHidden,
                             kNormEps, st));
     HY4V_CHECK(hy4_vis_merge_gather(t.data, gh, gw, kHidden, ffn.data, st));
-    if (!Linear(merge_w_, ffn.data, m1.data, merged, 4 * kHidden, 4 * kHidden,
-                error))
+    HY4V_CHECK(hy4_vis_to_half(ffn.data, h, std::uint64_t{n} * kHidden, st));
+    if (!g.Run(merge_w_, h, m1.data, merge_b_, nullptr, merged, 4 * kHidden,
+               4 * kHidden, error)) {
       return false;
-    HY4V_CHECK(hy4_vis_bias(m1.data, merge_b_, merged, 4 * kHidden, 1, st));
-    if (!Linear(proj_w_, m1.data, m2.data, merged, out_width_, 4 * kHidden,
-                error))
+    }
+    HY4V_CHECK(
+        hy4_vis_gelu_half(m1.data, h, std::uint64_t{merged} * 4 * kHidden, st));
+    if (!g.Run(proj_w_, h, m2.data, proj_b_, nullptr, merged, out_width_,
+               4 * kHidden, error)) {
       return false;
-    HY4V_CHECK(hy4_vis_bias(m2.data, proj_b_, merged, out_width_, 0, st));
+    }
     HY4V_CHECK(
         hy4_vis_newline(m2.data, newline_, out.data, oh, ow, out_width_, st));
     const hipError_t status = hipStreamSynchronize(st);

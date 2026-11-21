@@ -73,6 +73,7 @@ gufo_extension_target(
     runtime/hy4_dfly.cpp
     runtime/hy4_forward.cpp
     runtime/hy4_vision.cpp
+    runtime/hy4_vision_gemm.cpp
     runtime/tokenizer.cpp
   LINK_LIBRARIES
     gufo_hy4flash_mmq
@@ -80,6 +81,7 @@ gufo_extension_target(
     gufo_ext_core
     gufo_ext_hip
     roc::hipblas
+    roc::hipblaslt
     Threads::Threads
 )
 
@@ -128,6 +130,9 @@ foreach(name IN ITEMS eval_probe tokenize_probe vision_probe)
     SOURCES tools/probe/${name}.cpp
     LINK_LIBRARIES gufo_hy4flash_hip gufo_ext_hip gufo_ext_runtime
   )
+  if(TARGET hy4flash_${name} AND name STREQUAL "vision_probe")
+    target_link_libraries(hy4flash_${name} PRIVATE gufo_hy4flash_text)
+  endif()
   if(TARGET hy4flash_${name})
     set_target_properties(hy4flash_${name} PROPERTIES
       EXCLUDE_FROM_ALL TRUE OUTPUT_NAME hy4_${name})
