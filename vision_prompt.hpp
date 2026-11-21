@@ -38,6 +38,8 @@ struct ImagePrompt {
   };
   std::vector<std::int32_t> tokens;
   std::vector<Image> images;
+  /// Tokens a following user turn keeps (RenderChat's stable prefix).
+  std::size_t stable_prefix_tokens = 0;
   /// Identity of all images.
   std::vector<std::uint8_t> cache_identity;
   /// Identity of the images starting before `token_count`.

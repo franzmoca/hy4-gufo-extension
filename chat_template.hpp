@@ -53,10 +53,14 @@ struct ContentSpan {
 /// its start, pad and end tokens; with `image_offsets` it renders as nothing
 /// and its byte offset in the result is appended instead. `content_spans`
 /// receives the request text's ranges in the result, in order.
+/// `stable_prefix_bytes` receives how much of the result a following user
+/// turn keeps; it falls after a special token, so its tokens are a prefix of
+/// the result's.
 [[nodiscard]] std::string RenderChat(
     const ext::ChatRequest& request,
     std::vector<std::size_t>* image_offsets = nullptr,
-    std::vector<ContentSpan>* content_spans = nullptr);
+    std::vector<ContentSpan>* content_spans = nullptr,
+    std::size_t* stable_prefix_bytes = nullptr);
 
 }  // namespace gufo::models::hy4_flash
 

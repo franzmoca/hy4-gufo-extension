@@ -9,6 +9,11 @@
   file or page a tool returned, could close a turn or a reasoning block in
   the next prompt. Prompts without such spellings tokenize as before, so
   cached prompts stay valid.
+- Each request tokenizes its prompt once, not twice: the renderer reports the
+  prefix a following user turn keeps, as Gufo's Qwen renderer does, instead of
+  tokenizing that turn's prompt too. Preparing a 72K-token conversation takes
+  15.7 ms instead of 31.5 ms (848K tokens: 144 instead of 288 ms), with the
+  same tokens and cache prefix, and an image request decodes its images once.
 
 ## 0.2.0 (2026-11-21)
 

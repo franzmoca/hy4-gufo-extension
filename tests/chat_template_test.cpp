@@ -142,6 +142,60 @@ bool Ordered(std::span<const hy4::ContentSpan> spans, std::size_t size) {
   return true;
 }
 
+// Where the tokenizer may cut `text`: before and after each control token
+// outside `spans`, and at both ends.
+std::vector<std::size_t> Cuts(const std::string& text,
+                              std::span<const hy4::ContentSpan> spans) {
+  std::vector<std::size_t> cuts{0, text.size()};
+  for (const auto& [at, spelling] : Controls(text)) {
+    if (!Overlaps(spans, at, spelling.size())) {
+      cuts.push_back(at);
+      cuts.push_back(at + spelling.size());
+    }
+  }
+  return cuts;
+}
+
+// The stable prefix is the last cut at or before the first byte a following
+// user turn changes, so its tokens are the ones the prompt and that turn's
+// prompt share.
+void CheckStablePrefix(const ChatRequest& request, const std::string& name) {
+  std::vector<hy4::ContentSpan> spans;
+  std::size_t stable = 0;
+  const std::string text = hy4::RenderChat(request, nullptr, &spans, &stable);
+  ChatRequest next = request;
+  next.messages.emplace_back(ChatRole::kUser, "");
+  const std::string continued = hy4::RenderChat(next);
+  std::size_t diverge = 0;
+  while (diverge < text.size() && diverge < continued.size() &&
+         text[diverge] == continued[diverge])
+    ++diverge;
+  const auto cuts = Cuts(text, spans);
+  std::size_t last = 0;
+  for (const std::size_t cut : cuts) {
+    if (cut <= diverge)
+      last = std::max(last, cut);
+  }
+  Expect(stable == last, name + ": stable prefix at byte " +
+                             std::to_string(stable) + ", want " +
+                             std::to_string(last));
+  // With images rendered apart, the same prefix less the images before it.
+  std::vector<std::size_t> offsets;
+  std::size_t bare_stable = 0;
+  (void)hy4::RenderChat(request, &offsets, nullptr, &bare_stable);
+  // The prefix follows a turn start or a think tag, never an image.
+  std::size_t images_before = 0;
+  for (const std::size_t offset : offsets) {
+    if (offset < bare_stable)
+      ++images_before;
+  }
+  const std::size_t image_bytes = hy4::Hy4Tokens::kImageStart.size() +
+                                  hy4::Hy4Tokens::kImagePad.size() +
+                                  hy4::Hy4Tokens::kImageEnd.size();
+  Expect(stable - bare_stable == images_before * image_bytes,
+         name + ": stable prefix with image offsets");
+}
+
 // The first difference, for the failure message.
 std::string Diff(const std::string& got, const std::string& want) {
   std::size_t i = 0;
@@ -205,6 +259,13 @@ void CheckGoldens() {
     for (const auto& span : bare_spans)
       bare_text.append(bare, span.offset, span.size);
     Expect(text == bare_text, name + ": content spans with image offsets");
+    CheckStablePrefix(request, name);
+    for (const bool preserve : {false, true}) {
+      ChatRequest variant = request;
+      variant.reasoning.preserve_thinking = preserve;
+      CheckStablePrefix(variant,
+                        name + (preserve ? " (preserved)" : " (dropped)"));
+    }
   }
   Expect(count >= 10, "golden cases present");
 }

@@ -12,6 +12,7 @@ adapted here, not shared; changes to them are this repository's own.
 | `image_resize.{hpp,cpp}` | `gemma4-gufo-extension` `52af868` (`vision/resize.cpp`), from Gufo `83b764b4` (`src/core/image.cpp`) | antialiased bicubic RGB8 resize |
 | `FusedAttention` in `kernels/rocm/hy4_vision.hip.cpp` | `gemma4-gufo-extension` `52af868` (`vision/encoder.hip`) | scale folded into Q, FP32 output |
 | `ContentSpan` and the request-text spans in `chat_template.cpp`, the span check in `Tokenizer::EncodeWithSpecials` | Gufo `0a473ebf` (`src/models/deepseek_v4_flash/chat_template.cpp`: `ContentSpan`, `MarkContent`, `SplitControlTokens`) | a control-token spelling that overlaps request text stays text; Hy4 records the spans through a writer and matches every special token, not a fixed list |
+| `stable_prefix_bytes` in `RenderChat` and its use in `PreparePrompt` and `PrepareImagePrompt` | Gufo `0a473ebf` (`src/families/qwen/text/chat_template.cpp`, `src/families/qwen/vision/prompt.cpp`) | the renderer reports what a following user turn keeps and the prompt is tokenized once; Hy4 cuts after a special token and encodes the shorter side |
 
 The model's reference implementations, which nothing here copies:
 

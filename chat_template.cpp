@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <gufo/ext/json.hpp>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -191,7 +192,8 @@ std::string_view ReasoningEffortName(const ReasoningOptions& reasoning) {
 
 std::string RenderChat(const ext::ChatRequest& request,
                        std::vector<std::size_t>* image_offsets,
-                       std::vector<ContentSpan>* content_spans) {
+                       std::vector<ContentSpan>* content_spans,
+                       std::size_t* stable_prefix_bytes) {
   const auto& messages = request.messages;
   const std::string marker = image_offsets ? ImageMarker(request)
                                            : std::string(T::kImageStart) +
@@ -215,6 +217,10 @@ std::string RenderChat(const ext::ChatRequest& request,
   for (std::size_t i = 0; i < messages.size(); ++i) {
     if (messages[i].role == ChatRole::kUser) last_user = static_cast<std::ptrdiff_t>(i);
   }
+  // Where the next request's prompt starts to differ: after the first think
+  // tag whose reasoning a later user turn drops, else after the generation
+  // prompt's turn start. Both follow a special token.
+  std::optional<std::size_t> stable;
 
   const bool leading_system =
       !messages.empty() && (messages[0].role == ChatRole::kSystem || messages[0].role == ChatRole::kDeveloper);
@@ -286,6 +292,8 @@ std::string RenderChat(const ext::ChatRequest& request,
       w.Markup(T::kThinkOpen);
       if (!no_think &&
           (preserved || static_cast<std::ptrdiff_t>(i) > last_user)) {
+        if (!preserved && !m.thought.empty() && !stable)
+          stable = w.str().size();
         w.Text(m.thought);
       }
       w.Markup(T::kThinkClose);
@@ -328,12 +336,15 @@ std::string RenderChat(const ext::ChatRequest& request,
   }
 
   if (messages.empty() || messages.back().role != ChatRole::kAssistant) {
+    if (!stable)
+      stable = w.str().size() + T::kStart.size();
     TurnStart(w, "assistant");
     w.Markup(T::kThinkOpen);
     if (no_think)
       w.Markup(T::kThinkClose);
   }
   std::string& out = w.str();
+  std::size_t stable_bytes = stable.value_or(out.size());
   if (image_offsets) {
     image_offsets->clear();
     std::string clean;
@@ -348,17 +359,18 @@ std::string RenderChat(const ext::ChatRequest& request,
     }
     clean.append(out, cursor);
     out = std::move(clean);
+    // An offset in `out` less the markers that ended at or before it.
+    const auto rebase = [&](std::size_t offset) {
+      std::size_t gone = 0;
+      for (const std::size_t at : removed) {
+        if (at + marker.size() > offset)
+          break;
+        gone += marker.size();
+      }
+      return offset - gone;
+    };
+    stable_bytes = rebase(stable_bytes);
     if (content_spans) {
-      // An offset in `out` less the markers that ended at or before it.
-      const auto rebase = [&](std::size_t offset) {
-        std::size_t gone = 0;
-        for (const std::size_t at : removed) {
-          if (at + marker.size() > offset)
-            break;
-          gone += marker.size();
-        }
-        return offset - gone;
-      };
       for (auto& span : *content_spans) {
         const std::size_t begin = rebase(span.offset);
         span.size = rebase(span.offset + span.size) - begin;
@@ -368,6 +380,8 @@ std::string RenderChat(const ext::ChatRequest& request,
                     [](const ContentSpan& span) { return span.size == 0; });
     }
   }
+  if (stable_prefix_bytes)
+    *stable_prefix_bytes = stable_bytes;
   return std::move(out);
 }
 

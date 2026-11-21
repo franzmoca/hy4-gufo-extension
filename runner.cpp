@@ -399,31 +399,23 @@ public:
             {image.span.first, {identity.begin(), identity.end()}});
       }
       TextPreparedPrompt prepared{RunnerTokens(prompt->tokens), nullptr};
-      auto continuation = request;
-      continuation.messages.emplace_back(ext::ChatRole::kUser, "");
-      const auto continued = PrepareImages(continuation)->tokens;
-      prepared.cache_prefix_tokens = static_cast<std::size_t>(
-          std::mismatch(prompt->tokens.begin(), prompt->tokens.end(),
-                        continued.begin(), continued.end())
-              .first -
-          prompt->tokens.begin());
+      prepared.cache_prefix_tokens = prompt->stable_prefix_tokens;
       context->prompt = std::move(prompt);
       prepared.context = std::move(context);
       return prepared;
     }
-    auto prepared = TextModelRunner::PreparePrompt(request);
-    if (prepared) {
-      // The stable frontier: what a following user turn keeps of this prompt.
-      auto continuation = request;
-      continuation.messages.emplace_back(ext::ChatRole::kUser, "");
-      const auto continued = RenderAndTokenize(continuation);
-      if (continued) {
-        prepared->cache_prefix_tokens = static_cast<std::size_t>(
-            std::mismatch(prepared->tokens.begin(), prepared->tokens.end(), continued->begin(), continued->end())
-                .first -
-            prepared->tokens.begin());
-      }
-    }
+    // One tokenization: the stable frontier (what a following user turn
+    // keeps) follows a special token, so its tokens are the prompt's less
+    // those of the text after it.
+    std::vector<ContentSpan> spans;
+    std::size_t stable = 0;
+    const std::string rendered = RenderChat(request, nullptr, &spans, &stable);
+    auto tokens = RunnerTokens(tokenizer_->EncodeWithSpecials(rendered, spans));
+    if (tokens.empty())
+      return std::nullopt;
+    TextPreparedPrompt prepared{std::move(tokens), nullptr};
+    prepared.cache_prefix_tokens = tokenizer_->TokensBefore(
+        rendered, stable, prepared.tokens.size(), spans);
     return prepared;
   }
 

@@ -81,15 +81,25 @@ ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
                                std::uint32_t max_context) {
   std::vector<std::size_t> offsets;
   std::vector<ContentSpan> spans;
-  const std::string text = RenderChat(request, &offsets, &spans);
+  std::size_t stable = 0;
+  const std::string text = RenderChat(request, &offsets, &spans, &stable);
   const std::int32_t start = SingleToken(tokenizer, Hy4Tokens::kImageStart);
   const std::int32_t pad = SingleToken(tokenizer, Hy4Tokens::kImagePad);
   const std::int32_t end = SingleToken(tokenizer, Hy4Tokens::kImageEnd);
 
   ImagePrompt prompt;
+  bool counted = false;
   const auto append = [&](std::string_view piece) {
-    const auto tokens = tokenizer.EncodeWithSpecials(
-        piece, spans, static_cast<std::size_t>(piece.data() - text.data()));
+    const auto base = static_cast<std::size_t>(piece.data() - text.data());
+    const auto tokens = tokenizer.EncodeWithSpecials(piece, spans, base);
+    // The stable prefix ends in this piece after a special token.
+    if (!counted && stable <= base + piece.size()) {
+      prompt.stable_prefix_tokens =
+          prompt.tokens.size() + tokenizer.TokensBefore(piece, stable - base,
+                                                        tokens.size(), spans,
+                                                        base);
+      counted = true;
+    }
     if (tokens.size() > max_context - std::min<std::size_t>(
                                           max_context, prompt.tokens.size())) {
       throw std::length_error(

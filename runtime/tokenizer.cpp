@@ -329,4 +329,16 @@ std::vector<std::int32_t> Tokenizer::EncodeWithSpecials(
   return out;
 }
 
+std::size_t Tokenizer::TokensBefore(std::string_view text, std::size_t cut,
+                                    std::size_t total,
+                                    std::span<const ContentSpan> literal,
+                                    std::size_t base) const {
+  if (cut < text.size() - cut)
+    return EncodeWithSpecials(text.substr(0, cut), literal, base).size();
+  return total -
+         std::min(
+             total,
+             EncodeWithSpecials(text.substr(cut), literal, base + cut).size());
+}
+
 }  // namespace gufo::models::hy4_flash

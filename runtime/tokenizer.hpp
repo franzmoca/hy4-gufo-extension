@@ -32,6 +32,12 @@ public:
   [[nodiscard]] std::vector<std::int32_t> EncodeWithSpecials(
       std::string_view text, std::span<const ContentSpan> literal = {},
       std::size_t base = 0) const;
+  /// How many of EncodeWithSpecials(text, literal, base)'s tokens encode
+  /// text[0, cut) when `cut` falls before or after a special token outside
+  /// `literal`; `total` is that encoding's size. Encodes the shorter side.
+  [[nodiscard]] std::size_t TokensBefore(
+      std::string_view text, std::size_t cut, std::size_t total,
+      std::span<const ContentSpan> literal = {}, std::size_t base = 0) const;
   /// The bytes of one token: special tokens decode to their spelling.
   [[nodiscard]] std::string Decode(std::int32_t token) const;
 
