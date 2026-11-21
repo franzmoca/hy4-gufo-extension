@@ -57,6 +57,15 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E49 | Several sessions' drafts in one drafter pass | retained |
 | E50 | Prompt scratch logits for 16 rows | retained |
 | E51 | Wide prompt scratch rows mapped only for wide passes | retained |
+| E52 | BF16 router weights | retained |
+| E53 | FP32-activation decode GEMVs instead of quantized inputs | retained |
+| E54 | Decode half-layer boundary in two launches | retained |
+| E55 | Decode norms, ropes, gates and adds folded into fewer launches | retained |
+| E56 | Route by rank, and in one wave | rejected |
+| E57 | Attention gate in the grouped value projection's stores | rejected |
+| E58 | FP32 routed experts in two launches | retained |
+| E59 | Grouped Q8_0 decode rows read as whole blocks | retained |
+| E60 | Decode time after E59 | analysis |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1267,3 +1276,141 @@ long request pays one map: ABBA prefill 924 to 912 tok/s at 4.7K tokens
 (−1.3%), −0.5% at 10K and −0.3% at 18.6K; the agent session, whose requests
 prefill at most 2,048 tokens, is unchanged
 ([artifact](artifacts/2026-11-20-scratch-arena/arena.json)).
+
+## E52 to E60: decode launches and bandwidth (2026-11-21)
+
+These measure one-token decoding with `hy4_eval_probe`: a 400-token prompt,
+then 128 greedy tokens at context 4,096, in ABBA arms (base, new, new, base).
+Every retained step keeps verify passes bit-identical to one-token decoding
+(`--passcheck 4` and `8`, `--batchcheck 6`). At the start, decode took
+62.2 ms per token in the trace: 50.8 ms in weight GEMVs, 5.3 ms in small
+kernels, 5.6 ms in launch gaps (about 2,480 launches at a floor of ~1.9 µs
+each) and 0.5 ms in the host round trip after the head.
+
+## E52: BF16 router weights (2026-11-21)
+
+The F32 routers (`ffn_gate_inp`) hold exact BF16 values. They are converted
+to BF16 in place at load when every value converts exactly
+(`hy4_f32_to_bf16`, which counts inexact values), halving their reads.
+Decoding uses a split-row BF16 GEMV, prompt passes an FP32 GEMM over BF16
+weights. ABBA 16.48 / 16.59 → 16.86 / 16.93 tok/s (about 1.2 ms per token).
+Prompt logits and perplexity are bit-identical. Greedy decoding diverges
+after about 50 tokens because the decode GEMV sums in another order.
+Retained.
+
+## E53: FP32-activation decode GEMVs instead of quantized inputs (2026-11-21)
+
+Decode projections over Q8_0, Q4_K and Q6_K quantized their input to Q8_1
+first (one launch each) and ran ggml's MMVQ. `hy4_gemv`, ported from
+ds41-gufo-extension (UPSTREAM.md), reads the weights in their GGUF blocks
+with FP32 activations: no quantize launch, and a split-K layout with an
+atomic tile counter for 2 to 16 tokens that gives the lane layout's bits.
+It also stores SwiGLU, a projection pair, and later (E55) an add or a
+sigmoid gate. ABBA 16.79 / 16.95 → 17.56 / 17.57 tok/s (about 2.5 ms).
+Retained.
+
+## E54: Decode half-layer boundary in two launches (2026-11-21)
+
+Between attention and the FFN (and between layers), decoding ran the
+post-norm, the residual update of the four streams, the mix, the pre-mix
+collapse and the pre-norm as five launches. `hy4_hc_decode` does them in
+two: `HcPostMix` (48 slices per token) applies the deferred post-norm and
+residual and sums the mix partials, and `HcApplyNorm` reduces them, writes
+pre and post, collapses the streams and norms the result. The kernels
+compute the old kernels' bits. ABBA 17.77 / 17.72 → 17.99 / 17.99 tok/s
+(about 0.77 ms). Retained.
+
+## E55: Decode norms, ropes, gates and adds folded into fewer launches (2026-11-21)
+
+- `MlaPrep` norms the query and KV latents and ropes the KV rope part in one
+  launch.
+- The query rope writes its copy into the attention input itself.
+- `hy4_gemv` gained store modes: the attention gate (`y *= sigmoid(W x)`
+  from `attn_gate`) and the routed output's add of the shared expert.
+- The shared expert runs as a fused SwiGLU GEMV.
+- The boundary kernels of E54 hold the model's shape (4 streams, 8 mixes) in
+  registers, with one barrier for all mix sums.
+
+All are bit-identical to the launches they replace, and the greedy output is
+unchanged. ABBA 18.00 / 18.00 → 18.31 / 18.33 tok/s (about 1.0 ms). Launches
+per token went from about 2,480 to 1,458. Retained.
+
+## E56: Route by rank, and in one wave (2026-11-21)
+
+The top-16 of 512 routing (11 µs, 16 serial block-max rounds) was rewritten:
+
+- **Rank:** every expert counts the scores above it, 512 × 512 comparisons.
+  It took 19 µs, and ABBA went from 18.00 to 17.90 tok/s.
+- **One wave:** 16 experts per lane, with lane and wave maxima. It took
+  18 µs, bound by its chain of dependent cross-lane shuffles; this compiler
+  has no wave-reduction builtins.
+
+The tie test (512 experts, k = 16) and a guard against k above the expert
+count were kept. Rejected.
+
+## E57: Attention gate in the grouped value projection's stores (2026-11-21)
+
+Applying `sigmoid(attn_gate)` as `wv_b`'s grouped GEMV stores its outputs
+made that kernel 45.9 → 48.4 µs at the sliding layers' shape (cold weights)
+and left a gap after it. The gate went to `attn_gate`'s own stores instead
+(E55). Rejected.
+
+## E58: FP32 routed experts in two launches (2026-11-21)
+
+Decoding the routed experts took ten launches per layer: three input
+quantizations, gate, up, SwiGLU and four pieces of down. `hy4_gemv_experts`
+(the E53 lane layout over routed slots) runs gate and up with SwiGLU and the
+route weight in one launch and down in a second. Its slice count is fixed
+at 2 for every pass size, the fastest or tied at each shape: gate and up
+190 µs, Q4_K down 97 µs, Q6_K down 138 µs, at 218 to 224 GB/s.
+
+In a verify pass, the block of the first slot with each expert finds the
+others by a ballot over the ids. It reads the expert's rows once for all of
+them, with each slot's one-slot arithmetic, so no plan is built on the host
+or in another launch. ABBA 18.32 / 18.34 → 19.08 / 19.07 tok/s (about
+2.1 ms). The experts now sum FP32 activations, so the greedy output changed.
+
+Decode-pass KL against llama.cpp is a tie, 0.0813 ± 0.0072 → 0.0842 ±
+0.0082. This is the new `--kl-decode`, which scores the second half of each
+chunk as one-token passes. Against the exact-arithmetic reference
+([QUALITY.md](QUALITY.md)) it is 0.059 → 0.051, with the same top token
+93.6% → 94.6%. Retained.
+
+## E59: Grouped Q8_0 decode rows read as whole blocks (2026-11-21)
+
+`wk_b` (k = 192) and `wv_b` (k = 512) ran a grouped kernel in which a lane
+read 4 quants through two 16-bit loads. Now a lane reads a whole 34-byte
+block as nine aligned words, eight lanes share a row, and the group's inputs
+are staged in LDS. The LDS rows are padded to 36 floats: unpadded, a row's
+lanes read one bank and four tokens took 121 µs.
+
+Cold weights, sliding layers:
+
+| projection | n = 1 | n = 8 |
+| --- | --- | --- |
+| `wk_b` | 37.1 → 32.2 µs | unchanged |
+| `wv_b` | 45.6 → 42.4 µs | 73.4 → 84.0 µs |
+
+ABBA 19.07 / 19.07 → 19.18 / 19.17 tok/s (about 0.3 ms), passchecks exact.
+Retained.
+
+## E60: Decode time after E59 (2026-11-21)
+
+52.6 ms per token in the trace: 49.1 ms in kernels and 3.45 ms between them.
+
+- **Read ceiling:** a pure read kernel reaches 245 GB/s of the memory's
+  256 GB/s, with many small contiguous per-block chunks; nontemporal loads
+  do not help. The weight GEMVs run at 221 to 241 GB/s, the F16 head at 241
+  (3.1 ms).
+- **Small kernels:** the two boundary kernels take 15 µs per boundary
+  (1.3 ms per token) and are latency-bound. Unrolling their partial sums
+  changed nothing.
+- **Gaps:** 179 gaps of about 6.5 µs follow the kernels that run longer than
+  about 75 µs, about 1.2 ms in all. A standalone pair of the same expert
+  kernels shows at most 3 µs, and a long kernel followed by a tiny one
+  none, so part of it may come from the profiler.
+- **Host round trip:** after the head it takes 0.47 ms per token. The full
+  logits go to the host for sampling.
+
+Not tried yet: a quantized head (a quality trade-off), the boundary kernels
+folded into the next GEMV's start, and sampling on the device.
