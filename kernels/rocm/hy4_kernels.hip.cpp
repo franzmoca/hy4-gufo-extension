@@ -103,12 +103,31 @@ __global__ void EmbedQ8_0(const BlockQ8_0* table, const int32_t* tokens, uint32_
 
 // --------------------------------------------------------------------- norm
 
+// One row by one block: RmsNorm's body, shared by the fused decode kernels so
+// that they compute its bits.
+__device__ void RmsNormRow(const float* xr, const float* weight, float* yr,
+                           uint32_t dim, float eps, float* scratch) {
+  float ss = 0.0f;
+  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+    ss += xr[i] * xr[i];
+  ss = BlockSum(ss, scratch);
+  const float scale = rsqrtf(ss / (float)dim + eps);
+  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float v = xr[i] * scale;
+    yr[i] = weight ? v * weight[i] : v;
+  }
+}
+
 __global__ void RmsNorm(const float* x, const float* weight, float* out,
                         uint32_t dim, uint32_t stride, float eps,
                         _Float16* out_half = nullptr) {
   __shared__ float scratch[32];
   const float* xr = x + (uint64_t)blockIdx.x * stride;
   float* yr = out + (uint64_t)blockIdx.x * stride;
+  if (!out_half) {
+    RmsNormRow(xr, weight, yr, dim, eps, scratch);
+    return;
+  }
   float ss = 0.0f;
   for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
   ss = BlockSum(ss, scratch);
@@ -382,6 +401,139 @@ __global__ void __launch_bounds__(kBlock)
   }
 }
 
+// HcPostMix and HcApplyNorm for NM mixes over HC streams, the model's
+// shapes: the mixes stay in registers, their block sums share one barrier
+// (each is BlockSum's warp sums, then the warps' partials in order), and
+// HcApplyNorm keeps its columns (c = tid + kBlock r, kPer per thread) in
+// registers for the norm. The same sums in the same order as the general
+// kernels: their bits.
+template<uint32_t NM>
+__global__ void __launch_bounds__(kBlock)
+    HcPostMixFast(const float* y, const float* y_norm, const float* post_prev,
+                  float* h, const float* fn, float* partial, uint32_t hc,
+                  uint32_t dim, float eps) {
+  __shared__ float scratch[32];
+  __shared__ float sums[NM + 1][kBlock / 32];
+  const uint32_t t = blockIdx.y;
+  const uint32_t flat = hc * dim;
+  float scale = 0.0f;
+  const float* yt = y ? y + (uint64_t)t * dim : nullptr;
+  if (yt) {
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x)
+      ss += yt[i] * yt[i];
+    ss = BlockSum(ss, scratch);
+    scale = rsqrtf(ss / (float)dim + eps);
+  }
+  const uint32_t per = (flat + kHcSlices - 1) / kHcSlices;
+  const uint32_t lo = blockIdx.x * per;
+  const uint32_t hi = min(flat, lo + per);
+  float* ht = h + (uint64_t)t * flat;
+  float mix[NM + 1] = {};  // [NM] is the sum of squares
+  for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+    float f[NM];
+#pragma unroll
+    for (uint32_t m = 0; m < NM; ++m)
+      f[m] = fn[(uint64_t)m * flat + i];
+    float v = ht[i];
+    if (yt) {
+      const uint32_t stream = i / dim, c = i - stream * dim;
+      const float yv = yt[c] * scale;
+      const float yn = y_norm ? yv * y_norm[c] : yv;
+      v = v + yn * post_prev[(uint64_t)t * hc + stream];
+      ht[i] = v;
+    }
+    mix[NM] += v * v;
+#pragma unroll
+    for (uint32_t m = 0; m < NM; ++m)
+      mix[m] += f[m] * v;
+  }
+  const uint32_t lane = threadIdx.x % warpSize;
+  const uint32_t warp = threadIdx.x / warpSize;
+  const uint32_t warps = (blockDim.x + warpSize - 1) / warpSize;
+#pragma unroll
+  for (uint32_t m = 0; m <= NM; ++m) {
+    const float v = WarpSum(mix[m]);
+    if (lane == 0)
+      sums[m][warp] = v;
+  }
+  __syncthreads();
+  if (threadIdx.x <= NM) {
+    float total = 0.0f;
+    for (uint32_t w = 0; w < warps; ++w)
+      total += sums[threadIdx.x][w];
+    partial[((uint64_t)t * kHcSlices + blockIdx.x) * (kHcMaxMix + 1) +
+            threadIdx.x] = total;
+  }
+}
+
+template<uint32_t HC, uint32_t kPer>
+__global__ void __launch_bounds__(kBlock)
+    HcApplyNormFast(const float* h, const float* partial, const float* scale,
+                    const float* base, float* x, float* out,
+                    const float* weight, float* post, uint32_t dim, float eps,
+                    float hc_eps, float magnitude) {
+  __shared__ float mix_s[kHcMaxMix + 1];
+  __shared__ float pre_s[HC];
+  __shared__ float scratch[32];
+  const uint32_t t = blockIdx.y;
+  const uint32_t n_mix = post ? 2 * HC : HC;
+  const float* part = partial + (uint64_t)t * kHcSlices * (kHcMaxMix + 1);
+  if (threadIdx.x <= n_mix) {
+    float acc = 0.0f;
+    for (uint32_t b = 0; b < kHcSlices; ++b)
+      acc += part[b * (kHcMaxMix + 1) + threadIdx.x];
+    mix_s[threadIdx.x] = acc;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const float rs = rsqrtf(mix_s[n_mix] / (float)(HC * dim) + eps);
+    for (uint32_t i = 0; i < HC; ++i) {
+      pre_s[i] = Sigmoid(mix_s[i] * rs * scale[0] + base[i]) + hc_eps;
+      if (post)
+        post[(uint64_t)t * HC + i] =
+            Sigmoid(mix_s[HC + i] * rs * scale[1] + base[HC + i]) * magnitude +
+            hc_eps;
+    }
+  }
+  __syncthreads();
+  float pre[HC];
+#pragma unroll
+  for (uint32_t i = 0; i < HC; ++i)
+    pre[i] = pre_s[i];
+  const float* ht = h + (uint64_t)t * HC * dim;
+  float* xt = x + (uint64_t)t * dim;
+  float xv[kPer];
+#pragma unroll
+  for (uint32_t r = 0; r < kPer; ++r) {
+    const uint32_t c = threadIdx.x + r * kBlock;
+    float acc = 0.0f;
+    if (c < dim) {
+#pragma unroll
+      for (uint32_t i = 0; i < HC; ++i)
+        acc += ht[(uint64_t)i * dim + c] * pre[i];
+      xt[c] = acc;
+    }
+    xv[r] = acc;
+  }
+  float ss = 0.0f;
+#pragma unroll
+  for (uint32_t r = 0; r < kPer; ++r)
+    if (threadIdx.x + r * kBlock < dim)
+      ss += xv[r] * xv[r];
+  ss = BlockSum(ss, scratch);
+  const float rscale = rsqrtf(ss / (float)dim + eps);
+  float* yt = out + (uint64_t)t * dim;
+#pragma unroll
+  for (uint32_t r = 0; r < kPer; ++r) {
+    const uint32_t c = threadIdx.x + r * kBlock;
+    if (c < dim) {
+      const float v = xv[r] * rscale;
+      yt[c] = weight ? v * weight[c] : v;
+    }
+  }
+}
+
 __global__ void HcInit(const float* x, float* h, uint32_t hc, uint32_t dim) {
   const uint32_t t = blockIdx.y;
   for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim; c += gridDim.x * blockDim.x) {
@@ -586,16 +738,12 @@ __global__ void GemvQ8_0Grouped(const BlockQ8_0* w, const float* x, float* y,
 // Interleaved M-RoPE (mrope_section [12, 10, 10] of 32 pairs): pair i takes
 // the height position when i % 3 == 1 and the width one when i % 3 == 2, for
 // i < 30, else the temporal one. Without `pos_hw` every pair takes `pos`.
-__global__ void Rope(float* x, const int32_t* pos, const int32_t* pos_hw,
-                     uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
-                     uint32_t offset, uint32_t n_rot, float base) {
-  const uint32_t t = blockIdx.y;
-  const uint32_t pairs = n_rot / 2;
-  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= heads * pairs) return;
-  const uint32_t h = idx / pairs;
-  const uint32_t i = idx % pairs;
-  float* row = x + t * tok_stride + h * head_stride + offset;
+// Rotates pair i of token t's row in place; dst, if given, gets a copy.
+__device__ __forceinline__ void RopePair(float* row, float* dst,
+                                         const int32_t* pos,
+                                         const int32_t* pos_hw, uint32_t t,
+                                         uint32_t i, uint32_t n_rot,
+                                         float base) {
   int32_t p = pos[t];
   if (pos_hw != nullptr && i < 30 && i % 3 != 0)
     p = pos_hw[2 * t + (i % 3 - 1)];
@@ -604,8 +752,54 @@ __global__ void Rope(float* x, const int32_t* pos, const int32_t* pos_hw,
   sincosf(theta, &s, &c);
   const float x0 = row[2 * i];
   const float x1 = row[2 * i + 1];
-  row[2 * i] = x0 * c - x1 * s;
-  row[2 * i + 1] = x0 * s + x1 * c;
+  const float y0 = x0 * c - x1 * s;
+  const float y1 = x0 * s + x1 * c;
+  row[2 * i] = y0;
+  row[2 * i + 1] = y1;
+  if (dst) {
+    dst[2 * i] = y0;
+    dst[2 * i + 1] = y1;
+  }
+}
+
+// With dst, each rotated pair is also stored at dst + t * dst_tok + h *
+// dst_head (+ 2 i).
+__global__ void Rope(float* x, const int32_t* pos, const int32_t* pos_hw,
+                     uint32_t heads, uint64_t tok_stride, uint64_t head_stride,
+                     uint32_t offset, uint32_t n_rot, float base,
+                     float* dst = nullptr, uint64_t dst_tok = 0,
+                     uint64_t dst_head = 0) {
+  const uint32_t t = blockIdx.y;
+  const uint32_t pairs = n_rot / 2;
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= heads * pairs) return;
+  const uint32_t h = idx / pairs;
+  const uint32_t i = idx % pairs;
+  float* row = x + t * tok_stride + h * head_stride + offset;
+  RopePair(row, dst ? dst + t * dst_tok + h * dst_head : nullptr, pos, pos_hw,
+           t, i, n_rot, base);
+}
+
+// The decode MLA's normalisations after q_a and kv_a, grid (2, n): block 0
+// norms the query latent (RmsNorm of q_lora values), block 1 the KV latent
+// (the first kv_lora of dk values) in place and rotates the key's n_rot
+// values after it (Rope, one head).
+__global__ void __launch_bounds__(kBlock)
+    MlaPrep(float* qr, const float* q_norm, uint32_t q_lora, float* kva,
+            const float* kv_norm, uint32_t kv_lora, uint32_t dk,
+            const int32_t* pos, const int32_t* pos_hw, uint32_t n_rot,
+            float base, float eps) {
+  __shared__ float scratch[32];
+  const uint32_t t = blockIdx.y;
+  if (blockIdx.x == 0) {
+    float* row = qr + (uint64_t)t * q_lora;
+    RmsNormRow(row, q_norm, row, q_lora, eps, scratch);
+    return;
+  }
+  float* row = kva + (uint64_t)t * dk;
+  RmsNormRow(row, kv_norm, row, kv_lora, eps, scratch);
+  for (uint32_t i = threadIdx.x; i < n_rot / 2; i += blockDim.x)
+    RopePair(row + kv_lora, nullptr, pos, pos_hw, t, i, n_rot, base);
 }
 
 // ---------------------------------------------------------------- attention
@@ -2080,11 +2274,25 @@ int hy4_hc_decode(const float* y, const float* y_norm, const float* post_prev,
   if (!partial)
     return 1;
   const uint32_t n_mix = post ? 2 * hc : hc;
-  HcPostMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(
-      y, y_norm, post_prev, h, fn, partial, hc, dim, n_mix, eps);
-  HcApplyNorm<<<dim3(1, n), kBlock, 0, stream>>>(h, partial, scale, base, x,
-                                                 out, out_norm, post, hc, dim,
-                                                 eps, hc_eps, magnitude);
+  const dim3 slices(kHcSlices, n);
+  if (hc == 4 && n_mix == 8)
+    HcPostMixFast<8><<<slices, kBlock, 0, stream>>>(y, y_norm, post_prev, h, fn,
+                                                    partial, hc, dim, eps);
+  else if (hc == 4 && n_mix == 4)
+    HcPostMixFast<4><<<slices, kBlock, 0, stream>>>(y, y_norm, post_prev, h, fn,
+                                                    partial, hc, dim, eps);
+  else
+    HcPostMix<<<slices, kBlock, 0, stream>>>(y, y_norm, post_prev, h, fn,
+                                             partial, hc, dim, n_mix, eps);
+  constexpr uint32_t kPer = 12;
+  if (hc == 4 && dim <= kPer * kBlock)
+    HcApplyNormFast<4, kPer><<<dim3(1, n), kBlock, 0, stream>>>(
+        h, partial, scale, base, x, out, out_norm, post, dim, eps, hc_eps,
+        magnitude);
+  else
+    HcApplyNorm<<<dim3(1, n), kBlock, 0, stream>>>(h, partial, scale, base, x,
+                                                   out, out_norm, post, hc, dim,
+                                                   eps, hc_eps, magnitude);
   return Status();
 }
 
@@ -2256,7 +2464,8 @@ int hy4_swiglu(const float* gate, const float* up, const float* route_w, float* 
 int hy4_route(const float* logits, const float* bias, int32_t* ids, float* weights, uint32_t n, uint32_t n_experts,
               uint32_t k, int norm, float scale, hipStream_t stream) {
   if (n == 0) return 0;
-  if (k > kBlock) return 1;
+  if (k > kBlock || k > n_experts)
+    return 1;
   Route<<<n, kBlock, 2 * n_experts * sizeof(float), stream>>>(logits, bias, ids, weights, n_experts, k, norm,
                                                               scale);
   return Status();
@@ -2361,6 +2570,36 @@ int hy4_gather_indexed(const uint16_t* src, uint32_t ring, const int32_t* idx,
   if (rows && n_keys) {
     IndexMask<<<dim3((n_keys + kBlock - 1) / kBlock, rows), kBlock, 0, stream>>>(idx, count, limit, mask, n_keys);
   }
+  return Status();
+}
+
+int hy4_mla_prep(float* qr, const float* q_norm, uint32_t q_lora, float* kva,
+                 const float* kv_norm, uint32_t kv_lora, uint32_t dk,
+                 const int32_t* pos, const int32_t* pos_hw, uint32_t n_rot,
+                 float base, float eps, uint32_t n, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if ((pos_hw != nullptr && n_rot != 64) || kv_lora + n_rot > dk)
+    return 1;
+  MlaPrep<<<dim3(2, n), kBlock, 0, stream>>>(qr, q_norm, q_lora, kva, kv_norm,
+                                             kv_lora, dk, pos, pos_hw, n_rot,
+                                             base, eps);
+  return Status();
+}
+
+int hy4_rope_3d_copy(float* x, const int32_t* pos, const int32_t* pos_hw,
+                     uint32_t n, uint32_t heads, uint64_t tok_stride,
+                     uint64_t head_stride, uint32_t offset, uint32_t n_rot,
+                     float base, float* dst, uint64_t dst_tok,
+                     uint64_t dst_head, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (pos_hw != nullptr && n_rot != 64)
+    return 1;
+  const uint32_t work = heads * (n_rot / 2);
+  Rope<<<dim3((work + kBlock - 1) / kBlock, n), kBlock, 0, stream>>>(
+      x, pos, pos_hw, heads, tok_stride, head_stride, offset, n_rot, base, dst,
+      dst_tok, dst_head);
   return Status();
 }
 
