@@ -205,6 +205,7 @@ private:
   friend class Drafter;
   Model() = default;
   bool AllocScratch(std::string* error);
+  bool RouterToBf16(std::string* error);
 
   struct Shards;
   std::unique_ptr<Shards> shards_;
