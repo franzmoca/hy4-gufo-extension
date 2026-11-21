@@ -19,6 +19,12 @@
   fused into them. A 2048² image's first token takes 7.5 s instead of 9.6 s,
   a 1080p one 3.3 s instead of 4.9 s. Vision is now checked against Tencent's
   Transformers implementation (`tools/oracle/vision_reference.py`).
+- A conversation's earlier images are prepared once: decoded, resized and
+  hashed images stay in a 256 MiB cache keyed on their bytes, so each later
+  turn no longer decodes them again (20 to 170 ms per image per turn). With
+  ten images in the history (eight 1080p, two 12 MP photos) a follow-up turn
+  takes 0.33 s instead of 0.94 s. Prompts with images get a new cache
+  identity once, so their saved prompt caches are not reused.
 
 ## 0.2.0 (2026-11-21)
 

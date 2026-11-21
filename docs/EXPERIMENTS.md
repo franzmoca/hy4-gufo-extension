@@ -67,6 +67,7 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E59 | Grouped Q8_0 decode rows read as whole blocks | retained |
 | E60 | Decode time after E59 | analysis |
 | E61 | Vision tower GEMMs on hipBLASLt | retained |
+| E62 | Prepared image cache | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1450,4 +1451,30 @@ images give a geometric mean of 6.5e-4 relative RMS with hipBLASLt and 6.9e-4
 with hipBLAS, hipBLASLt the worse on 5 of 12. Retained. The first token is
 now half the language model's prefill of the image rows; attention (1.9 s of
 the 2.7 s at 2048², about 17 TFLOPS) is the tower's remaining cost.
+
+## E62: Prepared image cache (2026-11-21)
+
+A chat request carries the whole conversation, so every turn sent each
+earlier image again, and the prompt decoded, resized and hashed each one
+again before the prompt cache could match: 23 ms for a 2048² PNG, 43 ms for
+a 1080p JPEG and 166 ms for a 12 MP photo, per image per turn.
+
+`ImageCache` (`image_cache.cpp`, after Gufo's Qwen `ImageCache`) keeps the
+resized pixels and their SHA-256 for each image part's exact bytes and
+detail, least recently used out past 256 MiB (about twenty 2048² images or
+forty 1080p ones). The prompt identity takes each image's pixel digest
+instead of its pixels (version `v2`), so a hit hashes nothing.
+
+Ten images in the history (eight 1080p JPEGs, two 12 MP photos, 24,782
+tokens), five follow-up turns of a few tokens each:
+
+| | wall | first token |
+| --- | --- | --- |
+| before | 930 to 946 ms | 799 to 813 ms |
+| after | 317 to 334 ms | 176 to 188 ms |
+
+The first token is now the prefill of the new turn's tokens (about 175 ms).
+The rest of the wall time is the request itself: 20 MB of base64 JSON
+parsed and decoded per turn, which needs `--max-request-bytes` above its 8
+MB default. Retained.
 

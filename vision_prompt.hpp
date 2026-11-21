@@ -9,10 +9,12 @@
 #include <cstdint>
 #include <gufo/ext/image.hpp>
 #include <gufo/ext/text.hpp>
+#include <memory>
 #include <span>
 #include <string_view>
 #include <vector>
 
+#include "image_cache.hpp"
 #include "runtime/hy4_runtime.hpp"
 #include "runtime/tokenizer.hpp"
 
@@ -36,7 +38,7 @@ struct ImageSize {
 
 struct ImagePrompt {
   struct Image {
-    core::Image pixels;  ///< resized RGB8, sides multiples of 32
+    std::shared_ptr<const PreparedImage> image;
     ImageSpan span;
     /// Covers every image up to and including this one, with its placement,
     /// the preprocessing version and the encoder identity.
@@ -53,13 +55,14 @@ struct ImagePrompt {
       std::size_t token_count) const;
 };
 
-/// Renders `request`, decodes and resizes its images, and expands each into
-/// its rows. Throws std::invalid_argument for unreadable images and
-/// std::length_error past `max_context`.
+/// Renders `request`, decodes and resizes its images (through `cache` when
+/// given), and expands each into its rows. Throws std::invalid_argument for
+/// unreadable images and std::length_error past `max_context`.
 [[nodiscard]] ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
                                              const ext::ChatRequest& request,
                                              std::string_view encoder_identity,
-                                             std::uint32_t max_context);
+                                             std::uint32_t max_context,
+                                             ImageCache* cache = nullptr);
 
 }  // namespace gufo::models::hy4_flash
 

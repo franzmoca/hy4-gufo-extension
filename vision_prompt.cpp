@@ -86,7 +86,7 @@ std::span<const std::uint8_t> ImagePrompt::IdentityForPrefix(
 ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
                                const ext::ChatRequest& request,
                                std::string_view encoder_identity,
-                               std::uint32_t max_context) {
+                               std::uint32_t max_context, ImageCache* cache) {
   std::vector<std::size_t> offsets;
   std::vector<ContentSpan> spans;
   std::size_t stable = 0;
@@ -117,7 +117,8 @@ ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
     prompt.tokens.insert(prompt.tokens.end(), tokens.begin(), tokens.end());
   };
   crypto::Sha256Hasher identity;
-  HashText(identity, "hy4-image-bicubic-rgb8-f32-v1");
+  // v2: an image enters as the SHA-256 of its pixels, not the pixels.
+  HashText(identity, "hy4-image-bicubic-rgb8-f32-v2");
   HashText(identity, encoder_identity);
 
   // Image parts in render order: messages in order, each by offset.
@@ -139,9 +140,10 @@ ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
     cursor = offsets[i];
     if (!parts[i]->bytes)
       throw std::invalid_argument("image part has no data");
-    core::Image pixels =
-        PrepareImage(*parts[i]->bytes,
-                     parts[i]->detail == ext::ChatMessage::ImageDetail::kLow);
+    const bool low = parts[i]->detail == ext::ChatMessage::ImageDetail::kLow;
+    auto image = cache ? cache->Get(parts[i]->bytes, low)
+                       : PrepareAndHash(*parts[i]->bytes, low);
+    const core::Image& pixels = image->pixels;
     const ImageSpan span{static_cast<std::uint32_t>(prompt.tokens.size() + 1),
                          pixels.height / VisionEncoder::kFactor,
                          pixels.width / VisionEncoder::kFactor};
@@ -156,8 +158,8 @@ ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
     HashU32(identity, span.first);
     HashU32(identity, pixels.width);
     HashU32(identity, pixels.height);
-    identity.Update(pixels.pixels);
-    prompt.images.push_back({std::move(pixels), span, identity.Digest()});
+    identity.Update(image->digest);
+    prompt.images.push_back({std::move(image), span, identity.Digest()});
   }
   append(std::string_view(text).substr(cursor));
   const auto digest = identity.Finish();

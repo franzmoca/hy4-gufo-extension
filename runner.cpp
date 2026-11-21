@@ -106,8 +106,9 @@ public:
     auto& rows = rows_.at(index);
     if (!rows) {
       const auto& image = prompt_->images[index];
-      rows = encoder_->Encode(image.pixels.pixels.data(), image.pixels.width,
-                              image.pixels.height, error);
+      const core::Image& pixels = image.image->pixels;
+      rows = encoder_->Encode(pixels.pixels.data(), pixels.width, pixels.height,
+                              error);
       if (!rows)
         return nullptr;
       if (rows->rows() != image.span.Rows()) {
@@ -721,8 +722,9 @@ private:
     if (!vision_)
       throw std::invalid_argument(
           "image input requires the Hy4 Flash --mmproj BF16 sidecar");
-    return std::make_shared<const ImagePrompt>(PrepareImagePrompt(
-        *tokenizer_, request, vision_->Identity(), max_context_));
+    return std::make_shared<const ImagePrompt>(
+        PrepareImagePrompt(*tokenizer_, request, vision_->Identity(),
+                           max_context_, &image_cache_));
   }
 
   // A decode step between choosing its tokens and evaluating them: the
@@ -965,6 +967,8 @@ private:
   std::shared_ptr<Model> model_;
   std::shared_ptr<Drafter> drafter_;
   std::shared_ptr<VisionEncoder> vision_;
+  // Earlier turns' images, prepared once (image_cache.hpp).
+  mutable ImageCache image_cache_;
   std::uint32_t draft_tokens_{0};
   // Draft while the confidence head's chance that every draft so far is
   // accepted stays at least this (HY4_DFLY_MIN_ACCEPT overrides).

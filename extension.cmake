@@ -104,6 +104,7 @@ gufo_extension_target(
   NAME gufo_hy4flash_text
   SOURCES
     continuation_adapter.cpp
+    image_cache.cpp
     image_resize.cpp
     provider.cpp
     runner.cpp
