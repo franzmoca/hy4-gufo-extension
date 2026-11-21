@@ -452,47 +452,57 @@ void TestGemv() {
                         nullptr) != 0,
          "gemv_float rejects other types");
 
-  // Grouped Q8_0 with padded token and group strides.
-  const uint32_t groups = 3, mk = 64, kk = 96, n = 10;
-  const uint64_t x_grp = kk + 32, x_tok = groups * x_grp + 16, y_grp = mk + 8,
-                 y_tok = groups * y_grp + 4;
-  const auto w = RandomQ8_0(groups * mk * kk / 32);
-  const auto x = Random(n * x_tok);
-  float* y = Device(std::vector<float>(n * y_tok, 7.0f));
-  Expect(hy4_gemv_q8_0_grouped(Device(w), Device(x), y, mk, kk, groups, n,
-                               x_tok, x_grp, y_tok, y_grp, nullptr) == 0,
-         "gemv_q8_0_grouped status");
-  std::vector<double> want(n * y_tok, 7.0);
-  for (uint32_t t = 0; t < n; ++t)
-    for (uint32_t g = 0; g < groups; ++g)
-      for (uint32_t r = 0; r < mk; ++r) {
-        double acc = 0;
-        for (uint32_t i = 0; i < kk; ++i)
-          acc += Q8Value(w, ((std::size_t)g * mk + r) * kk + i) *
-                 x[t * x_tok + g * x_grp + i];
-        want[t * y_tok + g * y_grp + r] = acc;
+  // Grouped Q8_0 with padded token and group strides: k = 96 takes the
+  // generic kernel, 192 and 512 (wk_b, wv_b) the whole-block rows; m - 2
+  // rows (a partial row group) the generic one again.
+  for (auto [mk, kk] :
+       {std::pair<uint32_t, uint32_t>{64, 96}, {64, 192}, {32, 512}}) {
+    const uint32_t groups = 3, n = 10;
+    const std::string shape =
+        " m=" + std::to_string(mk) + " k=" + std::to_string(kk);
+    const uint64_t x_grp = kk + 32, x_tok = groups * x_grp + 16, y_grp = mk + 8,
+                   y_tok = groups * y_grp + 4;
+    const auto w = RandomQ8_0(groups * mk * kk / 32);
+    const auto x = Random(n * x_tok);
+    float* y = Device(std::vector<float>(n * y_tok, 7.0f));
+    Expect(hy4_gemv_q8_0_grouped(Device(w), Device(x), y, mk, kk, groups, n,
+                                 x_tok, x_grp, y_tok, y_grp, nullptr) == 0,
+           "gemv_q8_0_grouped status");
+    std::vector<double> want(n * y_tok, 7.0);
+    for (uint32_t t = 0; t < n; ++t)
+      for (uint32_t g = 0; g < groups; ++g)
+        for (uint32_t r = 0; r < mk; ++r) {
+          double acc = 0;
+          for (uint32_t i = 0; i < kk; ++i)
+            acc += Q8Value(w, ((std::size_t)g * mk + r) * kk + i) *
+                   x[t * x_tok + g * x_grp + i];
+          want[t * y_tok + g * y_grp + r] = acc;
+        }
+    Near(Host(y, n * y_tok), want, 1e-5, "gemv_q8_0_grouped" + shape);
+    {  // Each token as a one-token call computes it, also with a partial row
+       // group (m = 62).
+      for (const uint32_t m2 : {mk, mk - 2}) {
+        auto* dw = Device(w);
+        auto* dx = Device(x);
+        float* many = Device(std::vector<float>(n * y_tok, 7.0f));
+        Expect(hy4_gemv_q8_0_grouped(dw, dx, many, m2, kk, groups, n, x_tok,
+                                     x_grp, y_tok, y_grp, nullptr) == 0,
+               "gemv_q8_0_grouped many status");
+        const auto hm = Host(many, n * y_tok);
+        bool same = true;
+        for (uint32_t t = 0; t < n; ++t) {
+          float* one = Device(std::vector<float>(y_tok, 7.0f));
+          Expect(
+              hy4_gemv_q8_0_grouped(dw, dx + t * x_tok, one, m2, kk, groups, 1,
+                                    x_tok, x_grp, y_tok, y_grp, nullptr) == 0,
+              "gemv_q8_0_grouped one status");
+          const auto ho = Host(one, y_tok);
+          same &= std::memcmp(ho.data(), hm.data() + t * y_tok, y_tok * 4) == 0;
+        }
+        Expect(same, "gemv_q8_0_grouped tokens equal one-token calls" + shape +
+                         " m2=" + std::to_string(m2));
       }
-  Near(Host(y, n * y_tok), want, 1e-5, "gemv_q8_0_grouped");
-  {  // Each token as a one-token call computes it, also with a partial row
-     // group (m = 62).
-    const uint32_t m2 = 62;
-    auto* dw = Device(w);
-    auto* dx = Device(x);
-    float* many = Device(std::vector<float>(n * y_tok, 7.0f));
-    Expect(hy4_gemv_q8_0_grouped(dw, dx, many, m2, kk, groups, n, x_tok, x_grp,
-                                 y_tok, y_grp, nullptr) == 0,
-           "gemv_q8_0_grouped many status");
-    const auto hm = Host(many, n * y_tok);
-    bool same = true;
-    for (uint32_t t = 0; t < n; ++t) {
-      float* one = Device(std::vector<float>(y_tok, 7.0f));
-      Expect(hy4_gemv_q8_0_grouped(dw, dx + t * x_tok, one, m2, kk, groups, 1,
-                                   x_tok, x_grp, y_tok, y_grp, nullptr) == 0,
-             "gemv_q8_0_grouped one status");
-      const auto ho = Host(one, y_tok);
-      same &= std::memcmp(ho.data(), hm.data() + t * y_tok, y_tok * 4) == 0;
     }
-    Expect(same, "gemv_q8_0_grouped tokens equal one-token calls");
   }
 
   // The prefill absorption at Hy4's shape (wk_b 512 x 192, rope 64), with a

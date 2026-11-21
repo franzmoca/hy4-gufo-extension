@@ -733,6 +733,89 @@ __global__ void GemvQ8_0Grouped(const BlockQ8_0* w, const float* x, float* y,
     }
 }
 
+// Rows of whole Q8_0 blocks, k a multiple of 64 (so rows start 4-byte
+// aligned): 8 lanes per row, lane l taking blocks l, l + 8, ... as nine
+// aligned words around the block (its scale in the first word's low or high
+// half), so a row is read in full 32-bit loads. A block's 32 rows share one
+// group, whose nt input rows are staged in LDS. Each token sums alone: the
+// same bits for any nt.
+__device__ __forceinline__ void LoadQ8_0Words(const uint8_t* block, bool odd,
+                                              uint32_t (&v)[9]) {
+  const auto* words = reinterpret_cast<const uint32_t*>(block - (odd ? 2 : 0));
+#pragma unroll
+  for (int i = 0; i < 9; ++i)
+    v[i] = words[i];
+}
+
+// LDS stride of a 32-value input block: 36 floats, so the 8 lanes of a row
+// (blocks 0..7 of it) read 8 distinct 4-bank groups.
+constexpr uint32_t kRowsXStride = 36;
+
+__global__ void __launch_bounds__(kBlock)
+    GemvQ8_0Rows(const uint8_t* w, const float* x, float* y, uint32_t m,
+                 uint32_t k, uint32_t nt, uint64_t x_tok, uint64_t x_grp,
+                 uint64_t y_tok, uint64_t y_grp) {
+  extern __shared__ float xs[];  // [nt][k / 32][kRowsXStride]
+  const uint32_t g = blockIdx.y;
+  const uint32_t sub = threadIdx.x % 8;
+  const uint32_t row = blockIdx.x * (kBlock / 8) + threadIdx.x / 8;
+  const uint32_t nb = k / 32;
+  const uint8_t* base = w + ((uint64_t)g * m + min(row, m - 1)) * nb * 34;
+  // The first block's words are in flight while the inputs are staged.
+  uint32_t v[9] = {};
+  if (sub < nb)
+    LoadQ8_0Words(base + 34 * sub, sub & 1, v);
+  for (uint32_t i = threadIdx.x; i < nt * k; i += blockDim.x) {
+    const uint32_t t = i / k, c = i - t * k;
+    xs[(t * nb + c / 32) * kRowsXStride + c % 32] =
+        x[t * x_tok + g * x_grp + c];
+  }
+  __syncthreads();
+  float acc[kMaxTok] = {};
+  for (uint32_t b = sub; b < nb; b += 8) {
+    const bool odd = b & 1;  // the block starts 2 bytes into a word
+    if (b != sub)
+      LoadQ8_0Words(base + 34 * b, odd, v);
+    const uint16_t dh = odd ? (uint16_t)(v[0] >> 16) : (uint16_t)v[0];
+    const float d = __half2float(__ushort_as_half(dh));
+    float q[32];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const uint32_t word =
+          odd ? v[i + 1] : __builtin_amdgcn_alignbit(v[i + 1], v[i], 16);
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        q[4 * i + j] = (float)(int8_t)(word >> (8 * j));
+    }
+#pragma unroll
+    for (uint32_t t = 0; t < kMaxTok; ++t) {
+      if (t >= nt)
+        break;
+      const float4* xv =
+          reinterpret_cast<const float4*>(xs + (t * nb + b) * kRowsXStride);
+      float sum = 0.0f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const float4 xx = xv[i];
+        sum += q[4 * i] * xx.x + q[4 * i + 1] * xx.y + q[4 * i + 2] * xx.z +
+               q[4 * i + 3] * xx.w;
+      }
+      acc[t] += d * sum;
+    }
+  }
+#pragma unroll
+  for (uint32_t t = 0; t < kMaxTok; ++t) {
+    if (t >= nt)
+      break;
+    float s = acc[t];
+#pragma unroll
+    for (int off = 4; off > 0; off >>= 1)
+      s += __shfl_xor(s, off, 8);
+    if (sub == 0 && row < m)
+      y[t * y_tok + g * y_grp + row] = s;
+  }
+}
+
 // --------------------------------------------------------------------- rope
 
 // Interleaved M-RoPE (mrope_section [12, 10, 10] of 32 pairs): pair i takes
@@ -2358,8 +2441,19 @@ int hy4_gemv_q8_0_grouped(const void* w, const float* x, float* y, uint32_t m, u
                           hipStream_t stream) {
   if (k % 32)
     return 1;
+  // Whole-block rows when rows start aligned and a group's inputs fit LDS.
+  const bool rows_ok =
+      k % 64 == 0 && m % (kBlock / 8) == 0 && (uintptr_t)w % 4 == 0 &&
+      (uint64_t)kMaxTok * (k / 32) * kRowsXStride * sizeof(float) <= 32768;
   for (uint32_t t0 = 0; t0 < n; t0 += kMaxTok) {
     const uint32_t nt = n - t0 < kMaxTok ? n - t0 : kMaxTok;
+    if (rows_ok) {
+      GemvQ8_0Rows<<<dim3(m / (kBlock / 8), groups), kBlock,
+                     nt*(k / 32) * kRowsXStride * sizeof(float), stream>>>(
+          (const uint8_t*)w, x + t0 * x_tok, y + t0 * y_tok, m, k, nt, x_tok,
+          x_grp, y_tok, y_grp);
+      continue;
+    }
     // Four rows per warp from two tokens on, as in hy4_gemv_float.
     const uint32_t rows = nt > 1 ? 4 : 1;
     const uint32_t blocks =
