@@ -2,7 +2,7 @@
 
 AMD Strix Halo `gfx1151`, 128 GB unified memory. Xylolabs `Q4_K_M` GGUF
 target, Tencent DFly2 drafter. HTTP, greedy, thinking off. Gufo `0a473ebf`
-with this extension at `308ca55` (November 21, 2026); llama.cpp PR #32517
+with this extension at `22d0e06` (November 21, 2026); llama.cpp PR #32517
 (`cf70454a6`), which has no DFly2, so its DFly2 columns are its plain
 decoding. Positive gain favors Gufo.
 
@@ -92,7 +92,7 @@ llama.cpp has no DFly2; compare with its AR row above.
 
 ## Memory occupation
 
-Measured at `308ca55`. Peak device memory in use during the
+Measured at `22d0e06`. Peak device memory in use during the
 request. Gufo's figure includes its vision tower (1.05 GiB) and RAM prompt
 cache pages (2.1 GiB), which the llama.cpp run does without; the 16K row's
 4,096-token prompt maps the 5.6 GiB of wide prefill rows for its passes.

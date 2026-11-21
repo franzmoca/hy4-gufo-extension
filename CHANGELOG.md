@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.2.0 (2026-11-21)
+
+Built on upstream Gufo `0a473ebf`; needs extension API 0.3.29 or later.
+
+- Decode 15% faster: one user 16.4 → 18.8 tok/s at every depth up to 32K,
+  24 to 28 tok/s with DFly2 on mixed text, and eight users 68 → 85 tok/s in
+  all. Prefill is unchanged, and verify passes still compute what one-token
+  decoding does, so DFly2 and concurrent replies are identical to plain
+  decoding
+  ([E52](docs/EXPERIMENTS.md#e52-bf16-router-weights-2026-11-21) to
+  [E59](docs/EXPERIMENTS.md#e59-grouped-q8_0-decode-rows-read-as-whole-blocks-2026-11-21)):
+  - the routers are read as BF16, which holds their values exactly;
+  - the decode projections and routed experts read FP32 activations instead
+    of quantizing their inputs, the experts in two launches per layer, and a
+    verify pass reads each routed expert once;
+  - the hyper-connection boundaries, norms, ropes, the attention gate and
+    the residual adds take fewer launches (2,480 → 1,458 per token).
+- Greedy replies differ from 0.1.0 after a few dozen tokens: the decode sums
+  run in another order. Against an exact FP32 reference on the same weights,
+  the decoding passes score KL 0.051 (llama.cpp 0.083); see
+  [QUALITY.md](docs/QUALITY.md#text-kl-against-exact-arithmetic-2026-11-21).
+- `tools/oracle/reference.py` runs Tencent's Transformers implementation in
+  FP32 over the GGUF's weights and writes a KL base file; `hy4_eval_probe`
+  gains `--kl-decode` and `--hidden`.
+
 ## 0.1.0 (2026-11-20)
 
 First release. Built on upstream Gufo `0a473ebf` (0.35.0 and later commits);
