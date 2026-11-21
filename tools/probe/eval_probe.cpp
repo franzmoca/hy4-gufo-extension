@@ -9,7 +9,10 @@
 // TOKENS is a comma-separated id list or @FILE with whitespace-separated ids;
 // several prompts joined with '+' each run in a fresh session (after the
 // first, only their top probabilities are printed).
-// --logits writes the prompt's last-token logits as raw float32. --ppl N
+// --logits writes the prompt's last-token logits as raw float32. --hidden
+// PREFIX evaluates the prompt in prompt passes and writes every layer's
+// hyper-connection streams (PREFIX.h, float32 [layer][token][hc][n_embd])
+// and every token's logits (PREFIX.logits, float32 [token][vocab]). --ppl N
 // scores like llama-perplexity -c N: chunks of N tokens in fresh sessions,
 // the second half of each chunk scored. --kl BASE reads a llama-perplexity
 // --kl-divergence-base file (its tokens and log-probabilities) and reports
@@ -95,6 +98,7 @@ int main(int argc, char** argv) {
   int gen = 16;
   std::uint32_t ctx = 8192;
   std::string logits_path;
+  std::string hidden_prefix;
   std::uint32_t ppl = 0;
   std::string kl_path;
   bool kl_decode = false;
@@ -108,6 +112,8 @@ int main(int argc, char** argv) {
     if (a == "--gen") gen = std::atoi(argv[i + 1]);
     else if (a == "--ctx") ctx = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--logits") logits_path = argv[i + 1];
+    else if (a == "--hidden")
+      hidden_prefix = argv[i + 1];
     else if (a == "--ppl") ppl = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--kl") kl_path = argv[i + 1];
     else if (a == "--kl-decode") {
@@ -142,6 +148,35 @@ int main(int argc, char** argv) {
   }
 
   std::vector<float> logits;
+  if (!hidden_prefix.empty()) {
+    struct All {
+      std::vector<float> h;
+      std::size_t width;
+    } all{{}, std::size_t{model->config().hc} * model->config().n_embd};
+    auto keep = [](void* user, int layer, const float* h, std::uint32_t n) {
+      auto* a = static_cast<All*>(user);
+      if (layer >= 0)
+        a->h.insert(a->h.end(), h, h + std::size_t{n} * a->width);
+    };
+    auto s = model->CreateSession(ctx, &error);
+    if (!s) {
+      std::fprintf(stderr, "session failed: %s\n", error.c_str());
+      return 1;
+    }
+    s->SetLayerProbe(keep, &all);
+    std::vector<float> rows;
+    if (!s->Evaluate(prompt, &rows, true, &error, true)) {
+      std::fprintf(stderr, "evaluate failed: %s\n", error.c_str());
+      return 1;
+    }
+    std::ofstream(hidden_prefix + ".h", std::ios::binary)
+        .write(reinterpret_cast<const char*>(all.h.data()),
+               static_cast<std::streamsize>(all.h.size() * sizeof(float)));
+    std::ofstream(hidden_prefix + ".logits", std::ios::binary)
+        .write(reinterpret_cast<const char*>(rows.data()),
+               static_cast<std::streamsize>(rows.size() * sizeof(float)));
+    return 0;
+  }
   if (chunkcheck) {
     // The prompt prefilled whole (passes of MaxChunk() from token 0) and split
     // at token `chunkcheck` (as after a prompt-cache restore there): the
@@ -401,7 +436,8 @@ int main(int argc, char** argv) {
     const std::size_t vocab = static_cast<std::size_t>(n_vocab);
     const std::size_t nv = 2 * ((vocab + 1) / 2) + 4;
     std::vector<std::uint16_t> rec(nv);
-    double sum_kl = 0.0, sum_kl2 = 0.0, nll = 0.0, nll_base = 0.0;
+    double sum_kl = 0.0, sum_kl2 = 0.0, nll = 0.0, nll_base = 0.0,
+           nll_clamped = 0.0;
     std::size_t count = 0, same_top = 0;
     std::vector<double> logp(vocab);
     for (std::int32_t ch = 0; ch < n_chunk; ++ch) {
@@ -459,6 +495,9 @@ int main(int argc, char** argv) {
           }
           const std::int32_t next = ct[at + 1];
           nll += lse - row[next];
+          // As the base file records it: logits below max - 16 read as max
+          // - 16.
+          nll_clamped += lse - std::max(row[next], mx - 16.0f);
           nll_base -= scale * q[next] + min_lp;
           sum_kl += kl;
           sum_kl2 += kl * kl;
@@ -473,9 +512,14 @@ int main(int argc, char** argv) {
     }
     const double mean = sum_kl / static_cast<double>(count);
     const double err = std::sqrt((sum_kl2 / static_cast<double>(count) - mean * mean) / static_cast<double>(count));
-    std::printf("KL %.5f +/- %.5f, same top %.2f%%, PPL %.4f (base %.4f) over %zu tokens\n", mean, err,
-                100.0 * static_cast<double>(same_top) / static_cast<double>(count),
-                std::exp(nll / static_cast<double>(count)), std::exp(nll_base / static_cast<double>(count)), count);
+    std::printf(
+        "KL %.5f +/- %.5f, same top %.2f%%, PPL %.4f (%.4f clamped as the "
+        "base, base %.4f) over %zu tokens\n",
+        mean, err,
+        100.0 * static_cast<double>(same_top) / static_cast<double>(count),
+        std::exp(nll / static_cast<double>(count)),
+        std::exp(nll_clamped / static_cast<double>(count)),
+        std::exp(nll_base / static_cast<double>(count)), count);
     return 0;
   }
   if (ppl > 0) {

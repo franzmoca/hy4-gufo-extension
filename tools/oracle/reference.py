@@ -257,8 +257,9 @@ def engram_first_rows(w: Weights, cfg) -> dict[int, int]:
 
 
 @torch.no_grad()
-def forward(w: Weights, cfg, tokens: list[int], log=print) -> torch.Tensor:
-    """Logits [len(tokens), vocab] of one sequence from position 0."""
+def forward(w: Weights, cfg, tokens: list[int], log=print, hidden=None) -> torch.Tensor:
+    """Logits [len(tokens), vocab] of one sequence from position 0; with `hidden` (a file), every
+    layer's hyper-connection streams are appended to it as float32 [token][hc][hidden_size]."""
     with torch.device("meta"):
         model = M.HYV4FlashTextModel(cfg)
     model.rotary_emb = M.HYV4FlashRotaryEmbedding(config=cfg)
@@ -287,6 +288,8 @@ def forward(w: Weights, cfg, tokens: list[int], log=print) -> torch.Tensor:
                   position_ids=position_ids, cache=None, use_cache=False, indexer_position_ids=position_ids,
                   ngram_tokens=ngram_tokens, engram_mask=engram_mask)
         model.layers[il] = None
+        if hidden is not None:
+            h[0].numpy().astype("<f4").tofile(hidden)
         log(f"layer {il:2d} {layer.attention_type:18s} {time.time() - t0:6.1f} s")
     out = model.norm(head(h))[0]
     logits = torch.empty(n, w.tensors["output.weight"].data.shape[0])
@@ -324,6 +327,7 @@ def main():
     ap.add_argument("--chunks", type=int, default=0, help="score the first N chunks (default: all)")
     ap.add_argument("--tokens", help="comma-separated token ids: write all their logits to --logits")
     ap.add_argument("--logits", help="raw float32 [tokens, vocab] output for --tokens")
+    ap.add_argument("--hidden", help="with --tokens: every layer's streams, float32 [layer][token][hc][dim]")
     ap.add_argument("--threads", type=int, default=0)
     args = ap.parse_args()
     if args.threads:
@@ -334,7 +338,9 @@ def main():
     log = lambda s: print(s, file=sys.stderr, flush=True)  # noqa: E731
     if args.tokens:
         tokens = [int(t) for t in args.tokens.split(",") if t]
-        forward(w, cfg, tokens, log).numpy().astype("<f4").tofile(args.logits)
+        with open(args.hidden, "wb") if args.hidden else open("/dev/null", "wb") as hidden:
+            logits = forward(w, cfg, tokens, log, hidden if args.hidden else None)
+        logits.numpy().astype("<f4").tofile(args.logits)
         return
     with open(args.base, "rb") as f:
         magic, n_ctx, n_vocab, n_chunk = struct.unpack("<8sIii", f.read(20))
