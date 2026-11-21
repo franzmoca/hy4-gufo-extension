@@ -367,7 +367,9 @@ public:
       const ChatRequest& request) const override {
     if (HasImages(request))
       return RunnerTokens(PrepareImages(request)->tokens);
-    auto tokens = RunnerTokens(tokenizer_->EncodeWithSpecials(RenderChat(request)));
+    std::vector<ContentSpan> spans;
+    const std::string rendered = RenderChat(request, nullptr, &spans);
+    auto tokens = RunnerTokens(tokenizer_->EncodeWithSpecials(rendered, spans));
     if (tokens.empty()) return std::nullopt;
     return tokens;
   }

@@ -64,53 +64,88 @@ std::string ToolJson(const ext::ChatTool& tool) {
   return out;
 }
 
-std::string ToolsPrompt(const std::vector<ext::ChatTool>& tools) {
-  std::string out =
-      "# Tools\n\nYou may call one or more functions to assist with the user query."
-      "\n\nYou are provided with function signatures within <tools></tools> XML tags:"
-      "\n<tools>\n";
+// The rendered prompt and, when asked for, the spans of request text in it.
+class Writer {
+public:
+  explicit Writer(std::vector<ContentSpan>* spans) : spans_(spans) {}
+
+  /// Template framing: its control-token spellings are control tokens.
+  void Markup(std::string_view text) { out_ += text; }
+
+  /// Request text: its control-token spellings stay text.
+  void Text(std::string_view text) {
+    if (text.empty())
+      return;
+    if (spans_ != nullptr) {
+      if (!spans_->empty() &&
+          spans_->back().offset + spans_->back().size == out_.size()) {
+        spans_->back().size += text.size();
+      } else {
+        spans_->push_back({out_.size(), text.size()});
+      }
+    }
+    out_ += text;
+  }
+
+  std::string& str() { return out_; }
+
+private:
+  std::string out_;
+  std::vector<ContentSpan>* spans_;
+};
+
+void ToolsPrompt(Writer& w, const std::vector<ext::ChatTool>& tools) {
+  w.Markup(
+      "# Tools\n\nYou may call one or more functions to assist with the user "
+      "query."
+      "\n\nYou are provided with function signatures within <tools></tools> "
+      "XML tags:"
+      "\n<tools>\n");
   bool first = true;
   for (const auto& tool : tools) {
     const std::string line = ToolJson(tool);
     if (line.empty())
       continue;
     if (!first)
-      out += "\n";
+      w.Markup("\n");
     first = false;
-    out += line;
+    w.Text(line);
   }
-  out += "\n</tools>\n\n";
-  out += "For function call returns, you should first print ";
-  out += T::kCallsOpen;
-  out += "\nFor each function call, you should return object like:\n";
-  out += T::kCallOpen;
-  out += "{function-name}";
-  out += std::string(T::kKeyOpen) + "{arg-key-1}" + std::string(T::kKeyClose);
-  out += std::string(T::kValueOpen) + "{arg-value-1}" + std::string(T::kValueClose);
-  out += std::string(T::kKeyOpen) + "{arg-key-2}" + std::string(T::kKeyClose);
-  out += std::string(T::kValueOpen) + "{arg-value-2}" + std::string(T::kValueClose);
-  out += "...";
-  out += T::kCallClose;
-  out += "\nAt the end of function call returns, you should print ";
-  out += T::kCallsClose;
-  return out;
+  w.Markup("\n</tools>\n\n");
+  w.Markup("For function call returns, you should first print ");
+  w.Markup(T::kCallsOpen);
+  w.Markup("\nFor each function call, you should return object like:\n");
+  w.Markup(T::kCallOpen);
+  w.Markup("{function-name}");
+  w.Markup(std::string(T::kKeyOpen) + "{arg-key-1}" +
+           std::string(T::kKeyClose));
+  w.Markup(std::string(T::kValueOpen) + "{arg-value-1}" +
+           std::string(T::kValueClose));
+  w.Markup(std::string(T::kKeyOpen) + "{arg-key-2}" +
+           std::string(T::kKeyClose));
+  w.Markup(std::string(T::kValueOpen) + "{arg-value-2}" +
+           std::string(T::kValueClose));
+  w.Markup("...");
+  w.Markup(T::kCallClose);
+  w.Markup("\nAt the end of function call returns, you should print ");
+  w.Markup(T::kCallsClose);
 }
 
 // The message text with `image` at each image part's offset.
-std::string Content(const ChatMessage& message, std::string_view image) {
+void Content(Writer& w, const ChatMessage& message, std::string_view image) {
   std::vector<std::size_t> offsets;
   for (const auto& part : message.images)
     offsets.push_back(std::min(part.offset, message.content.size()));
   std::ranges::stable_sort(offsets);
-  std::string out;
+  const std::string_view content = message.content;
   std::size_t cursor = 0;
   for (const std::size_t offset : offsets) {
-    out.append(message.content, cursor, offset - cursor);
-    out += image;
+    w.Text(content.substr(cursor, offset - cursor));
+    w.Markup(image);
     cursor = offset;
   }
-  out.append(message.content, cursor);
-  return out + message.framing_suffix;
+  w.Text(content.substr(cursor));
+  w.Text(message.framing_suffix);
 }
 
 // A marker no message text contains, for RenderChat's image offsets.
@@ -130,12 +165,10 @@ std::string ImageMarker(const ext::ChatRequest& request) {
   }
 }
 
-void Turn(std::string& out, std::string_view role, std::string_view body) {
-  out += T::kStart;
-  out += role;
-  out += T::kMiddle;
-  out += body;
-  out += T::kEnd;
+void TurnStart(Writer& w, std::string_view role) {
+  w.Markup(T::kStart);
+  w.Markup(role);
+  w.Markup(T::kMiddle);
 }
 
 // A tool argument value: strings raw, other values as tojson.
@@ -157,32 +190,40 @@ std::string_view ReasoningEffortName(const ReasoningOptions& reasoning) {
 }
 
 std::string RenderChat(const ext::ChatRequest& request,
-                       std::vector<std::size_t>* image_offsets) {
+                       std::vector<std::size_t>* image_offsets,
+                       std::vector<ContentSpan>* content_spans) {
   const auto& messages = request.messages;
   const std::string marker = image_offsets ? ImageMarker(request)
                                            : std::string(T::kImageStart) +
                                                  std::string(T::kImagePad) +
                                                  std::string(T::kImageEnd);
-  const auto Content = [&](const ChatMessage& message) {
-    return hy4_flash::Content(message, marker);
-  };
+  if (content_spans)
+    content_spans->clear();
+  Writer w(content_spans);
   std::vector<ext::ChatTool> tools;
   if (request.tool_choice != ext::ChatRequest::ToolChoice::kNone) tools = request.tools;
   const std::string_view effort = ReasoningEffortName(request.reasoning);
   const bool no_think = effort == "no_think";
   const bool preserved = request.reasoning.preserve_thinking.value_or(!tools.empty());
-  const std::string mode = std::string(T::kReasoningMode) + "reasoning_effort:" + std::string(effort);
+  const auto Mode = [&] {
+    w.Markup(T::kReasoningMode);
+    w.Markup("reasoning_effort:");
+    w.Markup(effort);
+  };
 
   std::ptrdiff_t last_user = -1;
   for (std::size_t i = 0; i < messages.size(); ++i) {
     if (messages[i].role == ChatRole::kUser) last_user = static_cast<std::ptrdiff_t>(i);
   }
 
-  std::string out;
   const bool leading_system =
       !messages.empty() && (messages[0].role == ChatRole::kSystem || messages[0].role == ChatRole::kDeveloper);
   if (!leading_system) {
-    Turn(out, "system", (tools.empty() ? std::string() : ToolsPrompt(tools)) + mode);
+    TurnStart(w, "system");
+    if (!tools.empty())
+      ToolsPrompt(w, tools);
+    Mode();
+    w.Markup(T::kEnd);
   }
 
   // Tool-call ids of the last assistant turn, to order the responses after it.
@@ -212,13 +253,13 @@ std::string RenderChat(const ext::ChatRequest& request,
           matched = false;
         }
       }
-      std::string body;
+      TurnStart(w, "tool");
       for (const ChatMessage* t : matched ? ordered : cluster) {
-        body += T::kResponseOpen;
-        body += Content(*t);
-        body += T::kResponseClose;
+        w.Markup(T::kResponseOpen);
+        Content(w, *t, marker);
+        w.Markup(T::kResponseClose);
       }
-      Turn(out, "tool", body);
+      w.Markup(T::kEnd);
       call_ids.clear();
       i = end - 1;
       continue;
@@ -227,24 +268,28 @@ std::string RenderChat(const ext::ChatRequest& request,
       if (!m.images.empty())
         throw std::invalid_argument(
             "Hy4 Flash system messages cannot contain images");
-      std::string body;
+      TurnStart(w, "system");
       if (i == 0) {
-        if (!tools.empty()) body += ToolsPrompt(tools);
-        const std::string content = Content(m);
-        if (!tools.empty() && !content.empty()) body += "\n\n";
-        body += content;
-        body += mode;
+        if (!tools.empty()) {
+          ToolsPrompt(w, tools);
+          if (!m.content.empty() || !m.framing_suffix.empty())
+            w.Markup("\n\n");
+        }
+        Content(w, m, marker);
+        Mode();
       } else {
-        body = Content(m);
+        Content(w, m, marker);
       }
-      Turn(out, "system", body);
+      w.Markup(T::kEnd);
     } else if (m.role == ChatRole::kAssistant) {
-      std::string body(T::kThinkOpen);
-      if (!no_think && (preserved || static_cast<std::ptrdiff_t>(i) > last_user) && !m.thought.empty()) {
-        body += m.thought;
+      TurnStart(w, "assistant");
+      w.Markup(T::kThinkOpen);
+      if (!no_think &&
+          (preserved || static_cast<std::ptrdiff_t>(i) > last_user)) {
+        w.Text(m.thought);
       }
-      body += T::kThinkClose;
-      body += Content(m);
+      w.Markup(T::kThinkClose);
+      Content(w, m, marker);
       if (!m.tool_calls.empty()) {
         call_ids.clear();
         bool complete = true;
@@ -256,51 +301,74 @@ std::string RenderChat(const ext::ChatRequest& request,
           }
         }
         if (!complete) call_ids.clear();
-        body += T::kCallsOpen;
+        w.Markup(T::kCallsOpen);
         for (const auto& call : m.tool_calls) {
-          body += T::kCallOpen;
-          body += call.name;
+          w.Markup(T::kCallOpen);
+          w.Text(call.name);
           for (const auto& argument : call.arguments) {
-            body += T::kKeyOpen;
-            body += argument.name;
-            body += T::kKeyClose;
-            body += T::kValueOpen;
-            body += ArgumentValue(argument);
-            body += T::kValueClose;
+            w.Markup(T::kKeyOpen);
+            w.Text(argument.name);
+            w.Markup(T::kKeyClose);
+            w.Markup(T::kValueOpen);
+            w.Text(ArgumentValue(argument));
+            w.Markup(T::kValueClose);
           }
-          body += T::kCallClose;
+          w.Markup(T::kCallClose);
         }
-        body += T::kCallsClose;
+        w.Markup(T::kCallsClose);
       }
-      Turn(out, "assistant", body);
+      w.Markup(T::kEnd);
       if (!m.tool_calls.empty()) continue;  // keep call_ids for the responses
     } else {
-      Turn(out, RoleName(m.role), Content(m));
+      TurnStart(w, RoleName(m.role));
+      Content(w, m, marker);
+      w.Markup(T::kEnd);
     }
     call_ids.clear();
   }
 
   if (messages.empty() || messages.back().role != ChatRole::kAssistant) {
-    out += T::kStart;
-    out += "assistant";
-    out += T::kMiddle;
-    out += T::kThinkOpen;
-    if (no_think) out += T::kThinkClose;
+    TurnStart(w, "assistant");
+    w.Markup(T::kThinkOpen);
+    if (no_think)
+      w.Markup(T::kThinkClose);
   }
+  std::string& out = w.str();
   if (image_offsets) {
     image_offsets->clear();
     std::string clean;
+    std::vector<std::size_t> removed;  // marker offsets in `out`
     std::size_t cursor = 0;
     for (std::size_t at = out.find(marker); at != std::string::npos;
          at = out.find(marker, cursor)) {
       clean.append(out, cursor, at - cursor);
       image_offsets->push_back(clean.size());
+      removed.push_back(at);
       cursor = at + marker.size();
     }
     clean.append(out, cursor);
     out = std::move(clean);
+    if (content_spans) {
+      // An offset in `out` less the markers that ended at or before it.
+      const auto rebase = [&](std::size_t offset) {
+        std::size_t gone = 0;
+        for (const std::size_t at : removed) {
+          if (at + marker.size() > offset)
+            break;
+          gone += marker.size();
+        }
+        return offset - gone;
+      };
+      for (auto& span : *content_spans) {
+        const std::size_t begin = rebase(span.offset);
+        span.size = rebase(span.offset + span.size) - begin;
+        span.offset = begin;
+      }
+      std::erase_if(*content_spans,
+                    [](const ContentSpan& span) { return span.size == 0; });
+    }
   }
-  return out;
+  return std::move(out);
 }
 
 }  // namespace gufo::models::hy4_flash

@@ -80,14 +80,16 @@ ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
                                std::string_view encoder_identity,
                                std::uint32_t max_context) {
   std::vector<std::size_t> offsets;
-  const std::string text = RenderChat(request, &offsets);
+  std::vector<ContentSpan> spans;
+  const std::string text = RenderChat(request, &offsets, &spans);
   const std::int32_t start = SingleToken(tokenizer, Hy4Tokens::kImageStart);
   const std::int32_t pad = SingleToken(tokenizer, Hy4Tokens::kImagePad);
   const std::int32_t end = SingleToken(tokenizer, Hy4Tokens::kImageEnd);
 
   ImagePrompt prompt;
   const auto append = [&](std::string_view piece) {
-    const auto tokens = tokenizer.EncodeWithSpecials(piece);
+    const auto tokens = tokenizer.EncodeWithSpecials(
+        piece, spans, static_cast<std::size_t>(piece.data() - text.data()));
     if (tokens.size() > max_context - std::min<std::size_t>(
                                           max_context, prompt.tokens.size())) {
       throw std::length_error(

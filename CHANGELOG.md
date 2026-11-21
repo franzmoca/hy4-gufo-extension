@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Control-token spellings in request text stay text. Message content,
+  reasoning, tool definitions, call names and arguments, and tool results
+  used to turn `</think:opensource>`, `<｜hy_end:opensource｜>` and the other
+  control spellings into control tokens, so a reply that leaked a tag, or a
+  file or page a tool returned, could close a turn or a reasoning block in
+  the next prompt. Prompts without such spellings tokenize as before, so
+  cached prompts stay valid.
+
 ## 0.2.0 (2026-11-21)
 
 Built on upstream Gufo `0a473ebf`; needs extension API 0.3.29 or later.

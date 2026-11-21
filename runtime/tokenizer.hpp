@@ -6,13 +6,15 @@
 // extension.
 
 #include <cstdint>
+#include <gufo/ext/gguf_reader.hpp>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
-#include <gufo/ext/gguf_reader.hpp>
+#include "chat_template.hpp"
 
 namespace gufo::models::hy4_flash {
 
@@ -24,8 +26,12 @@ public:
   /// Plain text: special-token spellings are tokenized as text.
   [[nodiscard]] std::vector<std::int32_t> Encode(std::string_view text) const;
   /// Rendered chat: every control or user-defined token spelling becomes its
-  /// id (longest match); the text between is plain.
-  [[nodiscard]] std::vector<std::int32_t> EncodeWithSpecials(std::string_view text) const;
+  /// id (longest match); the text between is plain. A spelling that overlaps
+  /// one of `literal` stays text; its offsets count from `base` (`text`
+  /// begins at byte `base` of the rendered prompt) and are in order.
+  [[nodiscard]] std::vector<std::int32_t> EncodeWithSpecials(
+      std::string_view text, std::span<const ContentSpan> literal = {},
+      std::size_t base = 0) const;
   /// The bytes of one token: special tokens decode to their spelling.
   [[nodiscard]] std::string Decode(std::int32_t token) const;
 

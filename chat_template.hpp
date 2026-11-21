@@ -39,14 +39,24 @@ struct Hy4Tokens {
 /// The template's `reasoning_effort`: `no_think`, `high` or `max`.
 [[nodiscard]] std::string_view ReasoningEffortName(const ReasoningOptions& reasoning);
 
+/// A byte range of a rendered prompt that holds request text: message
+/// content, reasoning, tool definitions, call names and arguments. Its
+/// control-token spellings are text, not control tokens.
+struct ContentSpan {
+  std::size_t offset = 0;
+  std::size_t size = 0;
+};
+
 /// Renders `request` as the template does with add_generation_prompt: the
 /// prompt ends inside an open assistant turn (after `<think>` when thinking).
 /// `developer` messages render as system messages. An image part renders as
 /// its start, pad and end tokens; with `image_offsets` it renders as nothing
-/// and its byte offset in the result is appended instead.
+/// and its byte offset in the result is appended instead. `content_spans`
+/// receives the request text's ranges in the result, in order.
 [[nodiscard]] std::string RenderChat(
     const ext::ChatRequest& request,
-    std::vector<std::size_t>* image_offsets = nullptr);
+    std::vector<std::size_t>* image_offsets = nullptr,
+    std::vector<ContentSpan>* content_spans = nullptr);
 
 }  // namespace gufo::models::hy4_flash
 

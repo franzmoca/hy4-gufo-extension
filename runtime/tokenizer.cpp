@@ -289,10 +289,13 @@ std::vector<std::int32_t> Tokenizer::Encode(std::string_view text) const {
   return out;
 }
 
-std::vector<std::int32_t> Tokenizer::EncodeWithSpecials(std::string_view text) const {
+std::vector<std::int32_t> Tokenizer::EncodeWithSpecials(
+    std::string_view text, std::span<const ContentSpan> literal,
+    std::size_t base) const {
   std::vector<std::int32_t> out;
   std::size_t span = 0;
   std::size_t p = 0;
+  std::size_t next = 0;  // first literal span that may reach past `p`
   while (p < text.size()) {
     std::int32_t hit = -1;
     for (const std::int32_t id : specials_by_byte_[static_cast<std::uint8_t>(text[p])]) {
@@ -301,6 +304,17 @@ std::vector<std::int32_t> Tokenizer::EncodeWithSpecials(std::string_view text) c
         hit = id;
         break;
       }
+    }
+    if (hit >= 0) {
+      // Request text spells control tokens as characters.
+      const std::size_t at = base + p;
+      while (next < literal.size() &&
+             literal[next].offset + literal[next].size <= at)
+        ++next;
+      if (next < literal.size() &&
+          literal[next].offset <
+              at + tokens_[static_cast<std::size_t>(hit)].size())
+        hit = -1;
     }
     if (hit < 0) {
       ++p;
