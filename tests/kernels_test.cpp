@@ -1488,6 +1488,114 @@ void TestBf16() {
          "sgemm_nt_bf16 equals sgemm_nt on the widened weights");
 }
 
+// The FP32-activation decode GEMVs against double precision on the
+// dequantized weights: rows past a 32-row tile, every token count the
+// dispatch distinguishes, each token equal to a one-token call, the split
+// layout (scratch) equal to the lane layout (none), pairs equal to single
+// calls, and the fused SwiGLU.
+void TestDecodeGemv() {
+  const uint32_t k = 512;
+  void* scratch = nullptr;
+  Expect(hipMalloc(&scratch, hy4_gemv_scratch_bytes()) == hipSuccess &&
+             hipMemset(scratch, 0, hy4_gemv_scratch_bytes()) == hipSuccess,
+         "gemv scratch");
+  for (int type : {HY4_TYPE_Q8_0, HY4_TYPE_Q4_K, HY4_TYPE_Q6_K}) {
+    const std::string name = "gemv type " + std::to_string(type);
+    for (uint32_t m : {96u, 70u}) {
+      const auto wq = RandomQuant(type, m, k);
+      const auto wd = Dequant(type, wq);
+      const auto x = Random(16 * k);
+      const uint8_t* dw = Device(wq);
+      float* dx = Device(x);
+      std::vector<std::vector<float>> one(16);
+      for (uint32_t t = 0; t < 16; ++t) {
+        float* y = Device(std::vector<float>(m));
+        Expect(
+            hy4_gemv(type, dw, dx + t * k, y, m, k, 1, scratch, nullptr) == 0,
+            name + " status");
+        one[t] = Host(y, m);
+      }
+      std::vector<double> want(16 * m, 0.0);
+      for (uint32_t t = 0; t < 16; ++t)
+        for (uint32_t r = 0; r < m; ++r)
+          for (uint32_t i = 0; i < k; ++i)
+            want[t * m + r] += wd[r * k + i] * x[t * k + i];
+      std::vector<float> got;
+      for (const auto& v : one)
+        got.insert(got.end(), v.begin(), v.end());
+      Near(got, want, 1e-5, name + " m=" + std::to_string(m));
+      for (uint32_t n : {2u, 3u, 4u, 5u, 6u, 8u, 11u, 16u}) {
+        for (void* sc : {scratch, static_cast<void*>(nullptr)}) {
+          float* y = Device(std::vector<float>(n * m));
+          Expect(hy4_gemv(type, dw, dx, y, m, k, n, sc, nullptr) == 0,
+                 name + " status");
+          const auto many = Host(y, n * m);
+          bool same = true;
+          for (uint32_t t = 0; t < n; ++t)
+            same &= std::memcmp(many.data() + t * m, one[t].data(), m * 4) == 0;
+          Expect(same,
+                 name + " m=" + std::to_string(m) + " n=" + std::to_string(n) +
+                     (sc ? " split" : " lanes") + " equals one-token calls");
+        }
+      }
+    }
+    // A pair as two single calls, and the SwiGLU of gate and up.
+    const uint32_t m1 = 64, m2 = 96, n = 6;
+    const auto w1 = RandomQuant(type, m1, k), w2 = RandomQuant(type, m2, k);
+    const auto x = Random(n * k);
+    const uint8_t *d1 = Device(w1), *d2 = Device(w2);
+    float* dx = Device(x);
+    float *a1 = Device(std::vector<float>(n * m1)),
+          *a2 = Device(std::vector<float>(n * m2)),
+          *b1 = Device(std::vector<float>(n * m1)),
+          *b2 = Device(std::vector<float>(n * m2));
+    Expect(hy4_gemv_pair(type, d1, a1, m1, d2, a2, m2, dx, k, n, scratch,
+                         nullptr) == 0 &&
+               hy4_gemv(type, d1, dx, b1, m1, k, n, scratch, nullptr) == 0 &&
+               hy4_gemv(type, d2, dx, b2, m2, k, n, scratch, nullptr) == 0,
+           name + " pair status");
+    Expect(Host(a1, n * m1) == Host(b1, n * m1) &&
+               Host(a2, n * m2) == Host(b2, n * m2),
+           name + " pair equals single calls");
+    const auto up = RandomQuant(type, m1, k);
+    const uint8_t* du = Device(up);
+    float* u = Device(std::vector<float>(n * m1));
+    for (uint32_t cols : {1u, n}) {
+      for (float limit : {0.0f, 0.05f}) {
+        float* y = Device(std::vector<float>(cols * m1));
+        Expect(
+            hy4_gemv_swiglu(type, d1, du, dx, y, m1, k, limit, cols, scratch,
+                            nullptr) == 0 &&
+                hy4_gemv(type, du, dx, u, m1, k, cols, scratch, nullptr) == 0,
+            name + " swiglu status");
+        const auto g = Host(b1, cols * m1), uv = Host(u, cols * m1);
+        std::vector<double> want(cols * m1);
+        for (std::size_t i = 0; i < want.size(); ++i) {
+          double gi = g[i], ui = uv[i];
+          if (limit > 0) {
+            gi = std::min<double>(gi, limit);
+            ui = std::clamp<double>(ui, -limit, limit);
+          }
+          want[i] = gi / (1.0 + std::exp(-gi)) * ui;
+        }
+        Near(Host(y, cols * m1), want, 1e-6,
+             name + " swiglu n=" + std::to_string(cols) +
+                 " limit=" + std::to_string(limit));
+      }
+    }
+  }
+  Expect(hy4_gemv(HY4_TYPE_Q8_0, nullptr, nullptr, nullptr, 32, 96, 1, scratch,
+                  nullptr) != 0,
+         "gemv rejects k % 256");
+  Expect(hy4_gemv(HY4_TYPE_Q8_0, nullptr, nullptr, nullptr, 32, 256, 17,
+                  scratch, nullptr) != 0,
+         "gemv rejects more than 16 tokens");
+  Expect(hy4_gemv(HY4_TYPE_F16, nullptr, nullptr, nullptr, 32, 256, 1, scratch,
+                  nullptr) != 0,
+         "gemv rejects other types");
+  (void)hipFree(scratch);
+}
+
 void TestF16Matmul() {
   const auto half_round = [](const std::vector<float>& x) {
     std::vector<double> r(x.size());
@@ -1784,6 +1892,7 @@ int main() {
   TestKpool();
   TestAttnSoftmax();
   TestF16Matmul();
+  TestDecodeGemv();
   TestSgemm();
   TestBf16();
   TestMoeShared();

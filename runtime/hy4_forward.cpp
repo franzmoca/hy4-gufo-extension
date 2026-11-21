@@ -76,6 +76,9 @@ std::uint64_t ExpertBytes(const Tensor& w) {
 
 }  // namespace
 
+static_assert(Model::kVecMax <= HY4_GEMV_MAX_TOKENS,
+              "decode passes fit hy4_gemv");
+
 bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m,
             std::uint32_t k, std::uint32_t n, const Exec& ex,
             std::string* error, const std::uint16_t* xh) {
@@ -119,15 +122,9 @@ bool MatVec(const Tensor& w, const float* x, float* y, std::uint32_t m,
                                         static_cast<int>(k), stream));
           return true;
         }
-        // MMVQ takes up to 8 columns, each summed as a one-column launch
-        // sums it, so wider passes run in 8-column launches.
-        for (std::uint32_t t = 0; t < n; t += 8) {
-          const std::uint32_t nt = std::min<std::uint32_t>(8, n - t);
-          HY4_CHECK(hy4_mmq_dense_vec_typed(
-              w.type, w.data, x + std::size_t{t} * k, y + std::size_t{t} * m,
-              static_cast<int>(m), static_cast<int>(nt), static_cast<int>(k),
-              stream));
-        }
+        // FP32 activations; each token sums as a one-token call does.
+        HY4_CHECK(
+            hy4_gemv(w.type, w.data, x, y, m, k, n, ex.gemv_scratch, stream));
         return true;
       }
       if (w.type == HY4_TYPE_Q8_0) {
@@ -168,6 +165,14 @@ bool MatVecPair(const Tensor& w1, float* y1, std::uint32_t m1, const Tensor& w2,
     HY4_CHECK(hy4_f16_dense_pair(w1.type, w1.data, y1, m1, w2.data, y2, m2,
                                  xh ? static_cast<const void*>(xh) : x, n, k,
                                  xh ? HY4_F16_X_HALF : 0, ex.stream));
+    return true;
+  }
+  if (n <= Model::kVecMax && !ex.prompt && quantized && w2.type == w1.type &&
+      k % 256 == 0 && w1.dims.size() >= 2 && w1.dims[0] == k &&
+      w1.dims[1] == m1 && w2.dims.size() >= 2 && w2.dims[0] == k &&
+      w2.dims[1] == m2) {
+    HY4_CHECK(hy4_gemv_pair(w1.type, w1.data, y1, m1, w2.data, y2, m2, x, k, n,
+                            ex.gemv_scratch, ex.stream));
     return true;
   }
   return MatVec(w1, x, y1, m1, k, n, ex, error, xh) &&
@@ -343,6 +348,11 @@ bool Model::AllocScratch(std::string* error) {
     return Fail(error, "hy4: hipblas init failed");
   }
   blas_ = blas;
+  // Zeroed, as hy4_gemv's split counters must start.
+  std::uint8_t* gemv = nullptr;
+  if (!DeviceAlloc(&gemv, hy4_gemv_scratch_bytes(), owned))
+    return Fail(error, "hy4: gemv scratch allocation failed");
+  gemv_scratch_ = gemv;
   for (Layer& l : weights_.layers) {
     const std::uint64_t blocks =
         l.wk_b.dims[0] * l.wk_b.dims[1] * l.wk_b.dims[2] / 32;
@@ -743,7 +753,7 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
   const Weights& w = m.weights_;
   hipStream_t st = m.stream_;
   const bool prompt = first.prompt_pass_;
-  const Exec ex{st, m.blas_, prompt};
+  const Exec ex{st, m.blas_, prompt, m.gemv_scratch_};
   // Each part's rows follow the previous part's.
   std::vector<Rows> rows;
   std::uint32_t n = 0;
@@ -1047,7 +1057,7 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *first.scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_, first.prompt_pass_};
+  const Exec ex{st, m.blas_, first.prompt_pass_, m.gemv_scratch_};
   const bool batched = n > Model::kVecMax || first.prompt_pass_;
   const std::uint32_t heads = c.n_head[il];
   const std::uint32_t dk = c.kv_lora + c.n_rot;
@@ -1196,7 +1206,7 @@ bool Session::IndexerProject(std::span<const Rows> parts, std::uint32_t il,
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *first.scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_, first.prompt_pass_};
+  const Exec ex{st, m.blas_, first.prompt_pass_, m.gemv_scratch_};
   const std::uint32_t d = c.idx_dim;
   const float base = c.rope_base;  // indexer layers are the sparse ones
 
@@ -1315,7 +1325,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   const Layer& l = m.weights_.layers[il];
   Model::Scratch& s = *scratch_;
   hipStream_t st = m.stream_;
-  const Exec ex{st, m.blas_, prompt_pass_};
+  const Exec ex{st, m.blas_, prompt_pass_, m.gemv_scratch_};
   const std::uint16_t* cur_half =
       n > Model::kVecMax || prompt_pass_ ? s.cur_half : nullptr;
 

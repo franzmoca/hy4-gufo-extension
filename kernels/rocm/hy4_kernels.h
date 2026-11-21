@@ -77,6 +77,30 @@ int hy4_hc_init(const float* x, float* h, uint32_t n, uint32_t hc, uint32_t dim,
 int hy4_gemv_float(int type, const void* w, const float* x, float* y, uint32_t m, uint32_t k,
                    uint32_t n, hipStream_t stream);
 
+/* Decode projections with FP32 activations (hy4_gemv.hip.cpp): y[t, r] =
+ * W[r] . x[t] for Q8_0, Q4_K or Q6_K W [m][k] (k a multiple of 256)
+ * and n <= HY4_GEMV_MAX_TOKENS tokens (x rows k floats, y rows m floats).
+ * Each lane decodes its weights once for all tokens, and every token sees
+ * the FMA order of a one-token call, so a token's result does not depend on
+ * n. scratch (hy4_gemv_scratch_bytes, zeroed once before first use; NULL
+ * allowed) holds the split launches' partial sums; calls sharing it must run
+ * on one stream. Returns 1 for other types or shapes. */
+#define HY4_GEMV_MAX_TOKENS 16
+uint64_t hy4_gemv_scratch_bytes(void);
+int hy4_gemv(int type, const void* w, const float* x, float* y, uint32_t m,
+             uint32_t k, uint32_t n, void* scratch, hipStream_t stream);
+/* Two matrices of one type and width k over the same x in one launch:
+ * y1 = W1 x (m1 rows), y2 = W2 x (m2 rows), each as hy4_gemv computes it. */
+int hy4_gemv_pair(int type, const void* w1, float* y1, uint32_t m1,
+                  const void* w2, float* y2, uint32_t m2, const float* x,
+                  uint32_t k, uint32_t n, void* scratch, hipStream_t stream);
+/* Gate and up matrices of one type and shape over one x, fused with the
+ * SwiGLU: y = silu(min(gate x, limit)) * clamp(up x, +-limit) (no clamp for
+ * limit <= 0), each product as hy4_gemv computes it. */
+int hy4_gemv_swiglu(int type, const void* gate, const void* up, const float* x,
+                    float* y, uint32_t m, uint32_t k, float limit, uint32_t n,
+                    void* scratch, hipStream_t stream);
+
 /* Q8_0 matvecs for any k (a multiple of 32), grouped: for group g < groups,
  * y[t, g, 0:m] = W_g . x[t, g, 0:k] with W_g the g-th [m][k] block of w.
  * x of token t, group g starts at x + t * x_tok + g * x_grp; y likewise. */
