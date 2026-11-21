@@ -23,6 +23,32 @@ rounding past 2,048 tokens (near-tied pool and expert choices), so single
 positions and greedy identity are not gates there. Short prompts match
 llama.cpp greedy token for token.
 
+## Text: KL against exact arithmetic (2026-11-21)
+
+`tools/oracle/reference.py` runs Tencent's Transformers implementation
+(huggingface/transformers PR #50903 at `b865850d`) in FP32 on the CPU over
+the same GGUF's dequantized weights, and writes a KL base file over the same
+two chunks. Against it the differences are the arithmetic alone:
+quantization is common to all rows. `--kl` scores the prompt passes,
+`--kl-decode` the scored half as one-token decoding passes.
+
+| run | mean KL | same top token | PPL |
+| --- | --- | --- | --- |
+| exact reference | — | — | 14.491 |
+| llama.cpp, F16 cache | 0.083 ± 0.008 | 91.7% | 14.466 |
+| this engine, prompt passes | 0.054 ± 0.006 | 94.2% | 14.682 |
+| this engine, decoding passes | 0.051 ± 0.006 | 94.6% | 14.676 |
+
+All PPLs here count a token below the row's maximum minus 16 as that bound,
+as the base files record it. The probe prints its PPL both ways: unclamped,
+the engine's rows read 15.12 and 15.07. That gap is how the engine rows above
+came to read about 4% above llama.cpp. On a 3,072-token prefix scored with
+full logits on both sides, the engine's next-token NLL is within 0.004 ±
+0.013 of the reference's in every 1,024-token range, and its entropy matches.
+Per-layer hyper-connection states (`hy4_eval_probe --hidden`, `reference.py
+--hidden`) drift smoothly with depth, to about 10% relative at the last
+layer, with no step at the sparse layers' selection past 2,048 tokens.
+
 ## Speculative decoding: exact
 
 With DFly2 (decision 17), a verify pass computes the logits one-token
