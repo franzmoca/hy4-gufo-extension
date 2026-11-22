@@ -336,6 +336,11 @@ int hy4_argmax(const float* x, uint32_t dim, float* work, int32_t* out,
  * d = max |v| / 127 (binary16), q = v / d rounded to nearest even. */
 int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst,
                            hipStream_t stream);
+/* The same over bfloat16 src, which widens to FP32 exactly: a trunk whose LM
+ * head is BF16 quantizes to the same blocks a binary16 one of the same values
+ * would. */
+int hy4_quantize_q8_0_bf16(const uint16_t* src, uint64_t blocks, void* dst,
+                           hipStream_t stream);
 /* y [n][m] = x [n][k] w^T for w [m][k], all FP32; each output sums its k
  * products in order, so a token's row does not depend on n. k must be a
  * multiple of 32. */

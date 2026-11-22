@@ -17,61 +17,11 @@
 #include <string>
 #include <vector>
 
+#include "runtime/hy4_config.hpp"
+
 namespace gufo::models::hy4_flash {
 
 class EngramReader;
-
-struct Config {
-  std::uint32_t n_layer = 0;
-  std::uint32_t n_embd = 0;
-  std::uint32_t n_vocab = 0;
-  std::uint32_t n_ff_dense = 0;
-  std::uint32_t n_dense_lead = 0;
-  std::vector<std::uint32_t> n_head;  // per layer
-  std::vector<bool> is_swa;           // per layer
-  std::vector<bool> has_indexer;      // per layer
-  std::uint32_t q_lora = 0;
-  std::uint32_t kv_lora = 0;
-  std::uint32_t head_k = 0;  // nope + rope (256)
-  std::uint32_t head_v = 0;  // 256
-  std::uint32_t n_rot = 0;   // 64
-  float rope_base = 0.0f;
-  float rope_base_swa = 0.0f;
-  std::uint32_t swa_window = 0;
-  float rms_eps = 0.0f;
-  // MoE
-  std::uint32_t n_expert = 0;
-  std::uint32_t n_expert_used = 0;
-  std::uint32_t n_ff_exp = 0;
-  std::uint32_t n_latent = 0;
-  float expert_scale = 1.0f;
-  bool expert_norm = true;
-  std::vector<float> swiglu_clamp;  // per layer
-  // Hyper-connections
-  std::uint32_t hc = 0;
-  float hc_eps = 0.0f;
-  float hc_magnitude = 0.0f;
-  // Indexer
-  std::uint32_t idx_heads = 0;
-  std::uint32_t idx_dim = 0;
-  std::uint32_t idx_top_k = 0;
-  std::uint32_t kpool = 0;
-  // Engram
-  std::vector<std::uint32_t> engram_layers;
-  std::uint32_t engram_ngram = 0;
-  std::uint32_t engram_heads_per_ngram = 0;
-  std::uint32_t engram_dim = 0;
-  std::vector<std::uint64_t> engram_mult;
-  std::vector<std::uint32_t> engram_offsets;
-  std::vector<std::uint32_t> engram_primes;
-  std::vector<std::int64_t> engram_token_map;
-  std::uint32_t engram_pad = 0;
-
-  [[nodiscard]] std::uint32_t EngramCols() const {
-    return (engram_ngram - 1) * engram_heads_per_ngram;
-  }
-  [[nodiscard]] int EngramIndex(std::uint32_t layer) const;
-};
 
 /// A resident weight: device bytes, ggml type and GGUF dimensions.
 struct Tensor {

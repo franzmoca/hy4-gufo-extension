@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- The Xylolabs Q4_K_M trunk as it now ships loads. Its `block_count` counts a
+  `nextn` draft layer after the 42 backbone layers, and its per-layer arrays
+  describe the backbone alone or the draft layer too; the engine ran
+  `block_count` layers and refused the file with "per-layer metadata does not
+  match block_count". It now loads the 42 layers it runs and leaves the draft
+  layer's 6.97 GiB of BF16 weights on disk, since DFly2 comes from Tencent's
+  own checkpoint. The trunk's LM head is BF16 where the earlier cut held it
+  F16: the drafts quantize either to Q8_0, so speculative decoding keeps its
+  halved head and its rare-token row table.
 - Control-token spellings in request text stay text. Message content,
   reasoning, tool definitions, call names and arguments, and tool results
   used to turn `</think:opensource>`, `<｜hy_end:opensource｜>` and the other

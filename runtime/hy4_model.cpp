@@ -14,8 +14,8 @@
 #include <gufo/ext/experimental/weight_upload.hpp>
 #include <gufo/ext/gguf_reader.hpp>
 #include <string>
-#include <variant>
 
+#include "runtime/hy4_config.hpp"
 #include "runtime/hy4_engram.hpp"
 #include "runtime/hy4_internal.hpp"
 #include "runtime/hy4_runtime.hpp"
@@ -24,148 +24,9 @@ namespace gufo::models::hy4_flash {
 
 namespace {
 
-constexpr const char* kArch = "hy_v4_flash";
 constexpr std::string_view kEngramTable = "per_layer_token_embd.weight";
 
-std::string Key(const char* suffix) { return std::string(kArch) + "." + suffix; }
-
-// Metadata arrays as doubles, whatever their element type.
-std::vector<double> MetaArray(const core::GgufReader& r, const std::string& key) {
-  std::vector<double> out;
-  const auto* v = r.FindMetadata(key);
-  if (!v) return out;
-  std::visit(
-      [&](const auto& x) {
-        using T = std::decay_t<decltype(x)>;
-        if constexpr (std::is_same_v<T, std::vector<std::uint64_t>> ||
-                      std::is_same_v<T, std::vector<std::int64_t>> ||
-                      std::is_same_v<T, std::vector<double>>) {
-          for (const auto e : x) out.push_back(static_cast<double>(e));
-        } else if constexpr (std::is_same_v<T, std::uint64_t> || std::is_same_v<T, std::int64_t> ||
-                             std::is_same_v<T, double>) {
-          out.push_back(static_cast<double>(x));
-        } else if constexpr (std::is_same_v<T, bool>) {
-          out.push_back(x ? 1.0 : 0.0);
-        }
-      },
-      v->value);
-  return out;
-}
-
-// Exact integer arrays (the Engram multipliers exceed double precision).
-std::vector<std::uint64_t> MetaU64Array(const core::GgufReader& r, const std::string& key) {
-  std::vector<std::uint64_t> out;
-  const auto* v = r.FindMetadata(key);
-  if (!v) return out;
-  if (const auto* u = std::get_if<std::vector<std::uint64_t>>(&v->value)) return *u;
-  if (const auto* s = std::get_if<std::vector<std::int64_t>>(&v->value)) {
-    for (const auto e : *s) out.push_back(static_cast<std::uint64_t>(e));
-  }
-  return out;
-}
-
-double MetaScalar(const core::GgufReader& r, const std::string& key, double fallback) {
-  const auto a = MetaArray(r, key);
-  return a.empty() ? fallback : a[0];
-}
-
-bool ReadConfig(const core::GgufReader& r, Config* c, std::string* error) {
-  if (r.GetMetadataString("general.architecture").value_or("") != kArch) {
-    *error = "not an hy_v4_flash GGUF";
-    return false;
-  }
-  c->n_layer = static_cast<std::uint32_t>(MetaScalar(r, Key("block_count"), 0));
-  c->n_embd = static_cast<std::uint32_t>(MetaScalar(r, Key("embedding_length"), 0));
-  c->n_vocab = static_cast<std::uint32_t>(MetaScalar(r, Key("vocab_size"), 0));
-  c->n_ff_dense = static_cast<std::uint32_t>(MetaScalar(r, Key("feed_forward_length"), 0));
-  c->n_dense_lead = static_cast<std::uint32_t>(MetaScalar(r, Key("leading_dense_block_count"), 0));
-  c->q_lora = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.q_lora_rank"), 0));
-  c->kv_lora = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.kv_lora_rank"), 0));
-  c->head_k = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.key_length_mla"), 0));
-  c->head_v = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.value_length_mla"), 0));
-  c->n_rot = static_cast<std::uint32_t>(MetaScalar(r, Key("rope.dimension_count"), 0));
-  c->rope_base = static_cast<float>(MetaScalar(r, Key("rope.freq_base"), 10000.0));
-  c->rope_base_swa = static_cast<float>(MetaScalar(r, Key("rope.freq_base_swa"), 10000.0));
-  c->swa_window = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.sliding_window"), 0));
-  c->rms_eps = static_cast<float>(MetaScalar(r, Key("attention.layer_norm_rms_epsilon"), 1e-5));
-  c->n_expert = static_cast<std::uint32_t>(MetaScalar(r, Key("expert_count"), 0));
-  c->n_expert_used = static_cast<std::uint32_t>(MetaScalar(r, Key("expert_used_count"), 0));
-  c->n_ff_exp = static_cast<std::uint32_t>(MetaScalar(r, Key("expert_feed_forward_length"), 0));
-  c->n_latent = static_cast<std::uint32_t>(MetaScalar(r, Key("expert_latent_length"), 0));
-  c->expert_scale = static_cast<float>(MetaScalar(r, Key("expert_weights_scale"), 1.0));
-  c->expert_norm = MetaScalar(r, Key("expert_weights_norm"), 1.0) != 0.0;
-  c->hc = static_cast<std::uint32_t>(MetaScalar(r, Key("hyper_connection.count"), 0));
-  c->hc_eps = static_cast<float>(MetaScalar(r, Key("hyper_connection.epsilon"), 1e-6));
-  c->hc_magnitude = static_cast<float>(MetaScalar(r, Key("hyper_connection.magnitude"), 1.0));
-  c->idx_heads = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.indexer.head_count"), 0));
-  c->idx_dim = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.indexer.key_length"), 0));
-  c->idx_top_k = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.indexer.top_k"), 0));
-  c->kpool = static_cast<std::uint32_t>(MetaScalar(r, Key("attention.indexer.kpool"), 0));
-
-  if (MetaScalar(r, Key("expert_gating_func"), 0) != 2.0) {
-    *error = "unsupported expert gating function (expected sigmoid)";
-    return false;
-  }
-  if (!MetaScalar(r, Key("attention.indexer.kpool_select_tail"), 0)) {
-    *error = "unsupported indexer: kpool_select_tail must be set";
-    return false;
-  }
-
-  const auto heads = MetaArray(r, Key("attention.head_count"));
-  const auto swa = MetaArray(r, Key("attention.sliding_window_pattern"));
-  const auto idx = MetaArray(r, Key("attention.indexer.types"));
-  const auto clamp = MetaArray(r, Key("swiglu_clamp_exp"));
-  if (heads.size() != c->n_layer || swa.size() != c->n_layer || idx.size() != c->n_layer) {
-    *error = "per-layer metadata does not match block_count";
-    return false;
-  }
-  for (std::uint32_t i = 0; i < c->n_layer; ++i) {
-    c->n_head.push_back(static_cast<std::uint32_t>(heads[i]));
-    c->is_swa.push_back(swa[i] != 0.0);
-    c->has_indexer.push_back(idx[i] != 0.0);
-    c->swiglu_clamp.push_back(i < clamp.size() ? static_cast<float>(clamp[i]) : 0.0f);
-  }
-
-  for (const double l : MetaArray(r, Key("ple.layers"))) {
-    c->engram_layers.push_back(static_cast<std::uint32_t>(l));
-  }
-  c->engram_ngram = static_cast<std::uint32_t>(MetaScalar(r, Key("ple.ngram_size"), 0));
-  c->engram_heads_per_ngram = static_cast<std::uint32_t>(MetaScalar(r, Key("ple.heads_per_ngram"), 0));
-  c->engram_dim = static_cast<std::uint32_t>(MetaScalar(r, Key("embedding_length_per_layer_input"), 0));
-  c->engram_mult = MetaU64Array(r, Key("ple.layer_multipliers"));
-  for (const auto v : MetaU64Array(r, Key("ple.head_offsets"))) {
-    c->engram_offsets.push_back(static_cast<std::uint32_t>(v));
-  }
-  for (const auto v : MetaU64Array(r, Key("ple.head_vocab_sizes"))) {
-    c->engram_primes.push_back(static_cast<std::uint32_t>(v));
-  }
-  for (const auto v : MetaU64Array(r, Key("engram.token_map"))) {
-    c->engram_token_map.push_back(static_cast<std::int64_t>(v));
-  }
-  c->engram_pad = static_cast<std::uint32_t>(MetaScalar(r, Key("engram.pad_token_id"), 0));
-  const std::size_t n_e = c->engram_layers.size();
-  if (n_e > 0 && (c->engram_mult.size() != n_e * c->engram_ngram ||
-                  c->engram_primes.size() != n_e * c->EngramCols() ||
-                  c->engram_offsets.size() != n_e * c->EngramCols() ||
-                  c->engram_pad >= c->engram_token_map.size())) {
-    *error = "inconsistent Engram metadata";
-    return false;
-  }
-  if (c->n_layer == 0 || c->n_embd == 0 || c->hc == 0 || c->kv_lora == 0 || c->n_rot == 0) {
-    *error = "missing model dimensions";
-    return false;
-  }
-  return true;
-}
-
 }  // namespace
-
-int Config::EngramIndex(std::uint32_t layer) const {
-  for (std::size_t e = 0; e < engram_layers.size(); ++e) {
-    if (engram_layers[e] == layer) return static_cast<int>(e);
-  }
-  return -1;
-}
 
 struct Model::Shards {
   std::unique_ptr<core::GgufReader> trunk;  // every shard, mapped
@@ -242,10 +103,24 @@ std::unique_ptr<Model> Model::Load(const std::string& trunk_path,
     return nullptr;
   }
 
-  // Resident upload of every trunk tensor.
-  std::uint64_t total = 0;
+  // Resident upload of every trunk tensor. The Engram table is read from its
+  // shard, and a quant's draft layers stay on disk: DFly2 has its own
+  // checkpoint, so uploading them would only take memory.
+  std::uint64_t total = 0, draft_bytes = 0;
   for (const auto& t : r.GetTensors()) {
-    if (t.name != kEngramTable) total += t.size_bytes;
+    if (t.name == kEngramTable)
+      continue;
+    if (!BackboneTensor(t.name, c)) {
+      draft_bytes += t.size_bytes;
+      continue;
+    }
+    total += t.size_bytes;
+  }
+  if (draft_bytes != 0) {
+    std::fprintf(stderr,
+                 "hy4: the %u nextn draft layer%s stay%s on disk (%.2f GiB)\n",
+                 c.n_nextn, c.n_nextn == 1 ? "" : "s",
+                 c.n_nextn == 1 ? "s" : "", draft_bytes / 1073741824.0);
   }
   gufo::hip::WeightAllocator alloc(total);
   auto upload = gufo::hip::WeightUpload::Create(r.GetMappedRegions(), error);
