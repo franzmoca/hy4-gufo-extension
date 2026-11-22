@@ -1116,6 +1116,50 @@ void TestQuantizeHalf() {
          "quantize_q8_0_half (" + std::to_string(mismatches) + " mismatches)");
 }
 
+// The same blocks over bfloat16 weights, the LM head of a trunk quantized
+// with BF16 matrices.
+void TestQuantizeBf16() {
+  const uint64_t blocks = 3000;
+  std::vector<uint16_t> src(blocks * 32);
+  std::vector<float> values(src.size());
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    uint32_t u;
+    const float x = Random(1, -3, 3)[0];
+    std::memcpy(&u, &x, 4);
+    // Round to the nearest bfloat16, then widen back as the kernel does.
+    const uint16_t bits =
+        static_cast<uint16_t>((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+    src[i] = bits;
+    const uint32_t widened = static_cast<uint32_t>(bits) << 16;
+    std::memcpy(&values[i], &widened, 4);
+  }
+  for (int i = 0; i < 32; ++i) {  // an all-zero block
+    src[32 + i] = 0;
+    values[32 + i] = 0.0f;
+  }
+  BlockQ8_0* out = Device(std::vector<BlockQ8_0>(blocks));
+  Expect(hy4_quantize_q8_0_bf16(Device(src), blocks, out, nullptr) == 0,
+         "quantize_q8_0_bf16 status");
+  const auto got = Host(out, blocks);
+  int mismatches = 0;
+  for (uint64_t b = 0; b < blocks; ++b) {
+    float amax = 0.0f;
+    for (int i = 0; i < 32; ++i)
+      amax = std::max(amax, std::fabs(values[b * 32 + i]));
+    const float d = amax / 127.0f;
+    const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+    const _Float16 dh = (_Float16)d;
+    uint16_t dbits;
+    std::memcpy(&dbits, &dh, 2);
+    mismatches += got[b].d != dbits;
+    for (int i = 0; i < 32; ++i)
+      mismatches +=
+          got[b].qs[i] != (int8_t)std::nearbyint(values[b * 32 + i] * inv);
+  }
+  Expect(mismatches == 0,
+         "quantize_q8_0_bf16 (" + std::to_string(mismatches) + " mismatches)");
+}
+
 void TestGatherRows() {
   const uint32_t rows = 50, words = 816;  // a 3,072-wide Q8_0 row
   std::vector<uint32_t> src(rows * words);
@@ -2160,6 +2204,7 @@ int main() {
   TestRows();
   TestArgmax();
   TestQuantizeHalf();
+  TestQuantizeBf16();
   TestGatherRows();
   TestElementwise();
   TestRoute();

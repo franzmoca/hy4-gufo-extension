@@ -1810,6 +1810,30 @@ __global__ void QuantizeQ8Half(const _Float16* src, BlockQ8_0* dst,
     dst[b].qs[i] = (int8_t)rintf(v[i] * inv);
 }
 
+// Q8_0 blocks of 32 bfloat16 values (the trunk's LM head): the same d and q
+// as the binary16 form above, the weights read as BF16.
+__global__ void QuantizeQ8Bf16(const uint16_t* src, BlockQ8_0* dst,
+                               uint64_t blocks) {
+  const uint64_t b = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= blocks)
+    return;
+  float v[32];
+  float amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < 32; i += 8) {
+    Load8Bf16(src + b * 32 + i, v + i);
+  }
+#pragma unroll
+  for (int i = 0; i < 32; ++i)
+    amax = fmaxf(amax, fabsf(v[i]));
+  const float d = amax / 127.0f;
+  const float inv = d > 0.0f ? 1.0f / d : 0.0f;
+  dst[b].d = (__half)d;
+#pragma unroll
+  for (int i = 0; i < 32; ++i)
+    dst[b].qs[i] = (int8_t)rintf(v[i] * inv);
+}
+
 // ------------------------------------------------- fused prefill attention
 
 // MLA prefill attention on the matrix cores, each token over exactly its own
@@ -2819,6 +2843,15 @@ int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst,
   QuantizeQ8Half<<<(blocks + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
       reinterpret_cast<const _Float16*>(src), static_cast<BlockQ8_0*>(dst),
       blocks);
+  return Status();
+}
+
+int hy4_quantize_q8_0_bf16(const uint16_t* src, uint64_t blocks, void* dst,
+                           hipStream_t stream) {
+  if (blocks == 0)
+    return 0;
+  QuantizeQ8Bf16<<<(blocks + kBlock - 1) / kBlock, kBlock, 0, stream>>>(
+      src, static_cast<BlockQ8_0*>(dst), blocks);
   return Status();
 }
 

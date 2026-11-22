@@ -386,8 +386,10 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
   d->io_->table_new = nullptr;
   const Tensor& out = target.weights().output;
   d->head_ = out;
-  if (out.type == HY4_TYPE_F16 && out.dims.size() >= 2 &&
-      out.dims[0] % 32 == 0) {
+  // A trunk holds its LM head as binary16 or bfloat16; the drafts read a
+  // Q8_0 copy of it, half the bytes per row (E31).
+  if ((out.type == HY4_TYPE_F16 || out.type == HY4_TYPE_BF16) &&
+      out.dims.size() >= 2 && out.dims[0] % 32 == 0) {
     const std::uint64_t blocks = out.dims[0] * out.dims[1] / 32;
     void* q8 = nullptr;
     if (!DeviceAlloc(reinterpret_cast<std::uint8_t**>(&q8),
@@ -395,9 +397,12 @@ std::unique_ptr<Drafter> Drafter::Load(const std::string& path, Model& target, s
       Fail(error, "hy4 dfly: head allocation failed");
       return nullptr;
     }
-    if (hy4_quantize_q8_0_half(static_cast<const std::uint16_t*>(out.data),
-                               blocks, q8, nullptr) != 0 ||
-        hipDeviceSynchronize() != hipSuccess) {
+    const std::uint16_t* src = static_cast<const std::uint16_t*>(out.data);
+    const int quantized =
+        out.type == HY4_TYPE_F16
+            ? hy4_quantize_q8_0_half(src, blocks, q8, nullptr)
+            : hy4_quantize_q8_0_bf16(src, blocks, q8, nullptr);
+    if (quantized != 0 || hipDeviceSynchronize() != hipSuccess) {
       Fail(error, "hy4 dfly: head quantization failed");
       return nullptr;
     }

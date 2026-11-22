@@ -93,6 +93,12 @@
       ],
       "role": "test"
     },
+    "hy4flash_config_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
     "hy4flash_vision_prompt_test": {
       "requires": [
         "testing"

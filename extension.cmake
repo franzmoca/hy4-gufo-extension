@@ -7,6 +7,7 @@ gufo_extension_target(
     chat_template.cpp
     extension.cpp
     probe.cpp
+    runtime/hy4_config.cpp
     text_contract.cpp
     tool_calls.cpp
   LINK_LIBRARIES
@@ -76,6 +77,7 @@ gufo_extension_target(
     runtime/hy4_vision_gemm.cpp
     runtime/tokenizer.cpp
   LINK_LIBRARIES
+    gufo_hy4flash
     gufo_hy4flash_mmq
     gufo_ext_runtime
     gufo_ext_core
@@ -167,6 +169,8 @@ function(_hy4flash_test name labels)
 endfunction()
 
 _hy4flash_test(chat_template "cpu;tokenization;tools"
+  LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
+_hy4flash_test(config "cpu;loader"
   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
 _hy4flash_test(vision_prompt "cpu;vision"
   LINK_LIBRARIES gufo_hy4flash_text gufo_hy4flash_hip gufo_hy4flash gufo_ext_hip)
