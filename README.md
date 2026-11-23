@@ -51,7 +51,7 @@ container, which follows `main`:
 
 ```sh
 podman pull ghcr.io/gufo-org/toolboxes/gufo-runtime:edge
-gufo extension install https://github.com/franzmoca/hy4-gufo-extension@v0.2.0 --yes
+gufo extension install https://github.com/franzmoca/hy4-gufo-extension@v0.2.1 --yes
 ```
 
 Mount the extensions volume at `/home/gufo/.local/share/gufo/extensions` so

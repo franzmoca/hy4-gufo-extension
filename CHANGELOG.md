@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 (2026-11-23)
+
+Built on upstream Gufo `0a473ebf`; needs extension API 0.3.29 or later.
 
 - The AngelSlim Q4_K_M trunk loads. Its `block_count` counts a `nextn` draft
   layer after the 42 backbone layers, and its per-layer arrays describe the
