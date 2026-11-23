@@ -214,6 +214,23 @@ void CheckLayerCounts() {
   Expect(ok, "the shipped trunk read");
 }
 
+// The clamp array is checked like the other per-layer arrays: a short one
+// used to leave the layers it missed silently unclamped.
+void CheckClampLengths() {
+  const std::string p = "hy_v4_flash.";
+  Metadata m = Trunk(43, 1, 42);
+  m[p + "swiglu_clamp_exp"] = std::vector<float>(42, 10.0f);
+  std::string error;
+  bool ok = false;
+  Parse(m, &error, &ok);
+  Expect(ok, "a clamp array per backbone layer accepted: " + error);
+
+  m = Trunk(43, 1, 42);
+  m[p + "swiglu_clamp_exp"] = std::vector<float>(40, 10.0f);
+  Parse(m, &error, &ok);
+  Expect(!ok, "a short clamp array rejected");
+}
+
 // A draft layer's tensors are in the trunk but never read: they would sit
 // resident beside the backbone.
 void CheckBackboneTensors() {
@@ -271,6 +288,7 @@ void CheckEngramLayers() {
 
 int main() {
   CheckLayerCounts();
+  CheckClampLengths();
   CheckBackboneTensors();
   CheckEngramLayers();
   if (g_failures) {
