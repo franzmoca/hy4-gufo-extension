@@ -18,16 +18,17 @@ In `~/models/hy4-flash/`:
 | --- | ---: | --- |
 | `Hy4-flash-Q4_K_M-00001-of-00002.gguf` (Xylolabs) | 97.8 GB | Trunk, resident |
 | `Hy4-flash-Q4_K_M-00002-of-00002.gguf` | 63.4 GB | Engram tables, FP8 E4M3, read from disk |
-| `mmproj-Hy4-flash-bf16.gguf` | 1.0 GB | Vision tower |
+| `mmproj-Hy4-flash-BF16.gguf` | 1.0 GB | Vision tower |
 | `tencent-dfly2/model-00148-of-00148.safetensors` | 1.7 GB | DFly2 drafter, BF16 (87 tensors, nothing else) |
 | `tencent-dfly2/{config,tokenizer,chat_template,...}` | small | Config, tokenizer, chat template |
 
 Why Xylolabs over AngelSlim: KL 0.244 vs 0.281 against BF16, and 7 GB
 smaller. Both GGUFs follow the tensor naming of llama.cpp PR #32517. Neither
-ships DFly2. Both carry one `nextn` draft layer after the backbone
-(`block_count` 43 for 42 layers, `nextn_predict_layers` 1, its tensors BF16),
-which this engine leaves on disk: its drafter is DFly2, from Tencent's
-checkpoint.
+ships DFly2. AngelSlim counts one `nextn` draft layer after the backbone in
+`block_count` (43 for 42 layers, `nextn_predict_layers` 1, its tensors
+BF16); the engine leaves it on disk, since its drafter is DFly2, from
+Tencent's checkpoint. Xylolabs carries no draft layer, and its LM head is
+F16 where AngelSlim's is BF16.
 
 ## Architecture, from `config.json` and the llama.cpp PR
 
@@ -60,7 +61,8 @@ checkpoint.
   (eps = FP32 machine epsilon) and scaled by its head weight. The key/value
   projection has a bias, the gate is DS4.1's, and a token with no valid n-gram
   (or an image position) gets no Engram delta.
-- **LM head:** BF16 in this GGUF; the reference computes it in FP32.
+- **LM head:** F16 in the Xylolabs GGUF, BF16 in AngelSlim's; the reference
+  computes it in FP32.
 - **Vision:** SigLIP2-So400m adaptation, 27 layers, hidden size 1152, patch
   16, any resolution up to 2048, 2×2 merge, MLP projector. The llama.cpp PR
   does not touch `mtmd`, so its vision path is Tencent's own build or
@@ -92,10 +94,10 @@ Not needed: expert streaming. The trunk is resident.
 
 ## Memory budget (124 GiB host)
 
-- Trunk 90.8 GiB of its 97.8 (the `nextn` draft layer's 6.97 GiB stay on
-disk), vision 1 GB, DFly2 1.35 GB at Q8_0 (0.9 GB of
+- Trunk 91.1 GiB (97.8 GB), vision 1 GB, DFly2 1.35 GB at Q8_0 (0.9 GB of
   layers and, since E31, a 394 MB copy of the LM head for drafts, plus E35's
-  53 MB table of a request's rare-token rows).
+  53 MB table of a request's rare-token rows). The AngelSlim trunk holds
+  90.8 GiB resident: its `nextn` draft layer's 6.97 GiB stay on disk.
 - KV (binary16 since E30): the 12 sparse layers × 576 × 2 bytes come to
   13.8 KB per token; the indexer's pooled keys add 1.5 KB and its score buffer
   2 KB, about 17.4 KB per token of session context (18 GB at 1M). The 30 SWA
@@ -120,7 +122,7 @@ non-expert tensors, 16 of 512 experts, one embedding row):
 | Attention and indexer (Q8_0) | 5.31 |
 | Routed experts (16 × Q4_K gate/up, Q4_K or Q6_K down) | 2.81 |
 | Dense layer 0, shared experts, latent projections (Q8_0) | 1.42 |
-| LM head (BF16) | 0.74 |
+| LM head (F16 or BF16) | 0.74 |
 | Engram projections (Q8_0) | 0.10 |
 | **Total** | **10.4** |
 
@@ -193,9 +195,9 @@ These are judgment calls made without the maintainer; revisit any of them.
    matches the oracle's closely, so per-layer comparisons stay tight. Custom
    GEMVs are an optimization after correctness.
 3. **Small custom kernels** cover what the vendored path cannot: `attn_k_b`
-   (K = 192, not a multiple of 256), the F16 and BF16 head, Q8_0 embedding rows, norms,
-   iHC pre/post, the router, MLA attention with sinks, the kpool indexer and
-   Engram.
+   (K = 192, not a multiple of 256), the F16 and BF16 head, Q8_0 embedding
+   rows, norms, iHC pre/post, the router, MLA attention with sinks, the
+   kpool indexer and Engram.
 4. **Evaluation in chunks of up to 8 tokens.** `mmvq` serves N ≤ 8, so one
    evaluation takes 1-8 tokens: decode is N = 1, and prefill loops over chunks
    of 8. Large-batch MMQ prefill is phase 5. (Verify passes now take up to 16
@@ -253,9 +255,8 @@ These are judgment calls made without the maintainer; revisit any of them.
     Tencent shard (a file or the checkpoint directory, `--dfly-model`) and
     uploads Q8_0 matrices and F32 norms (0.9 GB), plus a Q8_0 copy of the
     target's binary16 or bfloat16 LM head for drafts (E31). The draft only
-    decides how
-    many target tokens one pass checks, so its rounding costs acceptance,
-    never output. The design, from AngelSpec's `dfly2` code (public, read
+    decides how many target tokens one pass checks, so its rounding costs
+    acceptance, never output. The design, from AngelSpec's `dfly2` code (public, read
     only): a block of 8 slots at positions a .. a + 7, the anchor a (sampled
     from the target's frontier logits) then mask tokens (120009), through the
     target's embedding; the anchor slot adds `gate * eh_proj(enorm(E(anchor))
