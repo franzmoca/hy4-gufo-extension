@@ -162,7 +162,7 @@ bool ReadConfig(const core::GgufReader& r, Config* c, std::string* error) {
   std::vector<double> swa =
       MetaArray(r, Key("attention.sliding_window_pattern"));
   std::vector<double> idx = MetaArray(r, Key("attention.indexer.types"));
-  const std::vector<double> clamp = MetaArray(r, Key("swiglu_clamp_exp"));
+  std::vector<double> clamp = MetaArray(r, Key("swiglu_clamp_exp"));
   const auto backbone = [&](const char* key, const std::vector<double>& v) {
     if (v.size() == c->n_layer || v.size() == blocks)
       return true;
@@ -174,18 +174,19 @@ bool ReadConfig(const core::GgufReader& r, Config* c, std::string* error) {
   };
   if (!backbone("attention.head_count", heads) ||
       !backbone("attention.sliding_window_pattern", swa) ||
-      !backbone("attention.indexer.types", idx)) {
+      !backbone("attention.indexer.types", idx) ||
+      !backbone("swiglu_clamp_exp", clamp)) {
     return false;
   }
   heads.resize(c->n_layer);
   swa.resize(c->n_layer);
   idx.resize(c->n_layer);
+  clamp.resize(c->n_layer);
   for (std::uint32_t i = 0; i < c->n_layer; ++i) {
     c->n_head.push_back(static_cast<std::uint32_t>(heads[i]));
     c->is_swa.push_back(swa[i] != 0.0);
     c->has_indexer.push_back(idx[i] != 0.0);
-    c->swiglu_clamp.push_back(i < clamp.size() ? static_cast<float>(clamp[i])
-                                               : 0.0f);
+    c->swiglu_clamp.push_back(static_cast<float>(clamp[i]));
   }
 
   for (const double l : MetaArray(r, Key("ple.layers"))) {
