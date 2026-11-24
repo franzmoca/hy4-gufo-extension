@@ -1154,6 +1154,203 @@ __global__ void __launch_bounds__(kAttnDv / 4)
       make_float4(o.x * inv, o.y * inv, o.z * inv, o.w * inv);
 }
 
+// DFly2 block MLA attention: all `n` queries in a block attend to every valid
+// indexed binary16 cache row sel[0..sel_count) (0 <= sel[j] <= limit) plus the
+// block's own `n` FP32 latent rows kva[0..n). Uses 8 splits so 8 tokens * 2
+// head groups * 8 splits = 128 workgroups saturate all CUs while partial
+// buffers stay within ~4 MiB.
+constexpr uint32_t kDflyAttnSplits = 8;
+
+__global__ void __launch_bounds__(kAttnWarps * 32)
+    DflyAttnDecode(const float* q, const _Float16* cache, uint32_t ring,
+                   const int32_t* sel, uint32_t sel_count, int32_t limit,
+                   const float* kva, float scale, float* part_ml,
+                   float* part_acc, uint32_t n, uint32_t heads) {
+  const uint32_t split = blockIdx.x, t = blockIdx.z;
+  const uint32_t count = sel_count + n;
+  const uint32_t keys = AttnSplitKeys(count, kDflyAttnSplits);
+  const uint32_t begin = split * keys;
+  if (begin >= count)
+    return;
+  const uint32_t end = min(count, begin + keys);
+  const uint32_t lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
+  const uint32_t h0 = blockIdx.y * kAttnHeadsPerBlock + warp * kAttnHpw;
+  if (h0 >= heads)
+    return;
+
+  float4 qv[kAttnHpw][4];
+  float2 qt[kAttnHpw];
+  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+    const float* qh = q + ((uint64_t)t * heads + h0 + h) * kAttnDk;
+    for (uint32_t i = 0; i < 4; ++i)
+      qv[h][i] = *(const float4*)(qh + 128 * i + 4 * lane);
+    qt[h] = *(const float2*)(qh + kAttnDv + 2 * lane);
+  }
+  float m[kAttnHpw], l[kAttnHpw];
+  float4 acc[kAttnHpw][4];
+  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+    m[h] = -INFINITY;
+    l[h] = 0.0f;
+    for (uint32_t i = 0; i < 4; ++i)
+      acc[h][i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  }
+  auto load4h = [](const _Float16* x) {
+    const Half4 h = *(const Half4*)x;
+    return make_float4((float)h[0], (float)h[1], (float)h[2], (float)h[3]);
+  };
+  auto load2h = [](const _Float16* x) {
+    return make_float2((float)x[0], (float)x[1]);
+  };
+  auto load_key = [&](uint32_t idx, float4(&kv)[4], float2& kt, bool& valid) {
+    if (idx < sel_count) {
+      const int32_t kp = sel[idx];
+      valid = kp >= 0 && kp <= limit;
+      if (valid) {
+        const _Float16* kr = cache + (uint64_t)((uint32_t)kp % ring) * kAttnDk;
+        for (uint32_t i = 0; i < 4; ++i)
+          kv[i] = load4h(kr + 128 * i + 4 * lane);
+        kt = load2h(kr + kAttnDv + 2 * lane);
+      } else {
+        for (uint32_t i = 0; i < 4; ++i)
+          kv[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        kt = make_float2(0.0f, 0.0f);
+      }
+    } else {
+      valid = true;
+      const float* kr = kva + (uint64_t)(idx - sel_count) * kAttnDk;
+      for (uint32_t i = 0; i < 4; ++i)
+        kv[i] = *(const float4*)(kr + 128 * i + 4 * lane);
+      kt = *(const float2*)(kr + kAttnDv + 2 * lane);
+    }
+  };
+  auto load_val = [&](uint32_t idx, float4(&kv)[4]) {
+    if (idx < sel_count) {
+      const int32_t kp = sel[idx];
+      if (kp >= 0 && kp <= limit) {
+        const _Float16* kr = cache + (uint64_t)((uint32_t)kp % ring) * kAttnDk;
+        for (uint32_t i = 0; i < 4; ++i)
+          kv[i] = load4h(kr + 128 * i + 4 * lane);
+      } else {
+        for (uint32_t i = 0; i < 4; ++i)
+          kv[i] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      }
+    } else {
+      const float* kr = kva + (uint64_t)(idx - sel_count) * kAttnDk;
+      for (uint32_t i = 0; i < 4; ++i)
+        kv[i] = *(const float4*)(kr + 128 * i + 4 * lane);
+    }
+  };
+
+  for (uint32_t c0 = begin; c0 < end; c0 += kAttnChunk) {
+    const uint32_t nk = min(kAttnChunk, end - c0);
+    float sc[kAttnHpw];
+    for (uint32_t h = 0; h < kAttnHpw; ++h)
+      sc[h] = -INFINITY;
+    for (uint32_t j = 0; j < nk; j += kAttnUnroll) {
+      float4 kv[kAttnUnroll][4];
+      float2 kt[kAttnUnroll];
+      bool ok[kAttnUnroll];
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        load_key(c0 + min(j + u, nk - 1), kv[u], kt[u], ok[u]);
+      float d[kAttnUnroll][kAttnHpw];
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        for (uint32_t h = 0; h < kAttnHpw; ++h) {
+          float x = qt[h].x * kt[u].x;
+          x = fmaf(qt[h].y, kt[u].y, x);
+          for (uint32_t i = 0; i < 4; ++i) {
+            x = fmaf(qv[h][i].x, kv[u][i].x, x);
+            x = fmaf(qv[h][i].y, kv[u][i].y, x);
+            x = fmaf(qv[h][i].z, kv[u][i].z, x);
+            x = fmaf(qv[h][i].w, kv[u][i].w, x);
+          }
+          d[u][h] = x;
+        }
+      for (int o = warpSize / 2; o > 0; o >>= 1)
+#pragma unroll
+        for (uint32_t u = 0; u < kAttnUnroll; ++u)
+          for (uint32_t h = 0; h < kAttnHpw; ++h)
+            d[u][h] += __shfl_xor(d[u][h], o);
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        for (uint32_t h = 0; h < kAttnHpw; ++h)
+          if (lane == j + u && j + u < nk && ok[u])
+            sc[h] = d[u][h] * scale;
+    }
+    float e[kAttnHpw];
+    for (uint32_t h = 0; h < kAttnHpw; ++h) {
+      const float mx = fmaxf(m[h], WarpMax(sc[h]));
+      const float alpha = m[h] == -INFINITY ? 0.0f : expf(m[h] - mx);
+      e[h] = (lane < nk && sc[h] > -INFINITY) ? expf(sc[h] - mx) : 0.0f;
+      l[h] = l[h] * alpha + WarpSum(e[h]);
+      m[h] = mx;
+      for (uint32_t i = 0; i < 4; ++i) {
+        acc[h][i].x *= alpha;
+        acc[h][i].y *= alpha;
+        acc[h][i].z *= alpha;
+        acc[h][i].w *= alpha;
+      }
+    }
+    for (uint32_t j = 0; j < nk; j += kAttnUnroll) {
+      float4 kv[kAttnUnroll][4];
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        load_val(c0 + min(j + u, nk - 1), kv[u]);
+#pragma unroll
+      for (uint32_t u = 0; u < kAttnUnroll; ++u)
+        for (uint32_t h = 0; h < kAttnHpw; ++h) {
+          const float pj = __shfl(e[h], min(j + u, kAttnChunk - 1));
+          if (j + u >= nk)
+            continue;
+          for (uint32_t i = 0; i < 4; ++i) {
+            acc[h][i].x = fmaf(pj, kv[u][i].x, acc[h][i].x);
+            acc[h][i].y = fmaf(pj, kv[u][i].y, acc[h][i].y);
+            acc[h][i].z = fmaf(pj, kv[u][i].z, acc[h][i].z);
+            acc[h][i].w = fmaf(pj, kv[u][i].w, acc[h][i].w);
+          }
+        }
+    }
+  }
+  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+    const uint64_t r = ((uint64_t)t * kDflyAttnSplits + split) * heads + h0 + h;
+    if (lane == 0) {
+      part_ml[2 * r] = m[h];
+      part_ml[2 * r + 1] = l[h];
+    }
+    for (uint32_t i = 0; i < 4; ++i)
+      *(float4*)(part_acc + r * kAttnDv + 128 * i + 4 * lane) = acc[h][i];
+  }
+}
+
+__global__ void __launch_bounds__(kAttnDv / 4)
+    DflyAttnCombine(const float* part_ml, const float* part_acc, uint32_t count,
+                    const float* sinks, float* out, uint32_t heads) {
+  const uint32_t h = blockIdx.x, t = blockIdx.y;
+  const uint32_t keys = AttnSplitKeys(count, kDflyAttnSplits);
+  const uint32_t splits = keys ? (count + keys - 1) / keys : 0;
+  const uint64_t r0 = (uint64_t)t * kDflyAttnSplits * heads + h;
+  float mx = sinks ? sinks[h] : -INFINITY;
+  for (uint32_t s = 0; s < splits; ++s)
+    mx = fmaxf(mx, part_ml[2 * (r0 + (uint64_t)s * heads)]);
+  float den = sinks ? expf(sinks[h] - mx) : 0.0f;
+  float4 o = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+  for (uint32_t s = 0; s < splits; ++s) {
+    const uint64_t r = r0 + (uint64_t)s * heads;
+    const float ms = part_ml[2 * r];
+    const float w = ms == -INFINITY ? 0.0f : expf(ms - mx);
+    den = fmaf(part_ml[2 * r + 1], w, den);
+    const float4 a = *(const float4*)(part_acc + r * kAttnDv + 4 * threadIdx.x);
+    o.x = fmaf(a.x, w, o.x);
+    o.y = fmaf(a.y, w, o.y);
+    o.z = fmaf(a.z, w, o.z);
+    o.w = fmaf(a.w, w, o.w);
+  }
+  const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+  *(float4*)(out + ((uint64_t)t * heads + h) * kAttnDv + 4 * threadIdx.x) =
+      make_float4(o.x * inv, o.y * inv, o.z * inv, o.w * inv);
+}
+
 __global__ void StoreRows(const float* src, uint64_t src_stride, float* dst, uint32_t ring, const int32_t* pos,
                           uint32_t dim) {
   const uint32_t t = blockIdx.y;
@@ -2557,6 +2754,33 @@ int hy4_mla_attention(const float* q, const uint16_t* cache, uint32_t ring,
       count, n_sel, scale, part_ml, part_acc, heads);
   MlaCombine<<<dim3(heads, n), kAttnDv / 4, 0, stream>>>(
       part_ml, part_acc, pos, window, count, sinks, out, heads);
+  return Status();
+}
+
+uint64_t hy4_dfly_attention_work(uint32_t n, uint32_t heads) {
+  return (uint64_t)n * kDflyAttnSplits * heads * (2 + kAttnDv);
+}
+
+int hy4_dfly_attention(const float* q, const uint16_t* cache, uint32_t ring,
+                       const int32_t* sel, uint32_t sel_count, int32_t limit,
+                       const float* kva, const float* sinks, float scale,
+                       float* out, uint32_t n, uint32_t heads, uint32_t dk,
+                       uint32_t dv, float* work, uint64_t work_floats,
+                       hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (dk != kAttnDk || dv != kAttnDv || heads % kAttnHpw != 0 ||
+      work_floats < hy4_dfly_attention_work(n, heads))
+    return 1;
+  float* part_ml = work;
+  float* part_acc = work + (uint64_t)n * kDflyAttnSplits * heads * 2;
+  const uint32_t groups = (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock;
+  DflyAttnDecode<<<dim3(kDflyAttnSplits, groups, n), kAttnWarps * 32, 0,
+                   stream>>>(q, reinterpret_cast<const _Float16*>(cache), ring,
+                             sel, sel_count, limit, kva, scale, part_ml,
+                             part_acc, n, heads);
+  DflyAttnCombine<<<dim3(heads, n), kAttnDv / 4, 0, stream>>>(
+      part_ml, part_acc, sel_count + n, sinks, out, heads);
   return Status();
 }
 

@@ -93,6 +93,7 @@ if(TARGET gufo_hy4flash_hip)
       kernels/rocm/hy4_f16_mm.hip.cpp
       kernels/rocm/hy4_gemv.hip.cpp
       kernels/rocm/hy4_kernels.hip.cpp
+      kernels/rocm/hy4_q4k_quant.hip.cpp
       kernels/rocm/hy4_vision.hip.cpp
   )
   target_compile_options(gufo_hy4flash_hip PRIVATE
