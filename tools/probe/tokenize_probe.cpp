@@ -26,7 +26,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "open failed: %s\n", error.c_str());
     return 1;
   }
-  auto tok = gufo::models::hy4_flash::Tokenizer::Load(*reader, &error);
+  auto tok = gufo::models::hy4_flash::Tokenizer::Load(
+      *reader, &error, /*canonicalize_specials=*/false);
   if (!tok) {
     std::fprintf(stderr, "tokenizer failed: %s\n", error.c_str());
     return 1;

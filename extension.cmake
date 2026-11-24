@@ -1,6 +1,6 @@
 # Hy4 Flash external model extension.
 
-# Host side: artifact probe, chat template, tool syntax and registration.
+# Host side: artifact probe, chat template, tokenizer, tool syntax and registration.
 gufo_extension_target(
   NAME gufo_hy4flash
   SOURCES
@@ -8,6 +8,7 @@ gufo_extension_target(
     extension.cpp
     probe.cpp
     runtime/hy4_config.cpp
+    runtime/tokenizer.cpp
     text_contract.cpp
     tool_calls.cpp
   LINK_LIBRARIES
@@ -75,7 +76,6 @@ gufo_extension_target(
     runtime/hy4_forward.cpp
     runtime/hy4_vision.cpp
     runtime/hy4_vision_gemm.cpp
-    runtime/tokenizer.cpp
   LINK_LIBRARIES
     gufo_hy4flash
     gufo_hy4flash_mmq
@@ -169,6 +169,8 @@ function(_hy4flash_test name labels)
 endfunction()
 
 _hy4flash_test(chat_template "cpu;tokenization;tools"
+  LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
+_hy4flash_test(tokenizer "cpu;tokenization;tools"
   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
 _hy4flash_test(config "cpu;loader"
   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)

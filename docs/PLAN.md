@@ -479,8 +479,13 @@ Vision (decision 19), with DFly2 drafting:
   post weights and no comb matrix, which confirms iHC. The head reduces the
   streams through `output_hc_fn/base/scale`.
 - **Chat template:** the embedded template matches Tencent's except that it
-  also accepts `reasoning_effort` `max`. Every special token carries the
-  `:opensource` suffix (`<think:opensource>`, `<｜hy_start:opensource｜>`).
+  also accepts `reasoning_effort` `max` (and AngelSlim's accepts `low`). The 24
+  suffixed special tokens share the same token IDs across checkpoints, with
+  `:opensource` on Xylolabs and Tencent's public release (`<think:opensource>`,
+  `<｜hy_start:opensource｜>`) and `:6124c78e` on AngelSlim. `Tokenizer::Load`
+  detects the checkpoint's suffix from `<｜hy_start…｜>` and canonicalizes those
+  24 special tokens to `:opensource` so the renderer, reasoning delimiters,
+  tool dialect and vision prompt share one spelling.
 
 With the drafter (`--dfly-model`, exact verify), the same suites: every case
 of `conversation`, `long-context` and `reasoning-budget` passed; `tools` as

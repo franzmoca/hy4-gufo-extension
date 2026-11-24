@@ -20,8 +20,15 @@ namespace gufo::models::hy4_flash {
 
 class Tokenizer {
 public:
-  [[nodiscard]] static std::unique_ptr<Tokenizer> Load(const core::GgufReader& reader,
-                                                       std::string* error);
+  /// Loads the byte-level BPE tokenizer from `reader`. When
+  /// `canonicalize_specials` is true, any checkpoint suffix on Hy4's suffixed
+  /// special tokens (such as AngelSlim's `:6124c78e`) is rewritten to
+  /// `:opensource` so the chat template, reasoning delimiters, tool dialect
+  /// and vision prompt share one spelling, and every required chat/tool/think
+  /// special token is verified to exist.
+  [[nodiscard]] static std::unique_ptr<Tokenizer> Load(
+      const core::GgufReader& reader, std::string* error,
+      bool canonicalize_specials = true);
 
   /// Plain text: special-token spellings are tokenized as text.
   [[nodiscard]] std::vector<std::int32_t> Encode(std::string_view text) const;

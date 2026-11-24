@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- The AngelSlim Q4_K_M trunk now serves chat, reasoning, tool calls and vision
+  correctly. Its 24 suffixed special tokens share the same token IDs as
+  Xylolabs and Tencent's public checkpoint (`120000`–`120124`) but carry the
+  internal `:6124c78e` suffix instead of `:opensource`; `Tokenizer::Load` now
+  detects the checkpoint's suffix from `<｜hy_start…｜>`, canonicalizes those
+  24 special tokens to `:opensource`, and rejects vocabularies missing required
+  framing, reasoning or tool control tokens. `hy4_tokenize_probe` loads with
+  raw spellings so it stays byte-identical to `llama-tokenize`.
+
 ## 0.2.1 (2026-11-23)
 
 Built on upstream Gufo `0a473ebf`; needs extension API 0.3.29 or later.
