@@ -49,6 +49,10 @@ constexpr std::size_t kBatchTransferStreams = 16;
 constexpr std::int64_t kDefaultDraftTokens = 7;
 // See Hy4TextRunner::min_accept_.
 constexpr float kDefaultMinAccept = 0.45f;
+// At six or more concurrent sessions, 16 verify rows leave at most one draft
+// token per session and plain AR beats DFly2 on prose; prompt-lookup copies
+// still run at any batch width (HY4_DFLY_MAX_CONCURRENCY overrides).
+constexpr std::size_t kDefaultDflyMaxConcurrency = 5;
 
 std::size_t CacheCeilingBytes() { return std::max(HostSnapshotCeilingBytes(), HostSnapshotBudgetBytes()); }
 
@@ -623,7 +627,7 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(TextRunnerState& state, std::size_t max_tokens,
                                           sampling::SamplerState& sampler) const override {
     DecodePlan plan =
-        PrepareDecode(state, max_tokens, sampler, Session::kTapRows);
+        PrepareDecode(state, max_tokens, sampler, Session::kTapRows, true);
     DecodePlan* drafting = &plan;
     DraftPlans(std::span(&drafting, 1));
     if (!plan.tokens.empty()) {
@@ -646,12 +650,14 @@ public:
       std::span<const TextRunnerDecode> decodes) const override {
     std::vector<TextDecodeStep> steps(decodes.size());
     std::vector<std::optional<DecodePlan>> plans(decodes.size());
+    const bool allow_dfly = decodes.size() <= dfly_max_concurrency_;
     for (std::size_t i = 0; i < decodes.size(); ++i) {
       try {
         plans[i] = PrepareDecode(
             decodes[i].state.get(), decodes[i].max_tokens,
             decodes[i].sampler.get(),
-            std::max<std::size_t>(1, Session::kTapRows / decodes.size()));
+            std::max<std::size_t>(1, Session::kTapRows / decodes.size()),
+            allow_dfly);
       } catch (...) {
         steps[i].failure = std::current_exception();
       }
@@ -764,7 +770,7 @@ private:
   // proposes at most its share of the pass's rows.
   DecodePlan PrepareDecode(TextRunnerState& state, std::size_t max_tokens,
                            sampling::SamplerState& sampler,
-                           std::size_t max_rows) const {
+                           std::size_t max_rows, bool allow_dfly) const {
     DecodePlan plan{
         .hy4 = &RequireState(state), .sampler = &sampler, .work = sampler};
     auto& hy4 = *plan.hy4;
@@ -784,8 +790,8 @@ private:
       plan.copy = Copy(hy4, static_cast<std::int32_t>(anchor.token), work, room,
                        &plan.proposals);
     }
-    const bool draft = !anchor.stop && plan.proposals.empty() && drafter_ &&
-                       session.TapsReady() && room > 0;
+    const bool draft = allow_dfly && !anchor.stop && plan.proposals.empty() &&
+                       drafter_ && session.TapsReady() && room > 0;
     if (anchor.stop || (plan.proposals.empty() && !draft)) {
       plan.step.stop = anchor.stop;
       if (anchor.stop) {
@@ -987,6 +993,12 @@ private:
   // accepted stays at least this (HY4_DFLY_MIN_ACCEPT overrides).
   float min_accept_{std::getenv("HY4_DFLY_MIN_ACCEPT") ? std::strtof(std::getenv("HY4_DFLY_MIN_ACCEPT"), nullptr)
                                                        : kDefaultMinAccept};
+  std::size_t dfly_max_concurrency_{
+      std::getenv("HY4_DFLY_MAX_CONCURRENCY")
+          ? static_cast<std::size_t>(std::max<long>(
+                0, std::strtol(std::getenv("HY4_DFLY_MAX_CONCURRENCY"), nullptr,
+                               10)))
+          : kDefaultDflyMaxConcurrency};
   // HY4_DFLY_PROFILE=1: mean draft and verify times, logged every 64 steps.
   struct Profile {
     std::uint64_t rounds{0}, draft_rounds{0}, accepted{0}, drafted{0};
