@@ -14,6 +14,7 @@
 #include <gufo/ext/experimental/state_memory.hpp>
 #include <gufo/ext/state.hpp>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -196,6 +197,16 @@ private:
   mutable bool wide_pass_running_ = false;
   std::unique_ptr<Scratch> scratch_;         // prompt passes, MaxChunk() rows
   std::unique_ptr<Scratch> decode_scratch_;  // other passes, kVecMax rows
+  // Resident decode logits tracking and device sampling scratch.
+  std::uint64_t logits_gen_ = 0;
+  std::vector<Session*> logits_owners_;
+  float* argmax_work_ = nullptr;
+  std::int32_t* argmax_dev_ = nullptr;
+  std::int32_t* argmax_host_ = nullptr;  // pinned
+  void* sample_scratch_ = nullptr;
+  std::uint32_t* sample_mask_ = nullptr;
+  std::vector<std::uint32_t> sample_mask_words_;
+  void* sample_out_host_ = nullptr;  // pinned hy4_sample_result
   // A prompt pass is paused between layer groups and holds scratch_.
   bool prompt_paused_ = false;
 };
@@ -218,11 +229,31 @@ public:
                               std::string* error, bool prompt = false);
 
   /// Evaluates `tokens` and keeps the last one's logits (LastLogits).
-  [[nodiscard]] bool Step(std::span<const std::int32_t> tokens, std::string* error) {
-    return Evaluate(tokens, &last_logits_, false, error);
+  [[nodiscard]] bool Step(std::span<const std::int32_t> tokens,
+                          std::string* error);
+  /// The logits after the last Step, [n_vocab] on the host (downloaded lazily
+  /// if still resident on the device).
+  [[nodiscard]] std::vector<float>& LastLogits();
+  /// Cached finite argmax of the frontier row (or row `row` of the last
+  /// Verify), if computed on the device.
+  [[nodiscard]] std::optional<std::int32_t> LastArgmax() const {
+    return last_argmax_;
   }
-  /// The logits after the last Step, [n_vocab] on the host.
-  [[nodiscard]] std::vector<float>& LastLogits() { return last_logits_; }
+  [[nodiscard]] std::optional<std::int32_t> Argmax(std::uint32_t row) const {
+    if (row < pass_argmax_.size() && pass_argmax_[row] >= 0)
+      return pass_argmax_[row];
+    return std::nullopt;
+  }
+  /// Device-side sampling on a resident Verify row (or the frontier row for
+  /// DeviceSampleLast). Returns false if the row is not resident or the draw
+  /// is degenerate, in which case the caller falls back to host logits.
+  [[nodiscard]] bool DeviceSample(std::uint32_t row, const std::uint32_t* mask,
+                                  std::uint32_t mask_words, float temperature,
+                                  double u, std::int32_t* token) const;
+  [[nodiscard]] bool DeviceSampleLast(const std::uint32_t* mask,
+                                      std::uint32_t mask_words,
+                                      float temperature, double u,
+                                      std::int32_t* token) const;
   /// Step for prompt tokens (Evaluate's `prompt`).
   [[nodiscard]] bool Prompt(std::span<const std::int32_t> tokens,
                             std::string* error) {
@@ -350,6 +381,7 @@ private:
     std::span<const std::int32_t> tokens;
     std::vector<float>* logits;
     bool all_logits;
+    bool lazy_logits = false;
   };
   // A part's rows of the pass: [row0, row0 + n) of the scratch.
   struct Rows {
@@ -437,9 +469,19 @@ private:
   bool prompt_pass_ = false;  // the current Evaluate is a prompt pass
   // The last Verify: its first position and logits [n][n_vocab].
   std::uint32_t pass_pos0_ = 0;
-  std::vector<float> pass_logits_;
+  mutable std::vector<float> pass_logits_;
   std::vector<void*> allocations_;
-  std::vector<float> last_logits_;
+  mutable std::vector<float> last_logits_;
+  // Lazy device-resident logits in Model::decode_scratch_->logits.
+  mutable std::uint64_t logits_gen_ = 0;
+  mutable std::uint32_t logits_row0_ = 0;
+  mutable std::uint32_t logits_count_ = 0;
+  mutable std::uint32_t last_row_ = 0;
+  mutable bool logits_on_host_ = true;
+  std::optional<std::int32_t> last_argmax_;
+  std::vector<std::int32_t> pass_argmax_;
+  bool EnsureLogits(std::string* error) const;
+  void ClearResidentLogits() noexcept;
   WriteHook write_hook_ = nullptr;
   void* write_user_ = nullptr;
   double engram_seconds_ = 0.0;

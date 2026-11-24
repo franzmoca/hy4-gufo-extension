@@ -354,6 +354,30 @@ int hy4_dequant_q8_0(const void* src, uint64_t blocks, float* out, hipStream_t s
 uint64_t hy4_argmax_work_floats(void);
 int hy4_argmax(const float* x, uint32_t dim, float* work, int32_t* out,
                hipStream_t stream);
+/* Batched finite argmax over `rows` rows of [dim] floats: writes the index of
+ * each row's largest finite value (lowest index on ties, -1 if none) to
+ * out[rows]. `work` holds at least hy4_argmax_work_floats_batch(rows) floats.
+ */
+uint64_t hy4_argmax_work_floats_batch(uint32_t rows);
+int hy4_argmax_rows(const float* x, uint32_t rows, uint32_t dim, float* work,
+                    int32_t* out, hipStream_t stream);
+
+/* Exact device sampling on one resident logit row [dim], adapted from
+ * ds41-gufo-extension (ds41_v41_sample_row). `mask` (nullable) is a device
+ * packed bitmask of (dim + 31) / 32 words where bit (i & 31) of mask[i >> 5]
+ * admits token i. With temperature <= 0, selects the masked finite argmax;
+ * with temperature > 0, draws from FP64 softmax(logits / temperature) with
+ * uniform u in [0, 1). `scratch` holds HY4_SAMPLE_SCRATCH_BYTES device bytes;
+ * writes *out (host) and synchronizes stream. */
+#define HY4_SAMPLE_SCRATCH_BYTES 4096u
+struct hy4_sample_result {
+  int32_t token;
+  int32_t degenerate;
+  int32_t argmax;
+};
+int hy4_sample_row(const float* logits, uint32_t dim, const uint32_t* mask,
+                   float temperature, double u, void* scratch,
+                   struct hy4_sample_result* out, hipStream_t stream);
 /* dst [blocks] = Q8_0 blocks of src [blocks * 32] binary16 values:
  * d = max |v| / 127 (binary16), q = v / d rounded to nearest even. */
 int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst,

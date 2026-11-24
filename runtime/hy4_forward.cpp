@@ -412,6 +412,20 @@ bool Model::AllocScratch(std::string* error) {
   if (!DeviceAlloc(&gemv, hy4_gemv_scratch_bytes(), owned))
     return Fail(error, "hy4: gemv scratch allocation failed");
   gemv_scratch_ = gemv;
+  std::uint8_t* sample_scratch = nullptr;
+  hy4_sample_result* sample_out = nullptr;
+  const std::uint32_t mask_words = (config_.n_vocab + 31) / 32;
+  if (!DeviceAlloc(&argmax_work_, hy4_argmax_work_floats_batch(kVecMax),
+                   owned) ||
+      !DeviceAlloc(&argmax_dev_, kVecMax, owned) ||
+      !HostAlloc(&argmax_host_, kVecMax, owned) ||
+      !DeviceAlloc(&sample_scratch, HY4_SAMPLE_SCRATCH_BYTES, owned) ||
+      !DeviceAlloc(&sample_mask_, mask_words, owned) ||
+      !HostAlloc(&sample_out, 1, owned)) {
+    return Fail(error, "hy4: sampling scratch allocation failed");
+  }
+  sample_scratch_ = sample_scratch;
+  sample_out_host_ = sample_out;
   for (Layer& l : weights_.layers) {
     const std::uint64_t blocks =
         l.wk_b.dims[0] * l.wk_b.dims[1] * l.wk_b.dims[2] / 32;
@@ -608,7 +622,99 @@ bool Session::EnsureRows(std::uint32_t rows, std::string* error) {
   return true;
 }
 
+void Session::ClearResidentLogits() noexcept {
+  logits_count_ = 0;
+  last_row_ = 0;
+  logits_on_host_ = true;
+  last_argmax_.reset();
+  pass_argmax_.clear();
+  if (model_)
+    std::erase(model_->logits_owners_, this);
+}
+
+bool Session::EnsureLogits(std::string* error) const {
+  if (logits_on_host_)
+    return true;
+  if (!model_ || logits_count_ == 0 || logits_gen_ != model_->logits_gen_) {
+    logits_on_host_ = true;
+    return true;
+  }
+  const std::size_t v = model_->config_.n_vocab;
+  const float* src =
+      model_->decode_scratch_->logits + std::size_t{logits_row0_} * v;
+  hipStream_t st = model_->stream_;
+  if (logits_count_ == 1) {
+    last_logits_.resize(v);
+    if (hipMemcpyAsync(last_logits_.data(), src, v * sizeof(float),
+                       hipMemcpyDeviceToHost, st) != hipSuccess ||
+        hipStreamSynchronize(st) != hipSuccess)
+      return Fail(error, "hy4: logits download failed");
+  } else {
+    pass_logits_.resize(std::size_t{logits_count_} * v);
+    if (hipMemcpyAsync(pass_logits_.data(), src,
+                       std::size_t{logits_count_} * v * sizeof(float),
+                       hipMemcpyDeviceToHost, st) != hipSuccess ||
+        hipStreamSynchronize(st) != hipSuccess)
+      return Fail(error, "hy4: logits download failed");
+    const std::size_t row = std::min<std::size_t>(last_row_, logits_count_ - 1);
+    last_logits_.assign(pass_logits_.begin() + row * v,
+                        pass_logits_.begin() + (row + 1) * v);
+  }
+  logits_on_host_ = true;
+  return true;
+}
+
+std::vector<float>& Session::LastLogits() {
+  (void)EnsureLogits(nullptr);
+  return last_logits_;
+}
+
+bool Session::DeviceSample(std::uint32_t row, const std::uint32_t* mask,
+                           std::uint32_t mask_words, float temperature,
+                           double u, std::int32_t* token) const {
+  if (!model_ || !token || logits_count_ == 0 || row >= logits_count_ ||
+      logits_gen_ != model_->logits_gen_)
+    return false;
+  const std::uint32_t vocab = model_->config_.n_vocab;
+  const std::uint32_t expected_words = (vocab + 31) / 32;
+  hipStream_t st = model_->stream_;
+  if (mask) {
+    if (mask_words != expected_words)
+      return false;
+    if (model_->sample_mask_words_.size() != expected_words ||
+        std::memcmp(model_->sample_mask_words_.data(), mask,
+                    expected_words * sizeof(std::uint32_t)) != 0) {
+      model_->sample_mask_words_.clear();
+      if (hipMemcpyAsync(model_->sample_mask_, mask,
+                         expected_words * sizeof(std::uint32_t),
+                         hipMemcpyHostToDevice, st) != hipSuccess) {
+        (void)hipGetLastError();
+        return false;
+      }
+      model_->sample_mask_words_.assign(mask, mask + expected_words);
+    }
+  }
+  const float* row_ptr =
+      model_->decode_scratch_->logits + std::size_t{logits_row0_ + row} * vocab;
+  auto* out = static_cast<hy4_sample_result*>(model_->sample_out_host_);
+  if (hy4_sample_row(row_ptr, vocab, mask ? model_->sample_mask_ : nullptr,
+                     temperature, u, model_->sample_scratch_, out, st) != 0)
+    return false;
+  if (out->degenerate || out->token < 0 ||
+      static_cast<std::uint32_t>(out->token) >= vocab)
+    return false;
+  *token = out->token;
+  return true;
+}
+
+bool Session::DeviceSampleLast(const std::uint32_t* mask,
+                               std::uint32_t mask_words, float temperature,
+                               double u, std::int32_t* token) const {
+  return DeviceSample(last_row_, mask, mask_words, temperature, u, token);
+}
+
 void Session::Reset() {
+  ClearResidentLogits();
   history_.clear();
   rope_.clear();
   rope_delta_ = 0;
@@ -625,6 +731,7 @@ void Session::Reset() {
 }
 
 std::int32_t* Session::BeginRestore(std::uint32_t tokens) {
+  ClearResidentLogits();
   std::string ensure_error;
   if (!EnsureRows(tokens, &ensure_error))
     return nullptr;
@@ -636,6 +743,7 @@ std::int32_t* Session::BeginRestore(std::uint32_t tokens) {
 }
 
 Session::~Session() {
+  ClearResidentLogits();
   kv_regions_.clear();
   pool_regions_.clear();
   state_.reset();
@@ -684,14 +792,24 @@ bool Session::PromptThrough(std::span<const std::int32_t> tokens,
   return Prompt(tokens, error);
 }
 
+bool Session::Step(std::span<const std::int32_t> tokens, std::string* error) {
+  if (tokens.empty())
+    return true;
+  if (tokens.size() > Model::kVecMax)
+    return Evaluate(tokens, &last_logits_, false, error);
+  prompt_pass_ = false;
+  const PassPart part{this, tokens, &last_logits_, false, true};
+  return Pass(std::span(&part, 1), error);
+}
+
 bool Session::Verify(std::span<const std::int32_t> tokens, std::string* error) {
   if (tokens.empty() || tokens.size() > kTapRows)
     return Fail(error, "hy4: verify takes 1 to 16 tokens");
+  prompt_pass_ = false;
   pass_pos0_ = Position();
   tap_ready_ = false;
-  if (!Evaluate(tokens, &pass_logits_, true, error)) return false;
-  last_logits_.assign(pass_logits_.end() - model_->config().n_vocab, pass_logits_.end());
-  return true;
+  const PassPart part{this, tokens, &pass_logits_, true, true};
+  return Pass(std::span(&part, 1), error);
 }
 
 bool Session::DecodeBatch(std::span<Session* const> sessions,
@@ -710,26 +828,18 @@ bool Session::DecodeBatch(std::span<Session* const> sessions,
       return Fail(error, "hy4: verify takes 1 to 16 tokens");
     se.prompt_pass_ = false;
     if (tokens[i].size() == 1) {
-      parts.push_back({&se, tokens[i], &se.last_logits_, false});
+      parts.push_back({&se, tokens[i], &se.last_logits_, false, true});
     } else {
       se.pass_pos0_ = se.Position();
       se.tap_ready_ = false;
-      parts.push_back({&se, tokens[i], &se.pass_logits_, true});
+      parts.push_back({&se, tokens[i], &se.pass_logits_, true, true});
     }
   }
-  if (!Pass(parts, error))
-    return false;
-  for (const PassPart& part : parts) {
-    Session& se = *part.session;
-    if (part.all_logits)
-      se.last_logits_.assign(
-          se.pass_logits_.end() - se.model_->config().n_vocab,
-          se.pass_logits_.end());
-  }
-  return true;
+  return Pass(parts, error);
 }
 
 std::span<const float> Session::PassLogits(std::uint32_t row) const {
+  (void)EnsureLogits(nullptr);
   const std::size_t v = model_->config().n_vocab;
   return std::span<const float>(pass_logits_).subspan(row * v, v);
 }
@@ -739,8 +849,20 @@ void Session::Keep(std::uint32_t tokens) {
   tokens = std::clamp<std::uint32_t>(tokens, 1, evaluated);
   history_.resize(pass_pos0_ + tokens);
   rope_.resize(history_.size());
-  const auto row = PassLogits(tokens - 1);
-  last_logits_.assign(row.begin(), row.end());
+  if (tokens - 1 < pass_argmax_.size()) {
+    const std::int32_t a = pass_argmax_[tokens - 1];
+    last_argmax_ = a >= 0 ? std::optional<std::int32_t>(a) : std::nullopt;
+  } else {
+    last_argmax_.reset();
+  }
+  if (logits_on_host_) {
+    const auto row = PassLogits(tokens - 1);
+    last_logits_.assign(row.begin(), row.end());
+  } else if (logits_count_ >= tokens) {
+    logits_row0_ += tokens - 1;
+    logits_count_ = 1;
+    last_row_ = 0;
+  }
   // The pass left its last tap_rows_ (= evaluated) rows.
   if (tap_ready_) tap_row_ = tap_rows_ - (evaluated - tokens) - 1;
 }
@@ -1201,42 +1323,123 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
     HY4_CHECK(hipMemcpyAsync(out.data(), s.logits, out.size() * sizeof(float),
                              hipMemcpyDeviceToHost, st));
   }
-  if (parts.size() == 1) {
-    if (auto* logits = parts.front().logits) {
-      const std::uint32_t first_row = parts.front().all_logits ? 0 : n - 1;
-      const std::uint32_t count = n - first_row;
-      logits->resize(std::size_t{count} * c.n_vocab);
-      // kVecMax rows per product: the scratch holds that many logit rows.
-      for (std::uint32_t r = 0; r < count; r += Model::kVecMax) {
-        const std::uint32_t rows = std::min(Model::kVecMax, count - r);
-        if (!MatVec(w.output, s.cur + std::size_t{first_row + r} * c.n_embd,
-                    s.logits, c.n_vocab, c.n_embd, rows, ex, error)) {
+  if (!wide) {
+    // Preserve any other session's deferred logits before
+    // decode_scratch_->logits is overwritten by this decode pass.
+    for (Session* owner : m.logits_owners_) {
+      const bool in_pass = std::ranges::any_of(
+          parts, [&](const PassPart& pp) { return pp.session == owner; });
+      if (!in_pass && !owner->logits_on_host_) {
+        if (!owner->EnsureLogits(error))
           return false;
+      }
+    }
+    m.logits_owners_.clear();
+  }
+  const bool lazy = !wide && !first.through_logits_ &&
+                    std::ranges::all_of(parts, [](const PassPart& pp) {
+                      return pp.lazy_logits;
+                    });
+  if (lazy) {
+    if (parts.size() == 1 && !parts.front().all_logits) {
+      if (!MatVec(w.output, s.cur + std::size_t{n - 1} * c.n_embd, s.logits,
+                  c.n_vocab, c.n_embd, 1, ex, error))
+        return false;
+      HY4_CHECK(hy4_argmax_rows(s.logits, 1, c.n_vocab, m.argmax_work_,
+                                m.argmax_dev_, st));
+      HY4_CHECK(hipMemcpyAsync(m.argmax_host_, m.argmax_dev_,
+                               sizeof(std::int32_t), hipMemcpyDeviceToHost,
+                               st));
+      HY4_CHECK(hipStreamSynchronize(st));
+      Session& se = *parts.front().session;
+      const std::uint64_t gen = ++m.logits_gen_;
+      se.logits_gen_ = gen;
+      se.logits_row0_ = 0;
+      se.logits_count_ = 1;
+      se.last_row_ = 0;
+      se.logits_on_host_ = false;
+      const std::int32_t a = m.argmax_host_[0];
+      se.pass_argmax_.assign(1, a);
+      se.last_argmax_ = a >= 0 ? std::optional<std::int32_t>(a) : std::nullopt;
+      m.logits_owners_.push_back(&se);
+    } else {
+      if (!MatVec(w.output, s.cur, s.logits, c.n_vocab, c.n_embd, n, ex, error))
+        return false;
+      HY4_CHECK(hy4_argmax_rows(s.logits, n, c.n_vocab, m.argmax_work_,
+                                m.argmax_dev_, st));
+      HY4_CHECK(hipMemcpyAsync(m.argmax_host_, m.argmax_dev_,
+                               std::size_t{n} * sizeof(std::int32_t),
+                               hipMemcpyDeviceToHost, st));
+      HY4_CHECK(hipStreamSynchronize(st));
+      const std::uint64_t gen = ++m.logits_gen_;
+      for (const Rows& part : rows) {
+        Session& se = *part.session;
+        const PassPart& pp = parts[&part - rows.data()];
+        if (part.n == 0)
+          continue;
+        se.logits_gen_ = gen;
+        se.logits_on_host_ = false;
+        if (pp.all_logits) {
+          se.logits_row0_ = part.row0;
+          se.logits_count_ = part.n;
+          se.last_row_ = part.n - 1;
+          se.pass_argmax_.assign(m.argmax_host_ + part.row0,
+                                 m.argmax_host_ + part.row0 + part.n);
+          const std::int32_t a = se.pass_argmax_.back();
+          se.last_argmax_ =
+              a >= 0 ? std::optional<std::int32_t>(a) : std::nullopt;
+        } else {
+          se.logits_row0_ = part.row0 + part.n - 1;
+          se.logits_count_ = 1;
+          se.last_row_ = 0;
+          const std::int32_t a = m.argmax_host_[se.logits_row0_];
+          se.pass_argmax_.assign(1, a);
+          se.last_argmax_ =
+              a >= 0 ? std::optional<std::int32_t>(a) : std::nullopt;
         }
-        HY4_CHECK(hipMemcpyAsync(logits->data() + std::size_t{r} * c.n_vocab,
-                                 s.logits,
-                                 std::size_t{rows} * c.n_vocab * sizeof(float),
-                                 hipMemcpyDeviceToHost, st));
+        m.logits_owners_.push_back(&se);
       }
     }
   } else {
-    // One head product over every session's rows; each takes its own.
-    if (!MatVec(w.output, s.cur, s.logits, c.n_vocab, c.n_embd, n, ex, error))
-      return false;
-    for (const Rows& part : rows) {
-      auto* logits = parts[&part - rows.data()].logits;
-      if (!logits || part.n == 0)
-        continue;
-      const std::uint32_t first_row =
-          parts[&part - rows.data()].all_logits ? 0 : part.n - 1;
-      logits->resize(std::size_t{part.n - first_row} * c.n_vocab);
-      HY4_CHECK(hipMemcpyAsync(
-          logits->data(),
-          s.logits + std::size_t{part.row0 + first_row} * c.n_vocab,
-          logits->size() * sizeof(float), hipMemcpyDeviceToHost, st));
+    if (parts.size() == 1) {
+      if (auto* logits = parts.front().logits) {
+        const std::uint32_t first_row = parts.front().all_logits ? 0 : n - 1;
+        const std::uint32_t count = n - first_row;
+        logits->resize(std::size_t{count} * c.n_vocab);
+        // kVecMax rows per product: the scratch holds that many logit rows.
+        for (std::uint32_t r = 0; r < count; r += Model::kVecMax) {
+          const std::uint32_t rows_here = std::min(Model::kVecMax, count - r);
+          if (!MatVec(w.output, s.cur + std::size_t{first_row + r} * c.n_embd,
+                      s.logits, c.n_vocab, c.n_embd, rows_here, ex, error)) {
+            return false;
+          }
+          HY4_CHECK(hipMemcpyAsync(
+              logits->data() + std::size_t{r} * c.n_vocab, s.logits,
+              std::size_t{rows_here} * c.n_vocab * sizeof(float),
+              hipMemcpyDeviceToHost, st));
+        }
+      }
+    } else {
+      // One head product over every session's rows; each takes its own.
+      if (!MatVec(w.output, s.cur, s.logits, c.n_vocab, c.n_embd, n, ex, error))
+        return false;
+      for (const Rows& part : rows) {
+        auto* logits = parts[&part - rows.data()].logits;
+        if (!logits || part.n == 0)
+          continue;
+        const std::uint32_t first_row =
+            parts[&part - rows.data()].all_logits ? 0 : part.n - 1;
+        logits->resize(std::size_t{part.n - first_row} * c.n_vocab);
+        HY4_CHECK(hipMemcpyAsync(
+            logits->data(),
+            s.logits + std::size_t{part.row0 + first_row} * c.n_vocab,
+            logits->size() * sizeof(float), hipMemcpyDeviceToHost, st));
+      }
     }
+    HY4_CHECK(hipStreamSynchronize(st));
+    for (const Rows& part : rows)
+      part.session->ClearResidentLogits();
   }
-  HY4_CHECK(hipStreamSynchronize(st));
   for (const Rows& part : rows) {
     Session& se = *part.session;
     const auto& tokens = parts[&part - rows.data()].tokens;
