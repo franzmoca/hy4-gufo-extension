@@ -2190,6 +2190,132 @@ void TestMoeShared() {
   }
 }
 
+void TestDflyAttention() {
+  const uint32_t dk = 576, dv = 512, ring = 128, heads = 32, n = 8,
+                 sel_count = 70;
+  const int32_t limit = 90;
+  const float scale = 1.0f / 16.0f;
+  auto cache = Random(ring * dk, -1, 1);
+  std::vector<uint16_t> cbits(cache.size());
+  for (std::size_t i = 0; i < cache.size(); ++i) {
+    cbits[i] = HalfBits(cache[i]);
+    cache[i] = (float)HalfValue(cbits[i]);
+  }
+  const auto q = Random(n * heads * dk, -1, 1);
+  const auto kva = Random(n * dk, -1, 1);
+  const auto sinks = Random(heads, -1, 1);
+  std::vector<int32_t> sel(sel_count);
+  for (uint32_t j = 0; j < sel_count; ++j) {
+    if (j % 11 == 0)
+      sel[j] = -1;
+    else if (j % 13 == 0)
+      sel[j] = limit + 5;
+    else
+      sel[j] = (int32_t)((j * 7) % (limit + 1));
+  }
+  const uint64_t work = hy4_dfly_attention_work(n, heads);
+  float* dw = Device(std::vector<float>(work));
+  float* out = Device(std::vector<float>(n * heads * dv));
+  Expect(hy4_dfly_attention(Device(q), Device(cbits), ring, Device(sel),
+                            sel_count, limit, Device(kva), Device(sinks), scale,
+                            out, n, heads, dk, dv, dw, work, nullptr) == 0,
+         "dfly_attention status");
+  std::vector<double> want(n * heads * dv, 0.0);
+  for (uint32_t t = 0; t < n; ++t)
+    for (uint32_t h = 0; h < heads; ++h) {
+      std::vector<double> sc;
+      std::vector<const float*> rows;
+      double mx = sinks[h];
+      for (uint32_t j = 0; j < sel_count; ++j) {
+        if (sel[j] < 0 || sel[j] > limit)
+          continue;
+        const float* kr = &cache[((uint32_t)sel[j] % ring) * dk];
+        double d = 0;
+        for (uint32_t i = 0; i < dk; ++i)
+          d += (double)q[(t * heads + h) * dk + i] * kr[i];
+        sc.push_back(d * scale);
+        rows.push_back(kr);
+        mx = std::max(mx, sc.back());
+      }
+      for (uint32_t j = 0; j < n; ++j) {
+        const float* kr = &kva[j * dk];
+        double d = 0;
+        for (uint32_t i = 0; i < dk; ++i)
+          d += (double)q[(t * heads + h) * dk + i] * kr[i];
+        sc.push_back(d * scale);
+        rows.push_back(kr);
+        mx = std::max(mx, sc.back());
+      }
+      double den = std::exp(sinks[h] - mx);
+      for (double& e : sc)
+        den += (e = std::exp(e - mx));
+      for (std::size_t j = 0; j < sc.size(); ++j)
+        for (uint32_t c = 0; c < dv; ++c)
+          want[(t * heads + h) * dv + c] += sc[j] / den * rows[j][c];
+    }
+  Near(Host(out, n * heads * dv), want, 1e-5, "dfly_attention");
+}
+
+void TestQuantizeQ4K() {
+  const uint64_t sbs = 6;
+  const auto vals = Random(sbs * 256, -2.0f, 2.0f);
+  std::vector<uint16_t> half_in(sbs * 256), bf16_in(sbs * 256);
+  std::vector<double> half_ref(sbs * 256), bf16_ref(sbs * 256);
+  for (std::size_t i = 0; i < vals.size(); ++i) {
+    half_in[i] = HalfBits(vals[i]);
+    half_ref[i] = HalfValue(half_in[i]);
+    uint32_t bits;
+    std::memcpy(&bits, &vals[i], 4);
+    bf16_in[i] = static_cast<uint16_t>(bits >> 16);
+    const uint32_t wide = static_cast<uint32_t>(bf16_in[i]) << 16;
+    float f;
+    std::memcpy(&f, &wide, 4);
+    bf16_ref[i] = f;
+  }
+  uint8_t* dq_h = Device(std::vector<uint8_t>(sbs * 144));
+  uint8_t* dq_b = Device(std::vector<uint8_t>(sbs * 144));
+  uint8_t* dq_q8 = Device(std::vector<uint8_t>(sbs * 144));
+  void* d_q8 = Device(std::vector<uint8_t>(sbs * 8 * 34));
+  Expect(hy4_quantize_q4_k_half(Device(half_in), sbs, dq_h, nullptr) == 0 &&
+             hy4_quantize_q4_k_bf16(Device(bf16_in), sbs, dq_b, nullptr) == 0 &&
+             hy4_quantize_q8_0_half(Device(half_in), sbs * 8, d_q8, nullptr) ==
+                 0 &&
+             hy4_quantize_q4_k_q8_0(d_q8, sbs, dq_q8, nullptr) == 0,
+         "quantize_q4_k status");
+  auto rms_err = [](const std::vector<double>& a,
+                    const std::vector<double>& b) {
+    double se = 0, ss = 0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = a[i] - b[i];
+      se += d * d;
+      ss += b[i] * b[i];
+    }
+    return std::sqrt(se / ss);
+  };
+  const auto deq_h = Dequant(HY4_TYPE_Q4_K, Host(dq_h, sbs * 144));
+  const auto deq_b = Dequant(HY4_TYPE_Q4_K, Host(dq_b, sbs * 144));
+  const auto deq_q8 = Dequant(HY4_TYPE_Q4_K, Host(dq_q8, sbs * 144));
+  // Theoretical 4-bit uniform RMS floor on [-2, 2] is 1/15 ~= 0.0667.
+  Expect(rms_err(deq_h, half_ref) < 0.08, "quantize_q4_k_half accuracy");
+  Expect(rms_err(deq_b, bf16_ref) < 0.08, "quantize_q4_k_bf16 accuracy");
+  Expect(rms_err(deq_q8, half_ref) < 0.08, "quantize_q4_k_q8_0 accuracy");
+  // Exact 4-bit grid values (sub-block j uses values -1 + (0..15) / 8) must
+  // round-trip with negligible error, verifying scale/min/nibble layout.
+  std::vector<uint16_t> grid_h(256);
+  std::vector<double> grid_ref(256);
+  for (int j = 0; j < 8; ++j)
+    for (int i = 0; i < 32; ++i) {
+      const float v = -1.0f + static_cast<float>((i + j) % 16) * 0.125f;
+      grid_h[j * 32 + i] = HalfBits(v);
+      grid_ref[j * 32 + i] = v;
+    }
+  uint8_t* dq_grid = Device(std::vector<uint8_t>(144));
+  Expect(hy4_quantize_q4_k_half(Device(grid_h), 1, dq_grid, nullptr) == 0,
+         "quantize_q4_k grid status");
+  const auto deq_grid = Dequant(HY4_TYPE_Q4_K, Host(dq_grid, 144));
+  Expect(rms_err(deq_grid, grid_ref) < 1e-3, "quantize_q4_k grid round-trip");
+}
+
 int main() {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
@@ -2204,11 +2330,13 @@ int main() {
   TestRope();
   TestMlaPrep();
   TestMlaAttention();
+  TestDflyAttention();
   TestMlaPrefill();
   TestRows();
   TestArgmax();
   TestQuantizeHalf();
   TestQuantizeBf16();
+  TestQuantizeQ4K();
   TestGatherRows();
   TestElementwise();
   TestRoute();

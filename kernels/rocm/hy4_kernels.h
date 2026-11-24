@@ -219,6 +219,20 @@ int hy4_mla_attention(const float* q, const uint16_t* cache, uint32_t ring,
                       uint32_t dv, float* work, uint64_t work_floats,
                       hipStream_t stream);
 
+/* DFly2 block MLA attention: n queries q [n][heads][dk] attend to every valid
+ * indexed binary16 cache row sel[j] (0 <= sel[j] <= limit, row sel[j] % ring)
+ * for j < sel_count and to all n FP32 block latent rows kva [n][dk], with
+ * learnable sinks [heads]. Same dk = 576, dv = 512, heads % 4 == 0 contract
+ * as hy4_mla_attention; `work` holds hy4_dfly_attention_work(n, heads) floats.
+ */
+uint64_t hy4_dfly_attention_work(uint32_t n, uint32_t heads);
+int hy4_dfly_attention(const float* q, const uint16_t* cache, uint32_t ring,
+                       const int32_t* sel, uint32_t sel_count, int32_t limit,
+                       const float* kva, const float* sinks, float scale,
+                       float* out, uint32_t n, uint32_t heads, uint32_t dk,
+                       uint32_t dv, float* work, uint64_t work_floats,
+                       hipStream_t stream);
+
 /* hy4_mla_attention for prefill on the matrix cores (binary16 operands, FP32
  * softmax and accumulation; q as binary16 bits from hy4_mla_absorb), each
  * token over exactly its own keys, so a token's result does not depend on the
@@ -348,6 +362,14 @@ int hy4_quantize_q8_0_half(const uint16_t* src, uint64_t blocks, void* dst,
  * head is BF16 quantizes to the same blocks a binary16 one of the same values
  * would. */
 int hy4_quantize_q8_0_bf16(const uint16_t* src, uint64_t blocks, void* dst,
+                           hipStream_t stream);
+/* dst [superblocks] = Q4_K blocks (144 bytes / 256 values, ggml
+ * quantize_row_q4_K_ref) from binary16, bfloat16, or Q8_0 rows. */
+int hy4_quantize_q4_k_half(const uint16_t* src, uint64_t superblocks, void* dst,
+                           hipStream_t stream);
+int hy4_quantize_q4_k_bf16(const uint16_t* src, uint64_t superblocks, void* dst,
+                           hipStream_t stream);
+int hy4_quantize_q4_k_q8_0(const void* src, uint64_t superblocks, void* dst,
                            hipStream_t stream);
 /* y [n][m] = x [n][k] w^T for w [m][k], all FP32; each output sums its k
  * products in order, so a token's row does not depend on n. k must be a

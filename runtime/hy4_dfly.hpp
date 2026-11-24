@@ -32,7 +32,8 @@ public:
   Drafter& operator=(const Drafter&) = delete;
 
   /// Loads the `model.dfly_layers.*` tensors of a safetensors file (BF16,
-  /// quantized to Q8_0 here) for `target`.
+  /// quantized on device to Q8_0 for attention and Q4_K for FFN, fusion and
+  /// correction) for `target`.
   [[nodiscard]] static std::unique_ptr<Drafter> Load(const std::string& path, Model& target,
                                                      std::string* error);
 
@@ -68,8 +69,8 @@ private:
   Tensor fuse_enorm_, fuse_hnorm_, fuse_eh_, fuse_gate_;
   Tensor corr_hnorm_, corr_enorm_, corr_gate_, corr_up_, corr_down_;
   Tensor final_norm_, confidence_w_;
-  // The target's LM head for drafts: a Q8_0 copy of a binary16 head (half the
-  // bytes per draft), else the target's own.
+  // The target's LM head for drafts: a Q4_K copy (quarter the bytes of
+  // binary16 per draft), else the target's own.
   Tensor head_;
   // Drafts score the head's first head_rows_ rows (the BPE's earlier, more
   // frequent tokens) and a table of the later rows whose tokens the session
@@ -93,7 +94,7 @@ private:
   [[nodiscard]] Table* TableFor(const Session& session);
   [[nodiscard]] bool AddTable();
   [[nodiscard]] bool SyncTable(Table& table, const Session& session,
-                               std::string* error);
+                               std::uint32_t slot, std::string* error);
   float confidence_b_ = 0.0f;
   std::int32_t mask_token_ = 0;
   std::unique_ptr<Buffers> buf_;

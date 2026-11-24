@@ -15,6 +15,7 @@ adapted here, not shared; changes to them are this repository's own.
 | `FusedAttention` in `kernels/rocm/hy4_vision.hip.cpp` | `gemma4-gufo-extension` `52af868` (`vision/encoder.hip`) | scale folded into Q, FP32 output |
 | `ContentSpan` and the request-text spans in `chat_template.cpp`, the span check in `Tokenizer::EncodeWithSpecials` | Gufo `0a473ebf` (`src/models/deepseek_v4_flash/chat_template.cpp`: `ContentSpan`, `MarkContent`, `SplitControlTokens`) | a control-token spelling that overlaps request text stays text; Hy4 records the spans through a writer and matches every special token, not a fixed list |
 | `stable_prefix_bytes` in `RenderChat` and its use in `PreparePrompt` and `PrepareImagePrompt` | Gufo `0a473ebf` (`src/families/qwen/text/chat_template.cpp`, `src/families/qwen/vision/prompt.cpp`) | the renderer reports what a following user turn keeps and the prompt is tokenized once; Hy4 cuts after a special token and encodes the shorter side |
+| `kernels/rocm/hy4_q4k_quant.hip.cpp` | Gufo `a33323f2` (`src/models/qwen38_flash_next/kernels/rocm/draft_head.hip.cpp`) | load-time GPU ggml-exact `quantize_row_q4_K_ref` quantizer, generalized to binary16, bfloat16 and Q8_0 inputs for the DFly2 drafter |
 
 The model's reference implementations, which nothing here copies:
 
