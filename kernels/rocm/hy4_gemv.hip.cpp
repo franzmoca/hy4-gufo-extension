@@ -478,11 +478,13 @@ __global__ void expert_plan_kernel(const int32_t* __restrict__ ids,
   }
 }
 
-/* Single-slot routed expert GEMV (n = 1): 32 rows per workgroup (4 rows x 8
- * tasks per wave, no LDS), loading U super-blocks ahead to hide DRAM latency.
+/* Single-slot routed expert GEMV (n = 1): 16 rows per workgroup (4 waves x 4
+ * rows x 8 tasks, no LDS), loading U super-blocks ahead to hide DRAM latency.
  */
+constexpr int kSingleWaves = 4;
+
 template<int kType, bool kSwiGLU, int U>
-__global__ void __launch_bounds__(kWave* kWaves)
+__global__ void __launch_bounds__(kWave* kSingleWaves)
     expert_single_kernel(const uint8_t* __restrict__ w,
                          const uint8_t* __restrict__ w_up,
                          uint64_t expert_bytes, float limit,
@@ -491,7 +493,7 @@ __global__ void __launch_bounds__(kWave* kWaves)
                          const float* __restrict__ route_w,
                          float* __restrict__ y, uint32_t m, uint32_t k) {
   using F = Format<kType>;
-  constexpr uint32_t kRows = (kWave / F::kTasks) * kWaves;
+  constexpr uint32_t kRows = (kWave / F::kTasks) * kSingleWaves;
   const uint32_t slot = blockIdx.y;
   const int32_t expert = ids[slot];
   const int lane = threadIdx.x % kWave;
@@ -831,17 +833,20 @@ void dispatch_experts(const void* w, const void* w_up, uint64_t expert_bytes,
   const auto* wg = static_cast<const uint8_t*>(w);
   const auto* wu = static_cast<const uint8_t*>(w_up);
   if (max_cols == 1) {
+    constexpr uint32_t kSingleRows =
+        (kWave / Format<kType>::kTasks) * kSingleWaves;
+    const dim3 single_grid((m + kSingleRows - 1) / kSingleRows, n_slots);
     constexpr int kUnroll = kType == 8 ? 1 : 3;
     if (w_up)
       expert_single_kernel<kType, true, kUnroll>
-          <<<grid, kWave * kWaves, 0, stream>>>(wg, wu, expert_bytes, limit, x,
-                                                slots_per_x, ids, route_w, y, m,
-                                                k);
+          <<<single_grid, kWave * kSingleWaves, 0, stream>>>(
+              wg, wu, expert_bytes, limit, x, slots_per_x, ids, route_w, y, m,
+              k);
     else
       expert_single_kernel<kType, false, kUnroll>
-          <<<grid, kWave * kWaves, 0, stream>>>(wg, nullptr, expert_bytes, 0.0f,
-                                                x, slots_per_x, ids, nullptr, y,
-                                                m, k);
+          <<<single_grid, kWave * kSingleWaves, 0, stream>>>(
+              wg, nullptr, expert_bytes, 0.0f, x, slots_per_x, ids, nullptr, y,
+              m, k);
     return;
   }
   if (max_cols == 2)

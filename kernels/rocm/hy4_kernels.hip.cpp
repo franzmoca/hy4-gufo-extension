@@ -895,7 +895,7 @@ __global__ void __launch_bounds__(kBlock)
 // size depends only on its own key count, so its result does not depend on
 // the other tokens of the pass.
 constexpr uint32_t kAttnDk = 576, kAttnDv = 512;
-constexpr uint32_t kAttnHpw = 4, kAttnWarps = 4, kAttnUnroll = 4,
+constexpr uint32_t kAttnHpw = 1, kAttnWarps = 8, kAttnUnroll = 4,
                    kAttnHeadsPerBlock = kAttnHpw * kAttnWarps;
 constexpr uint32_t kAttnChunk = 32;
 
@@ -1160,8 +1160,10 @@ __global__ void __launch_bounds__(kAttnDv / 4)
 // head groups * 8 splits = 128 workgroups saturate all CUs while partial
 // buffers stay within ~4 MiB.
 constexpr uint32_t kDflyAttnSplits = 8;
+constexpr uint32_t kDflyAttnHpw = 4, kDflyAttnWarps = 4,
+                   kDflyAttnHeadsPerBlock = kDflyAttnHpw * kDflyAttnWarps;
 
-__global__ void __launch_bounds__(kAttnWarps * 32)
+__global__ void __launch_bounds__(kDflyAttnWarps * 32)
     DflyAttnDecode(const float* q, const _Float16* cache, uint32_t ring,
                    const int32_t* sel, uint32_t sel_count, int32_t limit,
                    const float* kva, float scale, float* part_ml,
@@ -1174,21 +1176,21 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
     return;
   const uint32_t end = min(count, begin + keys);
   const uint32_t lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
-  const uint32_t h0 = blockIdx.y * kAttnHeadsPerBlock + warp * kAttnHpw;
+  const uint32_t h0 = blockIdx.y * kDflyAttnHeadsPerBlock + warp * kDflyAttnHpw;
   if (h0 >= heads)
     return;
 
-  float4 qv[kAttnHpw][4];
-  float2 qt[kAttnHpw];
-  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+  float4 qv[kDflyAttnHpw][4];
+  float2 qt[kDflyAttnHpw];
+  for (uint32_t h = 0; h < kDflyAttnHpw; ++h) {
     const float* qh = q + ((uint64_t)t * heads + h0 + h) * kAttnDk;
     for (uint32_t i = 0; i < 4; ++i)
       qv[h][i] = *(const float4*)(qh + 128 * i + 4 * lane);
     qt[h] = *(const float2*)(qh + kAttnDv + 2 * lane);
   }
-  float m[kAttnHpw], l[kAttnHpw];
-  float4 acc[kAttnHpw][4];
-  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+  float m[kDflyAttnHpw], l[kDflyAttnHpw];
+  float4 acc[kDflyAttnHpw][4];
+  for (uint32_t h = 0; h < kDflyAttnHpw; ++h) {
     m[h] = -INFINITY;
     l[h] = 0.0f;
     for (uint32_t i = 0; i < 4; ++i)
@@ -1243,8 +1245,8 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
 
   for (uint32_t c0 = begin; c0 < end; c0 += kAttnChunk) {
     const uint32_t nk = min(kAttnChunk, end - c0);
-    float sc[kAttnHpw];
-    for (uint32_t h = 0; h < kAttnHpw; ++h)
+    float sc[kDflyAttnHpw];
+    for (uint32_t h = 0; h < kDflyAttnHpw; ++h)
       sc[h] = -INFINITY;
     for (uint32_t j = 0; j < nk; j += kAttnUnroll) {
       float4 kv[kAttnUnroll][4];
@@ -1253,10 +1255,10 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
 #pragma unroll
       for (uint32_t u = 0; u < kAttnUnroll; ++u)
         load_key(c0 + min(j + u, nk - 1), kv[u], kt[u], ok[u]);
-      float d[kAttnUnroll][kAttnHpw];
+      float d[kAttnUnroll][kDflyAttnHpw];
 #pragma unroll
       for (uint32_t u = 0; u < kAttnUnroll; ++u)
-        for (uint32_t h = 0; h < kAttnHpw; ++h) {
+        for (uint32_t h = 0; h < kDflyAttnHpw; ++h) {
           float x = qt[h].x * kt[u].x;
           x = fmaf(qt[h].y, kt[u].y, x);
           for (uint32_t i = 0; i < 4; ++i) {
@@ -1270,16 +1272,16 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
       for (int o = warpSize / 2; o > 0; o >>= 1)
 #pragma unroll
         for (uint32_t u = 0; u < kAttnUnroll; ++u)
-          for (uint32_t h = 0; h < kAttnHpw; ++h)
+          for (uint32_t h = 0; h < kDflyAttnHpw; ++h)
             d[u][h] += __shfl_xor(d[u][h], o);
 #pragma unroll
       for (uint32_t u = 0; u < kAttnUnroll; ++u)
-        for (uint32_t h = 0; h < kAttnHpw; ++h)
+        for (uint32_t h = 0; h < kDflyAttnHpw; ++h)
           if (lane == j + u && j + u < nk && ok[u])
             sc[h] = d[u][h] * scale;
     }
-    float e[kAttnHpw];
-    for (uint32_t h = 0; h < kAttnHpw; ++h) {
+    float e[kDflyAttnHpw];
+    for (uint32_t h = 0; h < kDflyAttnHpw; ++h) {
       const float mx = fmaxf(m[h], WarpMax(sc[h]));
       const float alpha = m[h] == -INFINITY ? 0.0f : expf(m[h] - mx);
       e[h] = (lane < nk && sc[h] > -INFINITY) ? expf(sc[h] - mx) : 0.0f;
@@ -1299,7 +1301,7 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
         load_val(c0 + min(j + u, nk - 1), kv[u]);
 #pragma unroll
       for (uint32_t u = 0; u < kAttnUnroll; ++u)
-        for (uint32_t h = 0; h < kAttnHpw; ++h) {
+        for (uint32_t h = 0; h < kDflyAttnHpw; ++h) {
           const float pj = __shfl(e[h], min(j + u, kAttnChunk - 1));
           if (j + u >= nk)
             continue;
@@ -1312,7 +1314,7 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
         }
     }
   }
-  for (uint32_t h = 0; h < kAttnHpw; ++h) {
+  for (uint32_t h = 0; h < kDflyAttnHpw; ++h) {
     const uint64_t r = ((uint64_t)t * kDflyAttnSplits + split) * heads + h0 + h;
     if (lane == 0) {
       part_ml[2 * r] = m[h];
@@ -2732,7 +2734,7 @@ int hy4_mla_attention(const float* q, const uint16_t* cache, uint32_t ring,
                       uint32_t dv, float* work, uint64_t work_floats,
                       hipStream_t stream) {
   if (n == 0) return 0;
-  if (dk != kAttnDk || dv != kAttnDv || heads % kAttnHpw != 0 ||
+  if (dk != kAttnDk || dv != kAttnDv || heads % 4 != 0 ||
       work_floats < hy4_mla_attention_work(n, heads, sel ? n_sel : 0))
     return 1;
   int32_t* list = nullptr;
@@ -2769,13 +2771,14 @@ int hy4_dfly_attention(const float* q, const uint16_t* cache, uint32_t ring,
                        hipStream_t stream) {
   if (n == 0)
     return 0;
-  if (dk != kAttnDk || dv != kAttnDv || heads % kAttnHpw != 0 ||
+  if (dk != kAttnDk || dv != kAttnDv || heads % 4 != 0 ||
       work_floats < hy4_dfly_attention_work(n, heads))
     return 1;
   float* part_ml = work;
   float* part_acc = work + (uint64_t)n * kDflyAttnSplits * heads * 2;
-  const uint32_t groups = (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock;
-  DflyAttnDecode<<<dim3(kDflyAttnSplits, groups, n), kAttnWarps * 32, 0,
+  const uint32_t groups =
+      (heads + kDflyAttnHeadsPerBlock - 1) / kDflyAttnHeadsPerBlock;
+  DflyAttnDecode<<<dim3(kDflyAttnSplits, groups, n), kDflyAttnWarps * 32, 0,
                    stream>>>(q, reinterpret_cast<const _Float16*>(cache), ring,
                              sel, sel_count, limit, kva, scale, part_ml,
                              part_acc, n, heads);
