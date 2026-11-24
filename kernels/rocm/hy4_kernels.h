@@ -111,19 +111,27 @@ int hy4_gemv_add(int type, const void* w, const float* x, const float* add,
  * sigmoid(W[r] . x[t]), as hy4_sigmoid_mul(y, hy4_gemv's output) would. */
 int hy4_gemv_gate(int type, const void* w, const float* x, float* y, uint32_t m,
                   uint32_t k, uint32_t n, void* scratch, hipStream_t stream);
+/* On-device grouping of routed expert slots for hy4_gemv_experts (max_cols >
+ * 1): one launch per layer, reused by gate/up and down. */
+#define HY4_EXPERT_PLAN_SLOTS 256
+uint64_t hy4_expert_plan_ints(void);
+int hy4_expert_plan(const int32_t* ids, uint32_t n_slots, int32_t* plan,
+                    hipStream_t stream);
+
 /* Routed experts with FP32 activations: for slot j < n_slots, expert
  * ids[j] (matrices expert_bytes apart in w), input row x + (j / slots_per_x)
  * * k, output row y + j * m. With w_up the output is the SwiGLU of the two
  * (clamped by limit > 0) times route_w[j] when route_w is not NULL. max_cols
  * bounds the slots that share an expert (1 when none do, at most
- * HY4_GEMV_MAX_TOKENS; above 1, n_slots <= 256): such slots read the
- * expert's rows once, and every slot gets the bits of a one-slot launch. */
+ * HY4_GEMV_MAX_TOKENS; above 1, n_slots <= HY4_EXPERT_PLAN_SLOTS and `plan`
+ * must come from hy4_expert_plan): such slots read the expert's rows once,
+ * and every slot gets the bits of a one-slot launch. */
 int hy4_gemv_experts(int type, const void* w, const void* w_up,
                      uint64_t expert_bytes, const float* x,
                      uint32_t slots_per_x, const int32_t* ids,
-                     const float* route_w, float limit, float* y, uint32_t m,
-                     uint32_t k, uint32_t n_slots, uint32_t max_cols,
-                     hipStream_t stream);
+                     const int32_t* plan, const float* route_w, float limit,
+                     float* y, uint32_t m, uint32_t k, uint32_t n_slots,
+                     uint32_t max_cols, hipStream_t stream);
 
 /* Two matrices of one type and width k over the same x in one launch:
  * y1 = W1 x (m1 rows), y2 = W2 x (m2 rows), each as hy4_gemv computes it. */

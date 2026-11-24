@@ -253,7 +253,9 @@ bool Model::AllocScratchRows(Scratch& s, std::uint32_t n,
   };
   auto plan = [&](std::size_t rows) {
     const std::size_t slots = std::size_t{c.n_expert_used} * rows;
-    return slots + c.n_expert + 1 + slots / 128 + c.n_expert;
+    return std::max<std::size_t>(
+        slots + c.n_expert + 1 + slots / 128 + c.n_expert,
+        hy4_expert_plan_ints());
   };
   auto* owned = &allocations_;
   // A device buffer of count(n) elements. With an arena, its first
@@ -1503,14 +1505,17 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (l.gate_exps.type == l.up_exps.type && fp32_type(l.gate_exps.type) &&
       fp32_type(l.down_exps.type) && c.n_latent % 256 == 0 && f % 256 == 0) {
     const std::uint32_t slots = n * used;
+    if (n > 1)
+      HY4_CHECK(hy4_expert_plan(s.ids, slots, s.route_plan, st));
+    const std::int32_t* plan = n > 1 ? s.route_plan : nullptr;
     HY4_CHECK(hy4_gemv_experts(
         l.gate_exps.type, l.gate_exps.data, l.up_exps.data,
-        ExpertBytes(l.gate_exps), s.latent, used, s.ids, s.route_w,
+        ExpertBytes(l.gate_exps), s.latent, used, s.ids, plan, s.route_w,
         c.swiglu_clamp[il], s.ffn_c, f, c.n_latent, slots, n, st));
     HY4_CHECK(hy4_gemv_experts(l.down_exps.type, l.down_exps.data, nullptr,
                                ExpertBytes(l.down_exps), s.ffn_c, 1, s.ids,
-                               nullptr, 0.0f, s.ffn_a, c.n_latent, f, slots, n,
-                               st));
+                               plan, nullptr, 0.0f, s.ffn_a, c.n_latent, f,
+                               slots, n, st));
     HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
     return MatVecAdd(l.routed_up, s.moe, s.shared, s.y, c.n_embd, c.n_latent, n,
                      ex, error);

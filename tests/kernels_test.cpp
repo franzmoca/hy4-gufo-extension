@@ -1724,6 +1724,9 @@ void TestExpertGemv() {
         const auto x = Random(n * k), rw = Random(slots, 0.1f, 1.0f);
         const auto mid = Random(slots * k);
         int32_t* did = Device(ids);
+        int32_t* dplan = Device(std::vector<int32_t>(hy4_expert_plan_ints()));
+        Expect(hy4_expert_plan(did, slots, dplan, nullptr) == 0,
+               name + " plan status");
         float *dx = Device(x), *drw = Device(rw), *dmid = Device(mid);
         for (float limit : {0.0f, 0.05f}) {
           std::vector<double> want(slots * m), want_d(slots * m);
@@ -1747,13 +1750,14 @@ void TestExpertGemv() {
           }
           std::vector<float> one, one_d;
           for (uint32_t cols : {1u, n}) {
+            const int32_t* plan = cols > 1 ? dplan : nullptr;
             float *y = Device(std::vector<float>(slots * m)),
                   *yd = Device(std::vector<float>(slots * m));
             Expect(
-                hy4_gemv_experts(type, dg, du, bytes, dx, used, did, drw, limit,
-                                 y, m, k, slots, cols, nullptr) == 0 &&
+                hy4_gemv_experts(type, dg, du, bytes, dx, used, did, plan, drw,
+                                 limit, y, m, k, slots, cols, nullptr) == 0 &&
                     hy4_gemv_experts(type, ddn, nullptr, bytes, dmid, 1, did,
-                                     nullptr, 0.0f, yd, m, k, slots, cols,
+                                     plan, nullptr, 0.0f, yd, m, k, slots, cols,
                                      nullptr) == 0,
                 name + " status");
             const auto got = Host(y, slots * m), got_d = Host(yd, slots * m);
