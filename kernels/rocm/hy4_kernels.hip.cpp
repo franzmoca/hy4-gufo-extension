@@ -897,10 +897,18 @@ __global__ void __launch_bounds__(kBlock)
 constexpr uint32_t kAttnDk = 576, kAttnDv = 512;
 constexpr uint32_t kAttnHpw = 4, kAttnWarps = 4, kAttnUnroll = 4,
                    kAttnHeadsPerBlock = kAttnHpw * kAttnWarps;
-constexpr uint32_t kAttnChunk = 32, kAttnSplits = 32;
+constexpr uint32_t kAttnChunk = 32;
 
-__device__ __forceinline__ uint32_t AttnSplitKeys(uint32_t count) {
-  constexpr uint32_t per = kAttnChunk * kAttnSplits;
+// Cap partial buffers to 512 head-splits per token (1 MiB/token): 8 splits at
+// 64 heads (SWA, 32 blocks/token) and 16 at 32 heads (sparse, 32 blocks/token).
+// Depends only on `heads` so each token sums identically for any batch size.
+__host__ __device__ __forceinline__ uint32_t AttnSplits(uint32_t heads) {
+  return heads > 32 ? 8u : 16u;
+}
+
+__device__ __forceinline__ uint32_t AttnSplitKeys(uint32_t count,
+                                                  uint32_t max_splits) {
+  const uint32_t per = kAttnChunk * max_splits;
   return kAttnChunk * ((count + per - 1) / per);
 }
 
@@ -980,9 +988,10 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
               const uint32_t* list_count, uint32_t list_stride, float scale,
               float* part_ml, float* part_acc, uint32_t heads) {
   const uint32_t split = blockIdx.x, t = blockIdx.z;
+  const uint32_t max_splits = AttnSplits(heads);
   int32_t first;
   const uint32_t count = AttnKeys(pos, window, list_count, t, &first);
-  const uint32_t keys = AttnSplitKeys(count);
+  const uint32_t keys = AttnSplitKeys(count, max_splits);
   const uint32_t begin = split * keys;
   if (begin >= count)
     return;
@@ -1103,7 +1112,7 @@ __global__ void __launch_bounds__(kAttnWarps * 32)
     }
   }
   for (uint32_t h = 0; h < kAttnHpw; ++h) {
-    const uint64_t r = ((uint64_t)t * kAttnSplits + split) * heads + h0 + h;
+    const uint64_t r = ((uint64_t)t * max_splits + split) * heads + h0 + h;
     if (lane == 0) {
       part_ml[2 * r] = m[h];
       part_ml[2 * r + 1] = l[h];
@@ -1119,11 +1128,12 @@ __global__ void __launch_bounds__(kAttnDv / 4)
                uint32_t window, const uint32_t* list_count, const float* sinks,
                float* out, uint32_t heads) {
   const uint32_t h = blockIdx.x, t = blockIdx.y;
+  const uint32_t max_splits = AttnSplits(heads);
   int32_t first;
   const uint32_t count = AttnKeys(pos, window, list_count, t, &first);
-  const uint32_t keys = AttnSplitKeys(count);
+  const uint32_t keys = AttnSplitKeys(count, max_splits);
   const uint32_t splits = keys ? (count + keys - 1) / keys : 0;
-  const uint64_t r0 = (uint64_t)t * kAttnSplits * heads + h;
+  const uint64_t r0 = (uint64_t)t * max_splits * heads + h;
   float mx = sinks ? sinks[h] : -INFINITY;
   for (uint32_t s = 0; s < splits; ++s)
     mx = fmaxf(mx, part_ml[2 * (r0 + (uint64_t)s * heads)]);
@@ -2515,7 +2525,7 @@ int hy4_rope_3d(float* x, const int32_t* pos, const int32_t* pos_hw, uint32_t n,
 
 uint64_t hy4_mla_attention_work(uint32_t n, uint32_t heads, uint32_t n_sel) {
   const uint64_t lists = ((uint64_t)n * n_sel + n + 63) / 64 * 64;
-  return lists + (uint64_t)n * kAttnSplits * heads * (2 + kAttnDv);
+  return lists + (uint64_t)n * AttnSplits(heads) * heads * (2 + kAttnDv);
 }
 
 int hy4_mla_attention(const float* q, const uint16_t* cache, uint32_t ring,
@@ -2538,10 +2548,11 @@ int hy4_mla_attention(const float* q, const uint16_t* cache, uint32_t ring,
     AttnKeyList<<<n, kKeyListThreads, 0, stream>>>(sel, n_sel, pos, list,
                                                    count);
   }
+  const uint32_t max_splits = AttnSplits(heads);
   float* part_ml = part;
-  float* part_acc = part + (uint64_t)n * kAttnSplits * heads * 2;
+  float* part_acc = part + (uint64_t)n * max_splits * heads * 2;
   const uint32_t groups = (heads + kAttnHeadsPerBlock - 1) / kAttnHeadsPerBlock;
-  MlaDecode<<<dim3(kAttnSplits, groups, n), kAttnWarps * 32, 0, stream>>>(
+  MlaDecode<<<dim3(max_splits, groups, n), kAttnWarps * 32, 0, stream>>>(
       q, reinterpret_cast<const _Float16*>(cache), ring, pos, window, list,
       count, n_sel, scale, part_ml, part_acc, heads);
   MlaCombine<<<dim3(heads, n), kAttnDv / 4, 0, stream>>>(
