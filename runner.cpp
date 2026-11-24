@@ -186,6 +186,10 @@ public:
     lookup_.Clear();
   }
 
+  [[nodiscard]] std::shared_ptr<mem::StateAccount> state_account()
+      const override {
+    return session_->StateAccount();
+  }
   [[nodiscard]] Session& session() const { return *session_; }
   [[nodiscard]] cache::Adapter& adapter() const { return *adapter_; }
   [[nodiscard]] cache::Slot& slot() const { return *slot_; }
@@ -321,22 +325,31 @@ public:
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) capacity = free_bytes;
+    if (mem::MemGetInfo(&free_bytes, &total_bytes) == hipSuccess)
+      capacity = free_bytes;
+    const std::size_t demand = model_->DemandMappedBytes(max_context_);
+    const std::size_t tap_layers =
+        drafter_ ? drafter_->TargetLayers().size() : 0;
+    std::optional<std::size_t> session_bytes;
+    if (demand != 0)
+      session_bytes = model_->SessionStateBytes(max_context_, tap_layers);
     return {
         .resident_weights_bytes = static_cast<std::size_t>(
             model_->ResidentBytes() +
             (drafter_ ? drafter_->ResidentBytes() : 0) +
             (vision_ ? vision_->ResidentBytes() : 0)),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = std::nullopt,
-        .temporary_scratch_bytes = std::nullopt,
+        .per_request_state_bytes = session_bytes,
+        .temporary_scratch_bytes =
+            session_bytes ? std::optional<std::size_t>(0) : std::nullopt,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .retained_snapshot_ceiling_bytes = CacheCeilingBytes(),
         .requires_device_runtime_lock = true,
         .prompt_state_bytes_per_token = std::nullopt,
         .prompt_admission_budget_bytes = std::nullopt,
         .prompt_admission_available_bytes = {},
-        .demand_mapped_state_bytes = std::nullopt,
+        .demand_mapped_state_bytes =
+            demand != 0 ? std::optional<std::size_t>(demand) : std::nullopt,
     };
   }
 

@@ -500,40 +500,145 @@ std::uint32_t Model::KvRing(std::uint32_t layer, std::uint32_t max_context) cons
              : max_context;
 }
 
-std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context, std::string* error) {
+mem::StateDeclaration Model::DeclareSessionState(
+    std::uint32_t max_context) const {
+  const Config& c = config_;
+  max_context = SessionContext(max_context);
+  const std::uint32_t dk = c.kv_lora + c.n_rot;
+  const std::uint32_t pools = max_context / c.kpool + 1;
+  mem::StateDeclaration decl;
+  for (std::uint32_t i = 0; i < c.n_layer; ++i) {
+    const std::uint32_t ring = KvRing(i, max_context);
+    const std::size_t row_bytes = std::size_t{dk} * sizeof(std::uint16_t);
+    if (c.is_swa[i]) {
+      (void)decl.Fixed(std::size_t{ring} * row_bytes);
+    } else {
+      (void)decl.Context({.row_bytes = row_bytes, .rows = ring, .segments = 1},
+                         1);
+    }
+    if (c.has_indexer[i]) {
+      (void)decl.Fixed(std::size_t{Model::kIndexerRing} * 2 * c.idx_dim *
+                       sizeof(float));
+      (void)decl.Context({.row_bytes = std::size_t{c.idx_dim} * sizeof(float),
+                          .rows = pools,
+                          .segments = 1},
+                         c.kpool);
+    }
+  }
+  const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
+  (void)decl.Fixed(std::size_t{kScoreRows} * pools * sizeof(float));
+  (void)decl.Fixed(std::size_t{max_chunk_} * (top_pools + 1) * c.kpool *
+                   sizeof(std::int32_t));
+  return decl;
+}
+
+std::size_t Model::SessionStateBytes(std::uint32_t max_context,
+                                     std::size_t tap_layers) const {
+  const Config& c = config_;
+  const auto count =
+      mem::DemandMapped() ? mem::StateBytes::kPages : mem::StateBytes::kSize;
+  std::size_t bytes = DeclareSessionState(max_context).Bytes(count);
+  if (tap_layers != 0) {
+    const std::size_t sel_count = c.idx_top_k / c.kpool * c.kpool;
+    bytes += tap_layers * Session::kTapRows * sel_count * sizeof(std::int32_t);
+    bytes += std::size_t{Session::kTapRows} * c.n_embd * sizeof(float);
+  }
+  return bytes;
+}
+
+std::size_t Model::DemandMappedBytes(std::uint32_t max_context) const {
+  if (!mem::DemandMapped())
+    return 0;
+  return DeclareSessionState(max_context).ContextBytes(mem::StateBytes::kPages);
+}
+
+std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
+                                              std::string* error) {
   const Config& c = config_;
   max_context = SessionContext(max_context);
   std::unique_ptr<Session> s(new Session(this, max_context));
-  const std::uint32_t dk = c.kv_lora + c.n_rot;
-  const std::uint32_t pools = max_context / c.kpool + 1;
+  const mem::StateDeclaration decl = DeclareSessionState(max_context);
+  s->state_ = mem::SessionState::Create(decl, error);
+  if (!s->state_)
+    return nullptr;
+  const mem::SessionState& st = *s->state_;
   s->cache_.assign(c.n_layer, nullptr);
   s->ring_.assign(c.n_layer, 0);
   s->idx_rows_.assign(c.n_layer, nullptr);
   s->idx_pooled_.assign(c.n_layer, nullptr);
-  bool ok = true;
-  for (std::uint32_t i = 0; ok && i < c.n_layer; ++i) {
+  mem::StateBufferId id = 0;
+  for (std::uint32_t i = 0; i < c.n_layer; ++i) {
     s->ring_[i] = KvRing(i, max_context);
-    ok = DeviceAlloc(&s->cache_[i], std::size_t{s->ring_[i]} * dk, &s->allocations_);
-    if (ok && c.has_indexer[i]) {
-      ok = DeviceAlloc(&s->idx_rows_[i], std::size_t{Model::kIndexerRing} * 2 * c.idx_dim, &s->allocations_) &&
-           DeviceAlloc(&s->idx_pooled_[i], std::size_t{pools} * c.idx_dim, &s->allocations_);
+    s->cache_[i] = st.data<std::uint16_t>(id);
+    if (!c.is_swa[i])
+      s->kv_regions_.push_back(st.region(id));
+    ++id;
+    if (c.has_indexer[i]) {
+      s->idx_rows_[i] = st.data<float>(id++);
+      s->idx_pooled_[i] = st.data<float>(id);
+      s->pool_regions_.push_back(st.region(id));
+      ++id;
     }
   }
-  const std::uint32_t top_pools = c.idx_top_k / c.kpool - 1;
-  ok =
-      ok &&
-      DeviceAlloc(&s->score_, std::size_t{kScoreRows} * pools,
-                  &s->allocations_) &&
-      DeviceAlloc(&s->sel_, std::size_t{max_chunk_} * (top_pools + 1) * c.kpool,
-                  &s->allocations_);
-  if (!ok) {
-    Fail(error, "hy4: session allocation failed");
-    return nullptr;
-  }
+  s->score_ = st.data<float>(id++);
+  s->sel_ = st.data<std::int32_t>(id++);
   return s;
 }
 
+bool Session::EnsureRows(std::uint32_t rows, std::string* error) {
+  if (rows == 0)
+    return true;
+  const std::uint32_t pools = rows / model_->config_.kpool + 1;
+  for (const auto& r : kv_regions_) {
+    if (!r)
+      continue;
+    if (!r->Ensure(rows, error))
+      return false;
+    if (rows * 2 > r->backed_rows())
+      r->MapAhead(rows * 2);
+  }
+  for (const auto& r : pool_regions_) {
+    if (!r)
+      continue;
+    if (!r->Ensure(pools, error))
+      return false;
+    if (pools * 2 > r->backed_rows())
+      r->MapAhead(pools * 2);
+  }
+  return true;
+}
+
+void Session::Reset() {
+  history_.clear();
+  rope_.clear();
+  rope_delta_ = 0;
+  last_logits_.clear();
+  tap_ready_ = false;
+  for (const auto& r : kv_regions_) {
+    if (r && r->demand_mapped() && r->backed_rows() != 0)
+      r->TrimTo(0);
+  }
+  for (const auto& r : pool_regions_) {
+    if (r && r->demand_mapped() && r->backed_rows() != 0)
+      r->TrimTo(0);
+  }
+}
+
+std::int32_t* Session::BeginRestore(std::uint32_t tokens) {
+  std::string ensure_error;
+  if (!EnsureRows(tokens, &ensure_error))
+    return nullptr;
+  history_.assign(tokens, 0);
+  RestoreRope(0, 0, {0, 0, 0});
+  last_logits_.assign(model_->config().n_vocab, 0.0f);
+  tap_ready_ = false;
+  return history_.data();
+}
+
 Session::~Session() {
+  kv_regions_.clear();
+  pool_regions_.clear();
+  state_.reset();
   for (void* p : allocations_) (void)hipFree(p);
 }
 
@@ -752,6 +857,8 @@ bool Session::PrepareRows(std::span<const std::int32_t> tokens,
       return false;
   }
 
+  if (!EnsureRows(pos0 + n, error))
+    return false;
   if (write_hook_) write_hook_(write_user_, pos0, pos0 + n);
   std::vector<std::int32_t> pos(n), rope_t(n), rope_hw(2 * n);
   for (std::uint32_t i = 0; i < n; ++i) {
