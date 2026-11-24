@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <climits>
 #include <cstring>
+#include <optional>
+#include <unordered_set>
+#include <utility>
 #include <variant>
 
 namespace gufo::models::hy4_flash {
@@ -17,6 +20,53 @@ namespace {
 // GGUF token types.
 constexpr std::int64_t kTypeControl = 3;
 constexpr std::int64_t kTypeUserDefined = 4;
+
+constexpr std::string_view kCanonicalSuffix = ":opensource";
+
+struct SuffixedToken {
+  std::string_view prefix;
+  std::string_view tail;
+};
+
+// All 24 Hy4 special tokens that carry the checkpoint's HYTK suffix. Their
+// token IDs are shared across checkpoints; only the suffix varies.
+constexpr SuffixedToken kSuffixedTokens[] = {
+    {"<｜hy_start", "｜>"},
+    {"<｜hy_middle", "｜>"},
+    {"<｜hy_pad", "｜>"},
+    {"<｜hy_end", "｜>"},
+    {"<think", ">"},
+    {"</think", ">"},
+    {"<tool_call", ">"},
+    {"</tool_call", ">"},
+    {"<tool_calls", ">"},
+    {"</tool_calls", ">"},
+    {"<tool_response", ">"},
+    {"</tool_response", ">"},
+    {"<｜reasoning_mode", "｜>"},
+    {"<arg_key", ">"},
+    {"</arg_key", ">"},
+    {"<arg_value", ">"},
+    {"</arg_value", ">"},
+    {"<｜hy_image▁start", "｜>"},
+    {"<｜hy_image▁end", "｜>"},
+    {"<｜hy_image▁pad", "｜>"},
+    {"<｜hy_image▁newline", "｜>"},
+    {"<｜hy_video▁start", "｜>"},
+    {"<｜hy_video▁end", "｜>"},
+    {"<｜hy_video▁pad", "｜>"},
+};
+
+std::optional<std::string> StartSuffix(std::string_view token) {
+  constexpr std::string_view kPrefix = "<｜hy_start";
+  constexpr std::string_view kTail = "｜>";
+  if (!token.starts_with(kPrefix) || !token.ends_with(kTail) ||
+      token.size() < kPrefix.size() + kTail.size()) {
+    return std::nullopt;
+  }
+  return std::string(token.substr(
+      kPrefix.size(), token.size() - kPrefix.size() - kTail.size()));
+}
 
 bool GptPrintable(std::uint32_t b) { return (b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255); }
 
@@ -115,48 +165,145 @@ bool CjkAt(std::string_view s, std::size_t pos) {
 
 }  // namespace
 
-std::unique_ptr<Tokenizer> Tokenizer::Load(const core::GgufReader& reader, std::string* error) {
+std::unique_ptr<Tokenizer> Tokenizer::Load(const core::GgufReader& reader,
+                                           std::string* error,
+                                           bool canonicalize_specials) {
+  const auto fail = [&](std::string message) -> std::unique_ptr<Tokenizer> {
+    if (error != nullptr) {
+      *error = std::move(message);
+    }
+    return nullptr;
+  };
   std::unique_ptr<Tokenizer> t(new Tokenizer());
   const auto model = reader.GetMetadataString("tokenizer.ggml.model");
   if (model.value_or("") != "gpt2") {
-    *error = "hy4: expected a gpt2 (byte-level BPE) tokenizer";
-    return nullptr;
+    return fail("hy4: expected a gpt2 (byte-level BPE) tokenizer");
   }
   const auto tokens = reader.GetMetadataStringArray("tokenizer.ggml.tokens");
   const auto merges = reader.GetMetadataStringArray("tokenizer.ggml.merges");
   if (tokens.empty() || merges.empty() || tokens.size() > INT32_MAX) {
-    *error = "hy4: GGUF tokenizer tables are missing";
-    return nullptr;
+    return fail("hy4: GGUF tokenizer tables are missing");
   }
   std::vector<std::int64_t> types;
   if (const auto* v = reader.FindMetadata("tokenizer.ggml.token_type")) {
-    if (const auto* s = std::get_if<std::vector<std::int64_t>>(&v->value)) types = *s;
+    if (const auto* s = std::get_if<std::vector<std::int64_t>>(&v->value)) {
+      types = *s;
+    }
     if (const auto* u = std::get_if<std::vector<std::uint64_t>>(&v->value)) {
-      for (const auto x : *u) types.push_back(static_cast<std::int64_t>(x));
+      for (const auto x : *u) {
+        types.push_back(static_cast<std::int64_t>(x));
+      }
     }
   }
   t->tokens_.assign(tokens.begin(), tokens.end());
+  t->bos_ = static_cast<std::int32_t>(
+      reader.GetMetadataUint32("tokenizer.ggml.bos_token_id").value_or(0));
+  t->eos_ = static_cast<std::int32_t>(
+      reader.GetMetadataUint32("tokenizer.ggml.eos_token_id").value_or(0));
+  const auto is_special_id = [&](std::size_t i) {
+    return i < types.size() &&
+           (types[i] == kTypeControl || types[i] == kTypeUserDefined) &&
+           !t->tokens_[i].empty();
+  };
+  if (canonicalize_specials) {
+    std::optional<std::string> suffix;
+    if (t->bos_ >= 0 && static_cast<std::size_t>(t->bos_) < t->tokens_.size() &&
+        is_special_id(static_cast<std::size_t>(t->bos_))) {
+      suffix = StartSuffix(t->tokens_[static_cast<std::size_t>(t->bos_)]);
+    }
+    for (std::size_t i = 0; !suffix && i < t->tokens_.size(); ++i) {
+      if (is_special_id(i)) {
+        suffix = StartSuffix(t->tokens_[i]);
+      }
+    }
+    if (!suffix) {
+      return fail("hy4: GGUF vocabulary has no <｜hy_start…｜> special token");
+    }
+    if (*suffix != kCanonicalSuffix) {
+      std::unordered_map<std::string, std::string> rewrites;
+      rewrites.reserve(std::size(kSuffixedTokens));
+      for (const auto& entry : kSuffixedTokens) {
+        std::string from;
+        from.reserve(entry.prefix.size() + suffix->size() + entry.tail.size());
+        from.append(entry.prefix).append(*suffix).append(entry.tail);
+        std::string to;
+        to.reserve(entry.prefix.size() + kCanonicalSuffix.size() +
+                   entry.tail.size());
+        to.append(entry.prefix).append(kCanonicalSuffix).append(entry.tail);
+        rewrites.emplace(std::move(from), std::move(to));
+      }
+      std::vector<std::pair<std::size_t, std::string>> updates;
+      std::unordered_set<std::string_view> targets;
+      updates.reserve(rewrites.size());
+      targets.reserve(rewrites.size());
+      for (std::size_t i = 0; i < t->tokens_.size(); ++i) {
+        if (!is_special_id(i)) {
+          continue;
+        }
+        if (const auto it = rewrites.find(t->tokens_[i]);
+            it != rewrites.end()) {
+          updates.emplace_back(i, it->second);
+          targets.insert(it->second);
+        }
+      }
+      for (const std::string& token : t->tokens_) {
+        if (targets.contains(token)) {
+          return fail("hy4: GGUF already contains canonical token " + token);
+        }
+      }
+      for (auto& [index, canonical] : updates) {
+        t->tokens_[index] = std::move(canonical);
+      }
+    }
+  }
   t->special_.assign(t->tokens_.size(), false);
   t->token_to_id_.reserve(t->tokens_.size());
   t->specials_by_byte_.resize(256);
   for (std::size_t i = 0; i < t->tokens_.size(); ++i) {
     const auto id = static_cast<std::int32_t>(i);
     t->token_to_id_.emplace(t->tokens_[i], id);
-    const bool special = i < types.size() && (types[i] == kTypeControl || types[i] == kTypeUserDefined);
-    if (special && !t->tokens_[i].empty()) {
+    if (is_special_id(i)) {
       t->special_[i] = true;
-      t->specials_by_byte_[static_cast<std::uint8_t>(t->tokens_[i][0])].push_back(id);
+      t->specials_by_byte_[static_cast<std::uint8_t>(t->tokens_[i][0])]
+          .push_back(id);
     }
   }
   for (auto& list : t->specials_by_byte_) {
     std::stable_sort(list.begin(), list.end(),
-                     [&](std::int32_t a, std::int32_t b) { return t->tokens_[a].size() > t->tokens_[b].size(); });
+                     [&](std::int32_t a, std::int32_t b) {
+                       return t->tokens_[a].size() > t->tokens_[b].size();
+                     });
   }
   t->merge_rank_.reserve(merges.size());
   std::int32_t rank = 0;
-  for (const auto m : merges) t->merge_rank_.emplace(std::string(m), rank++);
-  t->bos_ = static_cast<std::int32_t>(reader.GetMetadataUint32("tokenizer.ggml.bos_token_id").value_or(0));
-  t->eos_ = static_cast<std::int32_t>(reader.GetMetadataUint32("tokenizer.ggml.eos_token_id").value_or(0));
+  for (const auto m : merges) {
+    t->merge_rank_.emplace(std::string(m), rank++);
+  }
+  if (canonicalize_specials) {
+    for (const std::string_view required : {
+             Hy4Tokens::kStart,
+             Hy4Tokens::kMiddle,
+             Hy4Tokens::kEnd,
+             Hy4Tokens::kReasoningMode,
+             Hy4Tokens::kThinkOpen,
+             Hy4Tokens::kThinkClose,
+             Hy4Tokens::kCallsOpen,
+             Hy4Tokens::kCallsClose,
+             Hy4Tokens::kCallOpen,
+             Hy4Tokens::kCallClose,
+             Hy4Tokens::kKeyOpen,
+             Hy4Tokens::kKeyClose,
+             Hy4Tokens::kValueOpen,
+             Hy4Tokens::kValueClose,
+             Hy4Tokens::kResponseOpen,
+             Hy4Tokens::kResponseClose,
+         }) {
+      if (!t->IsSpecial(t->Find(required))) {
+        return fail("hy4: GGUF is missing required special token " +
+                    std::string(required));
+      }
+    }
+  }
   return t;
 }
 

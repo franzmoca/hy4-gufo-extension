@@ -1100,7 +1100,13 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
       return nullptr;
     }
     vision = std::move(loaded_vision);
-    model->SetImageToken(tokenizer->Find(Hy4Tokens::kImagePad));
+    const std::int32_t image_pad = tokenizer->Find(Hy4Tokens::kImagePad);
+    if (!tokenizer->IsSpecial(image_pad)) {
+      set_error("Hy4 vision: GGUF vocabulary lacks " +
+                std::string(Hy4Tokens::kImagePad));
+      return nullptr;
+    }
+    model->SetImageToken(image_pad);
     server::Logger::Info(
         "loader",
         "event=hy4_vision_loaded resident_bytes=" +
