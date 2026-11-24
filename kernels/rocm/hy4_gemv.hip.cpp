@@ -15,10 +15,6 @@
 #include "hy4_gemv_tasks.hpp"
 #include "hy4_kernels.h"
 
-#ifndef HY4_EXPERT_SLICES
-#define HY4_EXPERT_SLICES 2
-#endif
-
 namespace {
 
 using namespace hy4_gemv_tasks;
@@ -32,10 +28,15 @@ template<>
 struct Format<12> {  // Q4_K
   static constexpr int kBlockBytes = 144;
   static constexpr int kTasks = 8;
-  using Raw = RawQ45K;
+  struct Raw {
+    uint4 header, q;
+  };
   using SplitRaw = Raw;
   static __device__ __forceinline__ Raw Load(const uint8_t* b, int t) {
-    return LoadQ45K<false>(b, t);
+    const int p = t >> 1;
+    const int h = t & 1;
+    return {*reinterpret_cast<const uint4*>(b),
+            *reinterpret_cast<const uint4*>(b + 16 + 32 * p + 16 * h)};
   }
   static __device__ __forceinline__ Raw LoadSplit(const uint8_t* b, int t) {
     return Load(b, t);
@@ -46,11 +47,14 @@ struct Format<12> {  // Q4_K
   }
   static __device__ __forceinline__ void Decode(const Raw& r, int t,
                                                 float (&w)[32]) {
-    DecodeQ45K<false>(r, t, w);
+    RawQ45K q{};
+    q.header = r.header;
+    q.q = r.q;
+    DecodeQ45K<false>(q, t, w);
   }
   static __device__ __forceinline__ void Decode(const uint8_t* b, int t,
                                                 float (&w)[32]) {
-    DecodeQ45K<false>(b, t, w);
+    Decode(Load(b, t), t, w);
   }
   static __device__ __forceinline__ float Dot(float acc, const float (&w)[32],
                                               int t, const float* x) {
@@ -415,195 +419,456 @@ __global__ void __launch_bounds__(kWave* kWaves)
   }
 }
 
-/* Routed experts: grid (row blocks, slots). Slot j's expert is ids[j], its
- * input row x + (j / slots_per_x) * k and its output row y + j * m. With
- * kCols == 1 every slot is its own launch row. With kCols > 1 (verify
- * passes, at most kCols slots per expert, n_slots <= 256) the block of the
- * first slot with an expert takes every slot with it, in slot order, and
- * decodes the expert's rows once for them; the other blocks exit. Each
- * slot's sums run as gemv_kernel runs one token: the same bits for any
- * kCols. With kSwiGLU the outputs are SwiGLU(gate, up) times route_w[j]. */
-template<int kType, int S, bool kSwiGLU, int kCols>
-__global__ void __launch_bounds__(kWave* kWaves)
-    expert_gemv_kernel(const uint8_t* __restrict__ w,
-                       const uint8_t* __restrict__ w_up, uint64_t expert_bytes,
-                       float limit, const float* __restrict__ x,
-                       uint32_t slots_per_x, const int32_t* __restrict__ ids,
-                       const float* __restrict__ route_w, float* __restrict__ y,
-                       uint32_t m, uint32_t k, uint32_t n_slots) {
-  using F = Format<kType>;
-  constexpr int kRowsPerWave = kWave / F::kTasks;
-  constexpr int kGroups = kWaves / S;
-  __shared__ float partial[S > 1 ? kCols : 1][kWaves][kWave];
-  __shared__ float partial_up[S > 1 && kSwiGLU ? kCols : 1][kWaves][kWave];
-  const uint32_t slot0 = blockIdx.y;
-  const int32_t expert = ids[slot0];
-  uint32_t slot[kCols];
-  int cols = 1;
-  slot[0] = slot0;
-  if constexpr (kCols > 1) {
-    __shared__ uint32_t match[kWaves];
-    const uint32_t j = threadIdx.x;
-    const bool hit = j < n_slots && ids[j] == expert;
-    const uint32_t mask = __ballot(hit);
-    if (threadIdx.x % kWave == 0)
-      match[threadIdx.x / kWave] = mask;
-    __syncthreads();
-    // An earlier slot with this expert does the work.
-    for (uint32_t wv = 0; wv * kWave < slot0; ++wv) {
-      const uint32_t below =
-          slot0 >= (wv + 1) * kWave ? ~0u : (1u << (slot0 % kWave)) - 1u;
-      if (match[wv] & below)
-        return;
+/* Routed experts with FP32 activations, adapted from ds41-gufo-extension
+ * (UPSTREAM.md). One block of kPlanSlots threads groups `ids[0..n_slots)` by
+ * expert: plan[0] is the group count, and group g at plan + 1 + g * kPlanGroup
+ * holds {expert_id, count, slot[0..count-1]} in ascending slot order. Every
+ * routed kernel sums super-blocks 0..blocks_per_row-1 in order and reduces the
+ * 8 tasks in xor-tree order (4, 2, 1), so single-slot, lane-major and
+ * task-major launches agree bit for bit. */
+constexpr int kPlanSlots = HY4_EXPERT_PLAN_SLOTS;
+constexpr int kPlanCols = HY4_GEMV_MAX_TOKENS;
+constexpr int kPlanGroup = 2 + kPlanCols;
+
+__global__ void expert_plan_kernel(const int32_t* __restrict__ ids,
+                                   uint32_t slots, int32_t* __restrict__ plan) {
+  __shared__ int32_t sid[kPlanSlots];
+  __shared__ int32_t first_of[kPlanSlots];
+  __shared__ int32_t group_of[kPlanSlots];
+  const uint32_t s = threadIdx.x;
+  if (s < slots)
+    sid[s] = ids[s];
+  __syncthreads();
+  int32_t id = 0, col = 0, count = 0, first = (int32_t)s;
+  if (s < slots) {
+    id = sid[s];
+    for (uint32_t o = 0; o < slots; ++o) {
+      const bool same = sid[o] == id;
+      count += same;
+      if (o < s && same) {
+        ++col;
+        if ((int32_t)o < first)
+          first = (int32_t)o;
+      }
     }
-    cols = 0;
-    for (uint32_t wv = slot0 / kWave; wv < kWaves; ++wv) {
-      uint32_t bits = match[wv];
-      if (wv == slot0 / kWave)
-        bits &= ~0u << (slot0 % kWave);
-      while (bits && cols < kCols) {
-        const int b = __builtin_ctz(bits);
-        bits &= bits - 1;
+    first_of[s] = first;
+  }
+  __syncthreads();
+  if (s < slots && first == (int32_t)s) {
+    int32_t group = 0;
+    for (uint32_t o = 0; o < s; ++o)
+      group += first_of[o] == (int32_t)o;
+    group_of[s] = group;
+  }
+  __syncthreads();
+  if (s >= slots)
+    return;
+  int32_t* g = plan + 1 + group_of[first] * kPlanGroup;
+  if (first == (int32_t)s) {
+    g[0] = id;
+    g[1] = count;
+  }
+  if (col < kPlanCols)
+    g[2 + col] = (int32_t)s;
+  if (s == slots - 1) {
+    int32_t groups = 0;
+    for (uint32_t o = 0; o < slots; ++o)
+      groups += first_of[o] == (int32_t)o;
+    plan[0] = groups;
+  }
+}
+
+/* Single-slot routed expert GEMV (n = 1): 32 rows per workgroup (4 rows x 8
+ * tasks per wave, no LDS), loading U super-blocks ahead to hide DRAM latency.
+ */
+template<int kType, bool kSwiGLU, int U>
+__global__ void __launch_bounds__(kWave* kWaves)
+    expert_single_kernel(const uint8_t* __restrict__ w,
+                         const uint8_t* __restrict__ w_up,
+                         uint64_t expert_bytes, float limit,
+                         const float* __restrict__ x, uint32_t slots_per_x,
+                         const int32_t* __restrict__ ids,
+                         const float* __restrict__ route_w,
+                         float* __restrict__ y, uint32_t m, uint32_t k) {
+  using F = Format<kType>;
+  constexpr uint32_t kRows = (kWave / F::kTasks) * kWaves;
+  const uint32_t slot = blockIdx.y;
+  const int32_t expert = ids[slot];
+  const int lane = threadIdx.x % kWave;
+  const int wave = threadIdx.x / kWave;
+  const int t = lane % F::kTasks;
+  const uint32_t row =
+      blockIdx.x * kRows + wave * (kWave / F::kTasks) + lane / F::kTasks;
+  if (row >= m)
+    return;
+  const uint32_t blocks_per_row = k / 256;
+  const uint64_t offset = (uint64_t)expert * expert_bytes +
+                          (uint64_t)row * blocks_per_row * F::kBlockBytes;
+  const uint8_t* base = w + offset;
+  const uint8_t* base_up = kSwiGLU ? w_up + offset : nullptr;
+  const float* xr = x + (uint64_t)(slot / slots_per_x) * k;
+  float acc = 0.0f;
+  float acc_up = 0.0f;
+  uint32_t blk = 0;
+  for (; blk + U <= blocks_per_row; blk += U) {
+    typename F::SplitRaw raw[U];
+    typename F::SplitRaw raw_up[kSwiGLU ? U : 1];
 #pragma unroll
-        for (int c = 0; c < kCols; ++c)
-          if (c == cols)
-            slot[c] = wv * kWave + b;
-        ++cols;
+    for (int u = 0; u < U; ++u) {
+      raw[u] = F::LoadSplit(base + (uint64_t)(blk + u) * F::kBlockBytes, t);
+      if constexpr (kSwiGLU)
+        raw_up[u] =
+            F::LoadSplit(base_up + (uint64_t)(blk + u) * F::kBlockBytes, t);
+    }
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      float wv[32];
+      F::DecodeSplit(raw[u], t, wv);
+      acc = F::Dot(acc, wv, t, xr + (blk + u) * 256);
+      if constexpr (kSwiGLU) {
+        F::DecodeSplit(raw_up[u], t, wv);
+        acc_up = F::Dot(acc_up, wv, t, xr + (blk + u) * 256);
       }
     }
   }
+  for (; blk < blocks_per_row; ++blk) {
+    float wv[32];
+    F::DecodeSplit(F::LoadSplit(base + (uint64_t)blk * F::kBlockBytes, t), t,
+                   wv);
+    acc = F::Dot(acc, wv, t, xr + blk * 256);
+    if constexpr (kSwiGLU) {
+      F::DecodeSplit(F::LoadSplit(base_up + (uint64_t)blk * F::kBlockBytes, t),
+                     t, wv);
+      acc_up = F::Dot(acc_up, wv, t, xr + blk * 256);
+    }
+  }
+#pragma unroll
+  for (int o = F::kTasks / 2; o > 0; o >>= 1) {
+    acc += __shfl_xor(acc, o, kWave);
+    if constexpr (kSwiGLU)
+      acc_up += __shfl_xor(acc_up, o, kWave);
+  }
+  if (t != 0)
+    return;
+  float v = acc;
+  if constexpr (kSwiGLU) {
+    float g = acc;
+    float u = acc_up;
+    if (limit > 0.0f) {
+      u = fminf(fmaxf(u, -limit), limit);
+      g = fminf(g, limit);
+    }
+    v = g / (1.0f + expf(-g)) * u;
+    if (route_w)
+      v *= route_w[slot];
+  }
+  y[(uint64_t)slot * m + row] = v;
+}
+
+/* Lane-major grouped expert GEMV (2..8 tokens): uniform 32-bit activation
+ * offsets in SGPRs, 32 rows per workgroup (no LDS), weights decoded once per
+ * expert group across its slots. */
+template<int kType, bool kSwiGLU, int kCols>
+__global__ void __launch_bounds__(kWave* kWaves)
+    expert_group_lane_kernel(const uint8_t* __restrict__ w,
+                             const uint8_t* __restrict__ w_up,
+                             uint64_t expert_bytes, float limit,
+                             const float* __restrict__ x, uint32_t slots_per_x,
+                             const int32_t* __restrict__ plan,
+                             const float* __restrict__ route_w,
+                             float* __restrict__ y, uint32_t m, uint32_t k) {
+  using F = Format<kType>;
+  constexpr uint32_t kRows = (kWave / F::kTasks) * kWaves;
+  if ((int32_t)blockIdx.y >= plan[0])
+    return;
+  const int32_t* g = plan + 1 + blockIdx.y * kPlanGroup;
+  const int32_t expert = g[0];
+  const int cols = g[1] < kCols ? g[1] : kCols;
   const int lane = threadIdx.x % kWave;
   const int wave = threadIdx.x / kWave;
-  const int group = wave / S;
-  const int sl = wave % S;
   const int t = lane % F::kTasks;
   const uint32_t row =
-      (blockIdx.x * kGroups + group) * kRowsPerWave + lane / F::kTasks;
+      blockIdx.x * kRows + wave * (kWave / F::kTasks) + lane / F::kTasks;
+  if (row >= m)
+    return;
+  uint32_t x_off[kCols];
+#pragma unroll
+  for (int c = 0; c < kCols; ++c)
+    x_off[c] = (uint32_t)((c < cols ? g[2 + c] : 0) / slots_per_x) * k;
   const uint32_t blocks_per_row = k / 256;
+  const uint64_t offset = (uint64_t)expert * expert_bytes +
+                          (uint64_t)row * blocks_per_row * F::kBlockBytes;
+  const uint8_t* base = w + offset;
+  const uint8_t* base_up = kSwiGLU ? w_up + offset : nullptr;
   float acc[kCols] = {};
   float acc_up[kCols] = {};
-  if (row < m) {
-    const uint64_t offset = (uint64_t)expert * expert_bytes +
-                            (uint64_t)row * blocks_per_row * F::kBlockBytes;
-    const uint8_t* base = w + offset;
-    const float* xr[kCols];
-#pragma unroll
-    for (int c = 0; c < kCols; ++c)
-      xr[c] = x + (uint64_t)(slot[c < cols ? c : 0] / slots_per_x) * k;
 #pragma unroll 2
-    for (uint32_t blk = sl; blk < blocks_per_row; blk += S) {
-      float wv[32];
-      F::Decode(base + (uint64_t)blk * F::kBlockBytes, t, wv);
+  for (uint32_t blk = 0; blk < blocks_per_row; ++blk) {
+    const float* xb = x + blk * 256;
+    float wv[32];
+    F::DecodeSplit(F::LoadSplit(base + (uint64_t)blk * F::kBlockBytes, t), t,
+                   wv);
 #pragma unroll
-      for (int c = 0; c < kCols; ++c)
-        if (c < cols)
-          acc[c] = F::Dot(acc[c], wv, t, xr[c] + blk * 256);
-      if constexpr (kSwiGLU) {
-        F::Decode(w_up + offset + (uint64_t)blk * F::kBlockBytes, t, wv);
+    for (int c = 0; c < kCols; ++c) {
+      if (c >= cols)
+        break;
+      acc[c] = F::Dot(acc[c], wv, t, xb + x_off[c]);
+    }
+    if constexpr (kSwiGLU) {
+      F::DecodeSplit(F::LoadSplit(base_up + (uint64_t)blk * F::kBlockBytes, t),
+                     t, wv);
 #pragma unroll
-        for (int c = 0; c < kCols; ++c)
-          if (c < cols)
-            acc_up[c] = F::Dot(acc_up[c], wv, t, xr[c] + blk * 256);
+      for (int c = 0; c < kCols; ++c) {
+        if (c >= cols)
+          break;
+        acc_up[c] = F::Dot(acc_up[c], wv, t, xb + x_off[c]);
       }
     }
   }
 #pragma unroll
   for (int c = 0; c < kCols; ++c) {
 #pragma unroll
-    for (int offset = F::kTasks / 2; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_xor(acc[c], offset, kWave);
+    for (int o = F::kTasks / 2; o > 0; o >>= 1) {
+      acc[c] += __shfl_xor(acc[c], o, kWave);
       if constexpr (kSwiGLU)
-        acc_up[c] += __shfl_xor(acc_up[c], offset, kWave);
+        acc_up[c] += __shfl_xor(acc_up[c], o, kWave);
     }
   }
-  if constexpr (S > 1) {
-#pragma unroll
-    for (int c = 0; c < kCols; ++c) {
-      partial[c][wave][lane] = acc[c];
-      if constexpr (kSwiGLU)
-        partial_up[c][wave][lane] = acc_up[c];
-    }
-    __syncthreads();
-    if (sl != 0)
-      return;
-#pragma unroll
-    for (int c = 0; c < kCols; ++c) {
-#pragma unroll
-      for (int s = 1; s < S; ++s) {
-        acc[c] += partial[c][wave + s][lane];
-        if constexpr (kSwiGLU)
-          acc_up[c] += partial_up[c][wave + s][lane];
-      }
-    }
-  }
-  if (t != 0 || row >= m)
+  if (t != 0)
     return;
 #pragma unroll
   for (int c = 0; c < kCols; ++c) {
     if (c >= cols)
-      continue;
+      break;
+    const int32_t slot = g[2 + c];
     float v = acc[c];
     if constexpr (kSwiGLU) {
-      float g = acc[c];
-      float u = acc_up[c];
+      float gv = acc[c];
+      float uv = acc_up[c];
       if (limit > 0.0f) {
-        u = fminf(fmaxf(u, -limit), limit);
-        g = fminf(g, limit);
+        uv = fminf(fmaxf(uv, -limit), limit);
+        gv = fminf(gv, limit);
       }
-      v = g / (1.0f + expf(-g)) * u;
+      v = gv / (1.0f + expf(-gv)) * uv;
       if (route_w)
-        v *= route_w[slot[c]];
+        v *= route_w[slot];
     }
-    y[(uint64_t)slot[c] * m + row] = v;
+    y[(uint64_t)slot * m + row] = v;
   }
 }
 
-/* The slices of expert_gemv_kernel: fixed, so that every pass sums alike. */
-constexpr int kExpertSlices = HY4_EXPERT_SLICES;
+/* Task-major grouped expert GEMV (9..16 tokens): wave t takes task t of 32
+ * rows (lane = row), so activations are uniform across the wave and arrive
+ * through scalar loads while the vector unit loads only weights. The 8 task
+ * waves reduce through LDS in xor-tree order (4, 2, 1), matching the lane
+ * kernels bit for bit. */
+template<int kType, bool kSwiGLU, int kCols, bool kPrefetch>
+__global__ void __launch_bounds__(kWave* kWaves)
+    expert_group_task_kernel(const uint8_t* __restrict__ w,
+                             const uint8_t* __restrict__ w_up,
+                             uint64_t expert_bytes, float limit,
+                             const float* __restrict__ x, uint32_t slots_per_x,
+                             const int32_t* __restrict__ plan,
+                             const float* __restrict__ route_w,
+                             float* __restrict__ y, uint32_t m, uint32_t k) {
+  using F = Format<kType>;
+  static_assert(F::kTasks == kWaves, "one wave per task");
+  constexpr uint32_t kRows = kWave;
+  constexpr int kMats = kSwiGLU ? 2 : 1;
+  constexpr int kRedCols = kCols < 4 ? kCols : 4;
+  __shared__ float red[kWaves / 2][kMats][kRedCols][kWave];
+  if ((int32_t)blockIdx.y >= plan[0])
+    return;
+  const int32_t* g = plan + 1 + blockIdx.y * kPlanGroup;
+  const int32_t expert = g[0];
+  const int cols = g[1] < kCols ? g[1] : kCols;
+  const int lane = threadIdx.x % kWave;
+  const int t = __builtin_amdgcn_readfirstlane(threadIdx.x / kWave);
+  const uint32_t row0 = blockIdx.x * kRows;
+  const uint32_t row = min(row0 + lane, m - 1);
+  uint32_t x_off[kCols];
+#pragma unroll
+  for (int c = 0; c < kCols; ++c)
+    x_off[c] = (uint32_t)((c < cols ? g[2 + c] : 0) / slots_per_x) * k;
+  const uint32_t blocks_per_row = k / 256;
+  const uint64_t offset = (uint64_t)expert * expert_bytes +
+                          (uint64_t)row * blocks_per_row * F::kBlockBytes;
+  const uint8_t* base = w + offset;
+  const uint8_t* base_up = kSwiGLU ? w_up + offset : nullptr;
+  float acc[kCols] = {};
+  float acc_up[kCols] = {};
+  if constexpr (kPrefetch) {
+    typename F::SplitRaw next = F::LoadSplit(base, t);
+    typename F::SplitRaw next_up{};
+    if constexpr (kSwiGLU)
+      next_up = F::LoadSplit(base_up, t);
+    for (uint32_t blk = 0; blk < blocks_per_row; ++blk) {
+      const typename F::SplitRaw raw = next, raw_up = next_up;
+      if (blk + 1 < blocks_per_row) {
+        next = F::LoadSplit(base + (uint64_t)(blk + 1) * F::kBlockBytes, t);
+        if constexpr (kSwiGLU)
+          next_up =
+              F::LoadSplit(base_up + (uint64_t)(blk + 1) * F::kBlockBytes, t);
+      }
+      const float* xb = x + blk * 256;
+      float wv[32];
+      F::DecodeSplit(raw, t, wv);
+      for (int c = 0; c < kCols; ++c) {
+        if (c >= cols)
+          break;
+        acc[c] = F::Dot(acc[c], wv, t, xb + x_off[c]);
+      }
+      if constexpr (kSwiGLU) {
+        F::DecodeSplit(raw_up, t, wv);
+        for (int c = 0; c < kCols; ++c) {
+          if (c >= cols)
+            break;
+          acc_up[c] = F::Dot(acc_up[c], wv, t, xb + x_off[c]);
+        }
+      }
+    }
+  } else {
+    for (uint32_t blk = 0; blk < blocks_per_row; ++blk) {
+      const float* xb = x + blk * 256;
+      float wv[32];
+      F::DecodeSplit(F::LoadSplit(base + (uint64_t)blk * F::kBlockBytes, t), t,
+                     wv);
+      for (int c = 0; c < kCols; ++c) {
+        if (c >= cols)
+          break;
+        acc[c] = F::Dot(acc[c], wv, t, xb + x_off[c]);
+      }
+      if constexpr (kSwiGLU) {
+        F::DecodeSplit(
+            F::LoadSplit(base_up + (uint64_t)blk * F::kBlockBytes, t), t, wv);
+        for (int c = 0; c < kCols; ++c) {
+          if (c >= cols)
+            break;
+          acc_up[c] = F::Dot(acc_up[c], wv, t, xb + x_off[c]);
+        }
+      }
+    }
+  }
+  for (int c0 = 0; c0 < kCols; c0 += kRedCols) {
+#pragma unroll
+    for (int offset = kWaves / 2; offset > 0; offset >>= 1) {
+      if (t >= offset && t < 2 * offset) {
+#pragma unroll
+        for (int j = 0; j < kRedCols; ++j) {
+          if (c0 + j < kCols) {
+            red[t - offset][0][j][lane] = acc[c0 + j];
+            if constexpr (kSwiGLU)
+              red[t - offset][1][j][lane] = acc_up[c0 + j];
+          }
+        }
+      }
+      __syncthreads();
+      if (t < offset) {
+#pragma unroll
+        for (int j = 0; j < kRedCols; ++j) {
+          if (c0 + j < kCols) {
+            acc[c0 + j] += red[t][0][j][lane];
+            if constexpr (kSwiGLU)
+              acc_up[c0 + j] += red[t][1][j][lane];
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+  if (t != 0 || row0 + lane >= m)
+    return;
+  for (int c = 0; c < kCols; ++c) {
+    if (c >= cols)
+      break;
+    const int32_t slot = g[2 + c];
+    float v = acc[c];
+    if constexpr (kSwiGLU) {
+      float gv = acc[c];
+      float uv = acc_up[c];
+      if (limit > 0.0f) {
+        uv = fminf(fmaxf(uv, -limit), limit);
+        gv = fminf(gv, limit);
+      }
+      v = gv / (1.0f + expf(-gv)) * uv;
+      if (route_w)
+        v *= route_w[slot];
+    }
+    y[(uint64_t)slot * m + row0 + lane] = v;
+  }
+}
 
 template<int kType, int kCols>
-void launch_experts(const void* w, const void* w_up, uint64_t expert_bytes,
-                    float limit, const float* x, uint32_t slots_per_x,
-                    const int32_t* ids, const float* route_w, float* y,
-                    uint32_t m, uint32_t k, uint32_t n_slots,
-                    hipStream_t stream) {
-  constexpr int S = kExpertSlices;
-  constexpr uint32_t kRows = (kWave / Format<kType>::kTasks) * (kWaves / S);
+void launch_experts_lane(const void* w, const void* w_up, uint64_t expert_bytes,
+                         float limit, const float* x, uint32_t slots_per_x,
+                         const int32_t* plan, const float* route_w, float* y,
+                         uint32_t m, uint32_t k, uint32_t n_slots,
+                         hipStream_t stream) {
+  constexpr uint32_t kRows = (kWave / Format<kType>::kTasks) * kWaves;
   const dim3 grid((m + kRows - 1) / kRows, n_slots);
   const auto* wg = static_cast<const uint8_t*>(w);
   const auto* wu = static_cast<const uint8_t*>(w_up);
   if (w_up)
-    expert_gemv_kernel<kType, S, true, kCols>
+    expert_group_lane_kernel<kType, true, kCols>
         <<<grid, kWave * kWaves, 0, stream>>>(wg, wu, expert_bytes, limit, x,
-                                              slots_per_x, ids, route_w, y, m,
-                                              k, n_slots);
+                                              slots_per_x, plan, route_w, y, m,
+                                              k);
   else
-    expert_gemv_kernel<kType, S, false, kCols>
+    expert_group_lane_kernel<kType, false, kCols>
         <<<grid, kWave * kWaves, 0, stream>>>(wg, nullptr, expert_bytes, 0.0f,
-                                              x, slots_per_x, ids, nullptr, y,
-                                              m, k, n_slots);
+                                              x, slots_per_x, plan, nullptr, y,
+                                              m, k);
 }
 
 template<int kType>
 void dispatch_experts(const void* w, const void* w_up, uint64_t expert_bytes,
                       float limit, const float* x, uint32_t slots_per_x,
-                      const int32_t* ids, const float* route_w, float* y,
-                      uint32_t m, uint32_t k, uint32_t n_slots,
-                      uint32_t max_cols, hipStream_t stream) {
-#define HY4_EXPERTS(C)                                                        \
-  launch_experts<kType, C>(w, w_up, expert_bytes, limit, x, slots_per_x, ids, \
-                           route_w, y, m, k, n_slots, stream)
-  if (max_cols == 1)
-    HY4_EXPERTS(1);
-  else if (max_cols == 2)
-    HY4_EXPERTS(2);
+                      const int32_t* ids, const int32_t* plan,
+                      const float* route_w, float* y, uint32_t m, uint32_t k,
+                      uint32_t n_slots, uint32_t max_cols, hipStream_t stream) {
+  constexpr uint32_t kRows = (kWave / Format<kType>::kTasks) * kWaves;
+  const dim3 grid((m + kRows - 1) / kRows, n_slots);
+  const auto* wg = static_cast<const uint8_t*>(w);
+  const auto* wu = static_cast<const uint8_t*>(w_up);
+  if (max_cols == 1) {
+    constexpr int kUnroll = kType == 8 ? 1 : 3;
+    if (w_up)
+      expert_single_kernel<kType, true, kUnroll>
+          <<<grid, kWave * kWaves, 0, stream>>>(wg, wu, expert_bytes, limit, x,
+                                                slots_per_x, ids, route_w, y, m,
+                                                k);
+    else
+      expert_single_kernel<kType, false, kUnroll>
+          <<<grid, kWave * kWaves, 0, stream>>>(wg, nullptr, expert_bytes, 0.0f,
+                                                x, slots_per_x, ids, nullptr, y,
+                                                m, k);
+    return;
+  }
+  if (max_cols == 2)
+    launch_experts_lane<kType, 2>(w, w_up, expert_bytes, limit, x, slots_per_x,
+                                  plan, route_w, y, m, k, n_slots, stream);
   else if (max_cols <= 4)
-    HY4_EXPERTS(4);
+    launch_experts_lane<kType, 4>(w, w_up, expert_bytes, limit, x, slots_per_x,
+                                  plan, route_w, y, m, k, n_slots, stream);
+  else if (max_cols <= 6)
+    launch_experts_lane<kType, 6>(w, w_up, expert_bytes, limit, x, slots_per_x,
+                                  plan, route_w, y, m, k, n_slots, stream);
   else if (max_cols <= 8)
-    HY4_EXPERTS(8);
-  else
-    HY4_EXPERTS(16);
-#undef HY4_EXPERTS
+    launch_experts_lane<kType, 8>(w, w_up, expert_bytes, limit, x, slots_per_x,
+                                  plan, route_w, y, m, k, n_slots, stream);
+  else {
+    constexpr bool kPrefetch = kType == 14;
+    if (w_up)
+      expert_group_task_kernel<kType, true, kPlanCols, kPrefetch>
+          <<<grid, kWave * kWaves, 0, stream>>>(wg, wu, expert_bytes, limit, x,
+                                                slots_per_x, plan, route_w, y,
+                                                m, k);
+    else
+      expert_group_task_kernel<kType, false, kPlanCols, kPrefetch>
+          <<<grid, kWave * kWaves, 0, stream>>>(wg, nullptr, expert_bytes, 0.0f,
+                                                x, slots_per_x, plan, nullptr,
+                                                y, m, k);
+  }
 }
 
 /* Slice results and per-tile counters of split_gemv_kernel, in the caller's
@@ -803,28 +1068,47 @@ extern "C" int hy4_gemv_gate(int type, const void* w, const float* x, float* y,
              Tokens{n, k, m, nullptr, true}, scratch, stream);
 }
 
+extern "C" uint64_t hy4_expert_plan_ints(void) {
+  return 1ull + (uint64_t)kPlanSlots * kPlanGroup;
+}
+
+extern "C" int hy4_expert_plan(const int32_t* ids, uint32_t n_slots,
+                               int32_t* plan, hipStream_t stream) {
+  if (!ids || !plan || n_slots == 0 || n_slots > kPlanSlots)
+    return 1;
+  expert_plan_kernel<<<1, kPlanSlots, 0, stream>>>(ids, n_slots, plan);
+  const hipError_t err = hipGetLastError();
+  if (err == hipSuccess)
+    return 0;
+  fprintf(stderr, "hy4: expert plan launch failed: %s\n",
+          hipGetErrorString(err));
+  return 1;
+}
+
 extern "C" int hy4_gemv_experts(int type, const void* w, const void* w_up,
                                 uint64_t expert_bytes, const float* x,
                                 uint32_t slots_per_x, const int32_t* ids,
-                                const float* route_w, float limit, float* y,
-                                uint32_t m, uint32_t k, uint32_t n_slots,
-                                uint32_t max_cols, hipStream_t stream) {
+                                const int32_t* plan, const float* route_w,
+                                float limit, float* y, uint32_t m, uint32_t k,
+                                uint32_t n_slots, uint32_t max_cols,
+                                hipStream_t stream) {
   if (k % 256 != 0 || m == 0 || n_slots == 0 || slots_per_x == 0 ||
       max_cols == 0 || max_cols > HY4_GEMV_MAX_TOKENS ||
-      (max_cols > 1 && n_slots > kWave * kWaves))
+      (max_cols == 1 && !ids) ||
+      (max_cols > 1 && (!plan || n_slots > kPlanSlots)))
     return 1;
   switch (type) {
     case HY4_TYPE_Q8_0:
       dispatch_experts<8>(w, w_up, expert_bytes, limit, x, slots_per_x, ids,
-                          route_w, y, m, k, n_slots, max_cols, stream);
+                          plan, route_w, y, m, k, n_slots, max_cols, stream);
       break;
     case HY4_TYPE_Q4_K:
       dispatch_experts<12>(w, w_up, expert_bytes, limit, x, slots_per_x, ids,
-                           route_w, y, m, k, n_slots, max_cols, stream);
+                           plan, route_w, y, m, k, n_slots, max_cols, stream);
       break;
     case HY4_TYPE_Q6_K:
       dispatch_experts<14>(w, w_up, expert_bytes, limit, x, slots_per_x, ids,
-                           route_w, y, m, k, n_slots, max_cols, stream);
+                           plan, route_w, y, m, k, n_slots, max_cols, stream);
       break;
     default:
       return 1;
