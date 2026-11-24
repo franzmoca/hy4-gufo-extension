@@ -43,6 +43,8 @@ public:
 
   [[nodiscard]] std::int32_t Find(std::string_view spelling) const;
   [[nodiscard]] bool IsSpecial(std::int32_t token) const;
+  /// The special-token spellings of this checkpoint, read from its GGUF.
+  [[nodiscard]] const Hy4Tokens& tokens() const { return hy4_; }
   [[nodiscard]] std::int32_t size() const { return static_cast<std::int32_t>(tokens_.size()); }
   [[nodiscard]] std::int32_t bos() const { return bos_; }
   [[nodiscard]] std::int32_t eos() const { return eos_; }
@@ -60,6 +62,7 @@ private:
   std::vector<std::vector<std::int32_t>> specials_by_byte_;
   std::int32_t bos_ = -1;
   std::int32_t eos_ = -1;
+  Hy4Tokens hy4_;
 };
 
 }  // namespace gufo::models::hy4_flash

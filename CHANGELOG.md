@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+- A trunk whose control tokens carry a suffix other than `:opensource` now
+  serves tool calls. Hy4 spells every special token with one suffix, chosen
+  per checkpoint: the Xylolabs Q4_K_M uses `:opensource`, the trunk that ships
+  its `nextn` draft layer (the AngelSlim Q4_K_M) uses `:6124c78e`. The
+  extension had Xylolabs's spellings compiled in, so on that trunk a prompt
+  wrote its turn framing in ordinary text where the model expects control
+  tokens, and the call blocks in its reply matched none of the dialect's
+  markers: tool calls came back as content, malformed or missing, and an image
+  prompt lost its vision token. The GGUF now says the suffix — the `HYTK` its
+  chat template sets, or its vocabulary's turn start when a template names
+  none — and the renderer, the call scanner, the reasoning tags and the
+  tokenizer's image token all take their spellings from it. A GGUF whose turn
+  tokens are not control tokens of its own vocabulary is refused at load
+  instead of being prompted as text.
+- `gufo serve` registers a tool dialect for any suffix other than `:opensource`
+  under the identity `hy4flash-` and the suffix, when that model loads: the
+  suffix lives inside the GGUF, which no extension sees while it registers.
+  `:opensource` still registers with the extension itself, so its dialect, its
+  prompts and its disk caches are byte for byte as before; another checkpoint's
+  cache identity now names its own suffix.
+- Checks: `tests/fixtures/chat_goldens_trunk.json` holds the same thirteen
+  cases rendered by a `:6124c78e` template, and the test scans a call block of
+  each spelling through both dialects, so a dialect reads its own block and
+  nothing of the other's.
+
 ## 0.2.1 (2026-11-23)
 
 Built on upstream Gufo `0a473ebf`; needs extension API 0.3.29 or later.

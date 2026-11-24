@@ -13,8 +13,6 @@
 namespace gufo::models::hy4_flash {
 namespace {
 
-using T = Hy4Tokens;
-
 bool Space(char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; }
 
 std::string_view Trim(std::string_view v) {
@@ -61,11 +59,26 @@ bool StringSoFar(std::string_view value) {
   return !PrefixOfAny(v, {"true", "false", "null"});
 }
 
+// The spellings of the dialect that opens a block with one of `markers`: the
+// scanner is handed the markers and nothing else, and the checkpoint's suffix
+// rides inside them, as the template builds them all from one suffix.
+std::optional<Hy4Tokens> TokensFor(std::span<const std::string_view> markers) {
+  constexpr std::string_view open = "<tool_calls";
+  for (const std::string_view marker : markers) {
+    if (!marker.starts_with(open) || !marker.ends_with(">")) continue;
+    return MakeHy4Tokens(
+        marker.substr(open.size(), marker.size() - open.size() - 1));
+  }
+  return std::nullopt;
+}
+
 }  // namespace
 
 void ScanHy4ToolCalls(std::string_view text, std::span<const std::string_view> markers,
                       std::vector<ext::ScannedToolCall>* calls,
                       std::vector<std::pair<std::size_t, std::size_t>>* spans, bool partial) {
+  const std::optional<Hy4Tokens> tokens = TokensFor(markers);
+  if (!tokens) return;  // no Hy4 block opener among the markers
   std::size_t cursor = 0;
   while (cursor < text.size()) {
     std::size_t begin = std::string_view::npos;
@@ -82,20 +95,20 @@ void ScanHy4ToolCalls(std::string_view text, std::span<const std::string_view> m
     bool any_complete = false;
     while (true) {
       pos = SkipSpace(text, pos);
-      if (At(text, pos, T::kCallsClose)) {
-        pos += T::kCallsClose.size();
+      if (At(text, pos, tokens->calls_close)) {
+        pos += tokens->calls_close.size();
         if (spans) spans->emplace_back(begin, pos);
         break;
       }
-      if (pos >= text.size() || !At(text, pos, T::kCallOpen)) {
+      if (pos >= text.size() || !At(text, pos, tokens->call_open)) {
         const std::string_view rest = text.substr(pos);
-        if (rest.empty() || PrefixOfAny(rest, {T::kCallOpen, T::kCallsClose})) {
+        if (rest.empty() || PrefixOfAny(rest, {tokens->call_open, tokens->calls_close})) {
           // The block ends with the text: a final parse closes it there.
           if (!partial && any_complete && spans) spans->emplace_back(begin, text.size());
         }
         return;
       }
-      pos += T::kCallOpen.size();
+      pos += tokens->call_open.size();
       // The name ends at the first tag.
       const std::size_t name_end = text.find('<', pos);
       if (name_end == std::string_view::npos) return;  // the name may still grow
@@ -104,23 +117,23 @@ void ScanHy4ToolCalls(std::string_view text, std::span<const std::string_view> m
       pos = name_end;
       while (true) {
         pos = SkipSpace(text, pos);
-        if (At(text, pos, T::kCallClose)) {
-          pos += T::kCallClose.size();
+        if (At(text, pos, tokens->call_close)) {
+          pos += tokens->call_close.size();
           call.valid = !call.name.empty();
           call.complete = true;
           break;
         }
-        if (At(text, pos, T::kKeyOpen)) {
-          const std::size_t key_begin = pos + T::kKeyOpen.size();
-          const std::size_t key_end = text.find(T::kKeyClose, key_begin);
+        if (At(text, pos, tokens->key_open)) {
+          const std::size_t key_begin = pos + tokens->key_open.size();
+          const std::size_t key_end = text.find(tokens->key_close, key_begin);
           if (key_end == std::string_view::npos) {
             if (partial) calls->push_back(std::move(call));
             return;
           }
           std::string key(Trim(text.substr(key_begin, key_end - key_begin)));
-          pos = SkipSpace(text, key_end + T::kKeyClose.size());
-          if (!At(text, pos, T::kValueOpen)) {
-            if (partial && PrefixOfAny(text.substr(pos), {T::kValueOpen})) {
+          pos = SkipSpace(text, key_end + tokens->key_close.size());
+          if (!At(text, pos, tokens->value_open)) {
+            if (partial && PrefixOfAny(text.substr(pos), {tokens->value_open})) {
               calls->push_back(std::move(call));
               return;
             }
@@ -128,22 +141,22 @@ void ScanHy4ToolCalls(std::string_view text, std::span<const std::string_view> m
             calls->push_back(std::move(call));
             return;
           }
-          const std::size_t value_begin = pos + T::kValueOpen.size();
-          const std::size_t value_end = text.find(T::kValueClose, value_begin);
+          const std::size_t value_begin = pos + tokens->value_open.size();
+          const std::size_t value_end = text.find(tokens->value_close, value_begin);
           if (value_end == std::string_view::npos) {
             if (partial) {
               const std::string_view sofar =
-                  BeforePartialDelimiter(text.substr(value_begin), T::kValueClose);
+                  BeforePartialDelimiter(text.substr(value_begin), tokens->value_close);
               if (StringSoFar(sofar)) call.unfinished = ext::ScannedToolArgument{key, std::string(sofar), true};
               calls->push_back(std::move(call));
             }
             return;
           }
           call.arguments.push_back(Argument(std::move(key), text.substr(value_begin, value_end - value_begin)));
-          pos = value_end + T::kValueClose.size();
+          pos = value_end + tokens->value_close.size();
           continue;
         }
-        if (partial && PrefixOfAny(text.substr(pos), {T::kCallClose, T::kKeyOpen})) {
+        if (partial && PrefixOfAny(text.substr(pos), {tokens->call_close, tokens->key_open})) {
           calls->push_back(std::move(call));
           return;
         }

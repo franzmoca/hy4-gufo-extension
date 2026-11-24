@@ -161,7 +161,8 @@ function(_hy4flash_test name labels)
     return()
   endif()
   target_compile_definitions(${target} PRIVATE
-    GUFO_HY4_CHAT_GOLDENS="${GUFO_EXTENSION_BUILD_ROOT}/tests/fixtures/chat_goldens.json")
+    GUFO_HY4_CHAT_GOLDENS="${GUFO_EXTENSION_BUILD_ROOT}/tests/fixtures/chat_goldens.json"
+    GUFO_HY4_CHAT_GOLDENS_OTHER="${GUFO_EXTENSION_BUILD_ROOT}/tests/fixtures/chat_goldens_trunk.json")
   add_test(NAME hy4flash.${name} COMMAND ${target})
   set_tests_properties(hy4flash.${name} PROPERTIES
     LABELS "hy4flash;${labels}" SKIP_RETURN_CODE 77)

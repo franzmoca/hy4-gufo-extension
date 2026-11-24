@@ -1,0 +1,499 @@
+{
+ "template_sha256": "09a8ba8fb355300da43229ff491a47d64c98dcfd79eb5881b3c88738953c7b51",
+ "cases": [
+  {
+   "name": "single user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hello!"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hello!<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "system max",
+   "effort": "max",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "2+2?"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>You are terse.<｜reasoning_mode:6124c78e｜>reasoning_effort:max<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>2+2?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "developer as system",
+   "messages": [
+    {
+     "role": "developer",
+     "content": "Answer in French."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Answer in French.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Hi<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "no_think drops history reasoning",
+   "effort": "no_think",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First"
+    },
+    {
+     "role": "assistant",
+     "content": "One",
+     "reasoning": "thinking one"
+    },
+    {
+     "role": "user",
+     "content": "Second"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:no_think<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>First<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>One<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Second<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>"
+  },
+  {
+   "name": "reasoning kept only after the last user",
+   "messages": [
+    {
+     "role": "user",
+     "content": "First"
+    },
+    {
+     "role": "assistant",
+     "content": "One",
+     "reasoning": "old thought"
+    },
+    {
+     "role": "user",
+     "content": "Second"
+    },
+    {
+     "role": "assistant",
+     "content": "Two",
+     "reasoning": "new thought"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>First<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>One<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Second<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>new thought</think:6124c78e>Two<｜hy_end:6124c78e｜>"
+  },
+  {
+   "name": "tool loop reorders responses",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the <web> & return \"results\".",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather in Rome and Oslo?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "reasoning": "Two cities.",
+     "tool_calls": [
+      {
+       "id": "a1",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Rome",
+         "is_string": true
+        },
+        {
+         "name": "days",
+         "value": "2",
+         "is_string": false
+        }
+       ]
+      },
+      {
+       "id": "b2",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Oslo",
+         "is_string": true
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "b2",
+     "content": "Oslo: 3"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "a1",
+     "content": "Rome: 18"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city, in °C.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search\", \"description\": \"Search the <web> & return \\\"results\\\".\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather in Rome and Oslo?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>Two cities.</think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Rome</arg_value:6124c78e><arg_key:6124c78e>days</arg_key:6124c78e><arg_value:6124c78e>2</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Oslo</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>Rome: 18</tool_response:6124c78e><tool_response:6124c78e>Oslo: 3</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool responses without ids keep their order",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather?"
+    },
+    {
+     "role": "assistant",
+     "content": "Checking.",
+     "tool_calls": [
+      {
+       "id": "",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Rome",
+         "is_string": true
+        }
+       ]
+      },
+      {
+       "id": "c3",
+       "name": "get_weather",
+       "arguments": [
+        {
+         "name": "city",
+         "value": "Oslo",
+         "is_string": true
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c3",
+     "content": "second"
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "",
+     "content": "first"
+    },
+    {
+     "role": "assistant",
+     "content": "Done.",
+     "reasoning": "kept: tools preserve thinking"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city, in °C.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Weather?<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>Checking.<tool_calls:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Rome</arg_value:6124c78e></tool_call:6124c78e><tool_call:6124c78e>get_weather<arg_key:6124c78e>city</arg_key:6124c78e><arg_value:6124c78e>Oslo</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>second</tool_response:6124c78e><tool_response:6124c78e>first</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>kept: tools preserve thinking</think:6124c78e>Done.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Thanks<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tools with a system message and typed arguments",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the <web> & return \"results\".",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "later",
+      "description": "Loaded on demand.",
+      "parameters": {},
+      "defer_loading": true
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "system",
+     "content": "Use tools."
+    },
+    {
+     "role": "user",
+     "content": "Find ünïcode"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "s1",
+       "name": "search",
+       "arguments": [
+        {
+         "name": "q",
+         "value": "ünïcode <tags>",
+         "is_string": true
+        },
+        {
+         "name": "limit",
+         "value": "5",
+         "is_string": false
+        },
+        {
+         "name": "exact",
+         "value": "true",
+         "is_string": false
+        },
+        {
+         "name": "filters",
+         "value": "{\"lang\": [\"en\", \"it\"], \"safe\": null}",
+         "is_string": false
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "s1",
+     "content": "{\"hits\": 0}"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"search\", \"description\": \"Search the <web> & return \\\"results\\\".\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}}}}\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city, in °C.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e>\n\nUse tools.<｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Find ünïcode<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>search<arg_key:6124c78e>q</arg_key:6124c78e><arg_value:6124c78e>ünïcode <tags></arg_value:6124c78e><arg_key:6124c78e>limit</arg_key:6124c78e><arg_value:6124c78e>5</arg_value:6124c78e><arg_key:6124c78e>exact</arg_key:6124c78e><arg_value:6124c78e>true</arg_value:6124c78e><arg_key:6124c78e>filters</arg_key:6124c78e><arg_value:6124c78e>{\"lang\": [\"en\", \"it\"], \"safe\": null}</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>{\"hits\": 0}</tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "tool choice none hides tools",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Current weather for a city, in °C.",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "days": {
+         "type": "integer",
+         "minimum": 1
+        }
+       },
+       "required": [
+        "city"
+       ]
+      },
+      "strict": true
+     }
+    }
+   ],
+   "tool_choice": "none",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Just talk."
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Just talk.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "images in user content",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Compare these two.",
+     "images": [
+      0,
+      7,
+      18
+     ]
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜><｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜>Compare<｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜> these two.<｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "image in a tool response",
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "search",
+      "description": "Search the <web> & return \"results\".",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "q": {
+         "type": "string"
+        }
+       }
+      }
+     }
+    }
+   ],
+   "messages": [
+    {
+     "role": "user",
+     "content": "Look"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "i1",
+       "name": "search",
+       "arguments": [
+        {
+         "name": "q",
+         "value": "cat",
+         "is_string": true
+        }
+       ]
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "i1",
+     "content": "Here:",
+     "images": [
+      5
+     ]
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"search\", \"description\": \"Search the <web> & return \\\"results\\\".\", \"parameters\": {\"type\": \"object\", \"properties\": {\"q\": {\"type\": \"string\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:6124c78e>\nFor each function call, you should return object like:\n<tool_call:6124c78e>{function-name}<arg_key:6124c78e>{arg-key-1}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-1}</arg_value:6124c78e><arg_key:6124c78e>{arg-key-2}</arg_key:6124c78e><arg_value:6124c78e>{arg-value-2}</arg_value:6124c78e>...</tool_call:6124c78e>\nAt the end of function call returns, you should print </tool_calls:6124c78e><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Look<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e><tool_calls:6124c78e><tool_call:6124c78e>search<arg_key:6124c78e>q</arg_key:6124c78e><arg_value:6124c78e>cat</arg_value:6124c78e></tool_call:6124c78e></tool_calls:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>tool<｜hy_middle:6124c78e｜><tool_response:6124c78e>Here:<｜hy_image▁start:6124c78e｜><｜hy_image▁pad:6124c78e｜><｜hy_image▁end:6124c78e｜></tool_response:6124c78e><｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "system after the first message",
+   "messages": [
+    {
+     "role": "user",
+     "content": "A"
+    },
+    {
+     "role": "system",
+     "content": "Mid system."
+    },
+    {
+     "role": "user",
+     "content": "B"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>A<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜>Mid system.<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>B<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e>"
+  },
+  {
+   "name": "assistant prefill stays open",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Count"
+    },
+    {
+     "role": "assistant",
+     "content": "1, 2,"
+    }
+   ],
+   "rendered": "<｜hy_start:6124c78e｜>system<｜hy_middle:6124c78e｜><｜reasoning_mode:6124c78e｜>reasoning_effort:high<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>user<｜hy_middle:6124c78e｜>Count<｜hy_end:6124c78e｜><｜hy_start:6124c78e｜>assistant<｜hy_middle:6124c78e｜><think:6124c78e></think:6124c78e>1, 2,<｜hy_end:6124c78e｜>"
+  }
+ ]
+}

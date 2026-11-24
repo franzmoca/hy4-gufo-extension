@@ -90,10 +90,11 @@ ImagePrompt PrepareImagePrompt(const Tokenizer& tokenizer,
   std::vector<std::size_t> offsets;
   std::vector<ContentSpan> spans;
   std::size_t stable = 0;
-  const std::string text = RenderChat(request, &offsets, &spans, &stable);
-  const std::int32_t start = SingleToken(tokenizer, Hy4Tokens::kImageStart);
-  const std::int32_t pad = SingleToken(tokenizer, Hy4Tokens::kImagePad);
-  const std::int32_t end = SingleToken(tokenizer, Hy4Tokens::kImageEnd);
+  const Hy4Tokens& tokens = tokenizer.tokens();
+  const std::string text = RenderChat(tokens, request, &offsets, &spans, &stable);
+  const std::int32_t start = SingleToken(tokenizer, tokens.image_start);
+  const std::int32_t pad = SingleToken(tokenizer, tokens.image_pad);
+  const std::int32_t end = SingleToken(tokenizer, tokens.image_end);
 
   ImagePrompt prompt;
   bool counted = false;

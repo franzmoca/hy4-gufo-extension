@@ -58,14 +58,25 @@ bool IsSha256Hex(std::string_view value) noexcept {
          });
 }
 
-std::vector<std::uint8_t> CompatibilityIdentity(std::string_view artifact_fingerprint, std::uint32_t max_context) {
+// The template's spellings ride in the identity: a prompt cached from one
+// checkpoint's control tokens is not a prompt of another's. `:opensource` keeps
+// the name every released model's caches were written under, since `artifact_id`
+// already pins the file they came from.
+std::string ChatTemplateIdentity(std::string_view suffix) {
+  if (suffix == OpensourceHy4Tokens().suffix) return "hy4-flash-opensource-v1";
+  return "hy4-flash" + std::string(suffix) + "-v1";
+}
+
+std::vector<std::uint8_t> CompatibilityIdentity(std::string_view artifact_fingerprint,
+                                                std::string_view token_suffix,
+                                                std::uint32_t max_context) {
   if (!IsSha256Hex(artifact_fingerprint)) throw std::invalid_argument("Hy4 disk cache requires an artifact fingerprint");
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=hy4flash\n"
            << "artifact_id=" << ext::kGgufIdentityScheme << ':' << artifact_fingerprint << '\n'
            << "tokenizer=hy-v4-byte-bpe-v1\n"
-           << "chat_template=hy4-flash-opensource-v1\n"
+           << "chat_template=" << ChatTemplateIdentity(token_suffix) << '\n'
            << "state_abi=" << kStateAbi << '\n'
            << "payload_layout=hy4-rocm-v1-f32-latent\n"
            << "numerics=hy4-v1\n"
@@ -257,14 +268,21 @@ public:
         model_name_(std::move(model_name)),
         max_context_(max_context),
         sessions_(sessions) {
-    component_identity_ = artifact_fingerprint.empty() ? ProcessIdentity(model_.get(), max_context_)
-                                                       : CompatibilityIdentity(artifact_fingerprint, max_context_);
+    component_identity_ = artifact_fingerprint.empty()
+                              ? ProcessIdentity(model_.get(), max_context_)
+                              : CompatibilityIdentity(artifact_fingerprint,
+                                                      tokenizer_->tokens().suffix,
+                                                      max_context_);
   }
 
-  [[nodiscard]] std::string ToolDialectId() const override { return std::string(kToolDialectId); }
+  // The dialect of this checkpoint's spellings, registered with the model.
+  [[nodiscard]] std::string ToolDialectId() const override {
+    return hy4_flash::ToolDialectId(tokenizer_->tokens());
+  }
 
   [[nodiscard]] ReasoningTags ReasoningBudgetTags() const override {
-    return {Hy4Tokens::kThinkOpen, Hy4Tokens::kThinkClose, {Hy4Tokens::kThinkClose}};
+    const Hy4Tokens& tokens = tokenizer_->tokens();
+    return {tokens.think_open, tokens.think_close, {tokens.think_close}};
   }
 
   [[nodiscard]] std::unique_ptr<ComponentCacheResources> CreateComponentCacheResources(
@@ -369,14 +387,15 @@ public:
     if (HasImages(request))
       return RunnerTokens(PrepareImages(request)->tokens);
     std::vector<ContentSpan> spans;
-    const std::string rendered = RenderChat(request, nullptr, &spans);
+    const std::string rendered =
+        RenderChat(tokenizer_->tokens(), request, nullptr, &spans);
     auto tokens = RunnerTokens(tokenizer_->EncodeWithSpecials(rendered, spans));
     if (tokens.empty()) return std::nullopt;
     return tokens;
   }
 
   [[nodiscard]] std::optional<std::string> RenderPrompt(const ChatRequest& request) const override {
-    return RenderChat(request);
+    return RenderChat(tokenizer_->tokens(), request);
   }
 
   [[nodiscard]] ext::InitialOutputState InitialOutputState(const ChatRequest& request) const override {
@@ -410,7 +429,8 @@ public:
     // those of the text after it.
     std::vector<ContentSpan> spans;
     std::size_t stable = 0;
-    const std::string rendered = RenderChat(request, nullptr, &spans, &stable);
+    const std::string rendered =
+        RenderChat(tokenizer_->tokens(), request, nullptr, &spans, &stable);
     auto tokens = RunnerTokens(tokenizer_->EncodeWithSpecials(rendered, spans));
     if (tokens.empty())
       return std::nullopt;
@@ -1045,6 +1065,15 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
     set_error("Hy4 tokenizer: " + load_error);
     return nullptr;
   }
+  // Extension registration registers the `:opensource` dialect. A checkpoint
+  // that spells its tokens otherwise keeps its suffix inside its own GGUF, so
+  // its dialect can only arrive with the model, registered before the runner
+  // starts answering for it.
+  std::string dialect_error;
+  if (EnsureToolDialectRegistered(tokenizer->tokens(), &dialect_error) == nullptr) {
+    set_error("Hy4 tool dialect: " + dialect_error);
+    return nullptr;
+  }
   std::uint32_t max_context = options.max_context;
   if (max_context == 0) {
     const std::uint64_t native = reader->GetMetadataUint64("hy_v4_flash.context_length").value_or(0);
@@ -1100,7 +1129,7 @@ std::shared_ptr<ext::TextModelRunner> CreateHy4TextRunner(const ext::TextRunnerO
       return nullptr;
     }
     vision = std::move(loaded_vision);
-    model->SetImageToken(tokenizer->Find(Hy4Tokens::kImagePad));
+    model->SetImageToken(tokenizer->Find(tokenizer->tokens().image_pad));
     server::Logger::Info(
         "loader",
         "event=hy4_vision_loaded resident_bytes=" +

@@ -9,7 +9,7 @@
 // gufo_hy4flash_text (provider.cpp); without HIP the probes register with no
 // execution factory.
 void hy4flash_register(gufo::ext::Registry& registry) {
-  gufo::ext::RegisterToolDialect(gufo::models::hy4_flash::ToolDialect());
+  gufo::ext::RegisterToolDialect(gufo::models::hy4_flash::OpensourceToolDialect());
 #if !defined(ENGINE_ENABLE_HIP)
   namespace hy4 = gufo::models::hy4_flash;
   registry.AddTextProvider({

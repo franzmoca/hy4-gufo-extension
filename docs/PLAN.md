@@ -479,8 +479,13 @@ Vision (decision 19), with DFly2 drafting:
   post weights and no comb matrix, which confirms iHC. The head reduces the
   streams through `output_hc_fn/base/scale`.
 - **Chat template:** the embedded template matches Tencent's except that it
-  also accepts `reasoning_effort` `max`. Every special token carries the
-  `:opensource` suffix (`<think:opensource>`, `<｜hy_start:opensource｜>`).
+  also accepts `reasoning_effort` `max`. Every special token carries one
+  suffix, set per checkpoint: `:opensource` on the Xylolabs Q4_K_M
+  (<think:opensource>, <｜hy_start:opensource｜>),
+  `:6124c78e` on the trunk that ships its `nextn` draft layer, whose
+  template also accepts `reasoning_effort` `low` (the renderer keeps mapping
+  `low` to `high`, so one name set serves both checkpoints). `Hy4Tokens`
+  holds one checkpoint's spellings, built from the suffix its GGUF states.
 
 With the drafter (`--dfly-model`, exact verify), the same suites: every case
 of `conversation`, `long-context` and `reasoning-budget` passed; `tools` as

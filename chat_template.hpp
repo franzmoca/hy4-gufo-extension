@@ -2,9 +2,10 @@
 #define HY4FLASH_CHAT_TEMPLATE_HPP_
 
 // Hy4 Flash's chat encoding: the GGUF's `tokenizer.chat_template` (Tencent's
-// template with the `:opensource` token suffix), rendered in C++.
+// template), rendered in C++.
 
 #include <cstddef>
+#include <gufo/ext/gguf_reader.hpp>
 #include <gufo/ext/text.hpp>
 #include <string>
 #include <string_view>
@@ -12,29 +13,57 @@
 
 namespace gufo::models::hy4_flash {
 
-/// Special-token spellings the template writes.
+/// One checkpoint's special-token spellings. Every Hy4 special token carries a
+/// suffix the checkpoint chose for all of them at once: `:opensource` on the
+/// Xylolabs GGUF, `:6124c78e` on Tencent's trunk. The template builds each one
+/// from a single `HYTK` variable, so the runner reads that suffix from the GGUF
+/// and the renderer, the tool-call scanner and the tool dialect all take this
+/// set. Spelling a turn with another checkpoint's suffix writes ordinary text
+/// where the model expects a control token, and reads back a call block that
+/// never matches.
 struct Hy4Tokens {
-  static constexpr std::string_view kStart = "<｜hy_start:opensource｜>";
-  static constexpr std::string_view kMiddle = "<｜hy_middle:opensource｜>";
-  static constexpr std::string_view kEnd = "<｜hy_end:opensource｜>";
-  static constexpr std::string_view kThinkOpen = "<think:opensource>";
-  static constexpr std::string_view kThinkClose = "</think:opensource>";
-  static constexpr std::string_view kCallsOpen = "<tool_calls:opensource>";
-  static constexpr std::string_view kCallsClose = "</tool_calls:opensource>";
-  static constexpr std::string_view kCallOpen = "<tool_call:opensource>";
-  static constexpr std::string_view kCallClose = "</tool_call:opensource>";
-  static constexpr std::string_view kKeyOpen = "<arg_key:opensource>";
-  static constexpr std::string_view kKeyClose = "</arg_key:opensource>";
-  static constexpr std::string_view kValueOpen = "<arg_value:opensource>";
-  static constexpr std::string_view kValueClose = "</arg_value:opensource>";
-  static constexpr std::string_view kResponseOpen = "<tool_response:opensource>";
-  static constexpr std::string_view kResponseClose = "</tool_response:opensource>";
-  static constexpr std::string_view kReasoningMode = "<｜reasoning_mode:opensource｜>";
-  static constexpr std::string_view kImageStart =
-      "<｜hy_image▁start:opensource｜>";
-  static constexpr std::string_view kImagePad = "<｜hy_image▁pad:opensource｜>";
-  static constexpr std::string_view kImageEnd = "<｜hy_image▁end:opensource｜>";
+  /// The suffix itself, leading colon included: `:opensource`.
+  std::string suffix;
+  std::string start;
+  std::string middle;
+  std::string end;
+  std::string think_open;
+  std::string think_close;
+  std::string calls_open;
+  std::string calls_close;
+  std::string call_open;
+  std::string call_close;
+  std::string key_open;
+  std::string key_close;
+  std::string value_open;
+  std::string value_close;
+  std::string response_open;
+  std::string response_close;
+  std::string reasoning_mode;
+  std::string image_start;
+  std::string image_pad;
+  std::string image_end;
+  /// `calls_open` and `call_open` together: a complete call header, which ends
+  /// a constrained reasoning phase and is what the dialect reports as its
+  /// reasoning marker.
+  std::string call_header;
+
+  /// The template's `HYTK` for these spellings, from the `start` token.
+  [[nodiscard]] static std::string SuffixOf(std::string_view start);
 };
+
+/// The spellings of one suffix, `:opensource` style or empty for none.
+[[nodiscard]] Hy4Tokens MakeHy4Tokens(std::string_view suffix);
+
+/// The Xylolabs spellings: the dialect the extension registers at startup, and
+/// the goldens in tests/fixtures/chat_goldens.json.
+[[nodiscard]] const Hy4Tokens& OpensourceHy4Tokens();
+
+/// The suffix `reader`'s checkpoint spells its tokens with: the `HYTK` its
+/// `tokenizer.chat_template` sets, or, when the template names none, the
+/// suffix of its `hy_start` vocabulary token. Empty when the GGUF has neither,
+/// which is a file this engine cannot prompt.
+[[nodiscard]] std::string Hy4TokenSuffix(const core::GgufReader& reader);
 
 /// The template's `reasoning_effort`: `no_think`, `high` or `max`.
 [[nodiscard]] std::string_view ReasoningEffortName(const ReasoningOptions& reasoning);
@@ -57,7 +86,7 @@ struct ContentSpan {
 /// turn keeps; it falls after a special token, so its tokens are a prefix of
 /// the result's.
 [[nodiscard]] std::string RenderChat(
-    const ext::ChatRequest& request,
+    const Hy4Tokens& tokens, const ext::ChatRequest& request,
     std::vector<std::size_t>* image_offsets = nullptr,
     std::vector<ContentSpan>* content_spans = nullptr,
     std::size_t* stable_prefix_bytes = nullptr);

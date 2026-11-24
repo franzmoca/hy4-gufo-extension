@@ -15,7 +15,6 @@ namespace {
 
 using ext::ChatMessage;
 using ext::ChatRole;
-using T = Hy4Tokens;
 
 std::string_view RoleName(ChatRole role) {
   switch (role) {
@@ -95,7 +94,8 @@ private:
   std::vector<ContentSpan>* spans_;
 };
 
-void ToolsPrompt(Writer& w, const std::vector<ext::ChatTool>& tools) {
+void ToolsPrompt(Writer& w, const Hy4Tokens& tokens,
+                 const std::vector<ext::ChatTool>& tools) {
   w.Markup(
       "# Tools\n\nYou may call one or more functions to assist with the user "
       "query."
@@ -114,22 +114,22 @@ void ToolsPrompt(Writer& w, const std::vector<ext::ChatTool>& tools) {
   }
   w.Markup("\n</tools>\n\n");
   w.Markup("For function call returns, you should first print ");
-  w.Markup(T::kCallsOpen);
+  w.Markup(tokens.calls_open);
   w.Markup("\nFor each function call, you should return object like:\n");
-  w.Markup(T::kCallOpen);
+  w.Markup(tokens.call_open);
   w.Markup("{function-name}");
-  w.Markup(std::string(T::kKeyOpen) + "{arg-key-1}" +
-           std::string(T::kKeyClose));
-  w.Markup(std::string(T::kValueOpen) + "{arg-value-1}" +
-           std::string(T::kValueClose));
-  w.Markup(std::string(T::kKeyOpen) + "{arg-key-2}" +
-           std::string(T::kKeyClose));
-  w.Markup(std::string(T::kValueOpen) + "{arg-value-2}" +
-           std::string(T::kValueClose));
+  w.Markup(std::string(tokens.key_open) + "{arg-key-1}" +
+           std::string(tokens.key_close));
+  w.Markup(std::string(tokens.value_open) + "{arg-value-1}" +
+           std::string(tokens.value_close));
+  w.Markup(std::string(tokens.key_open) + "{arg-key-2}" +
+           std::string(tokens.key_close));
+  w.Markup(std::string(tokens.value_open) + "{arg-value-2}" +
+           std::string(tokens.value_close));
   w.Markup("...");
-  w.Markup(T::kCallClose);
+  w.Markup(tokens.call_close);
   w.Markup("\nAt the end of function call returns, you should print ");
-  w.Markup(T::kCallsClose);
+  w.Markup(tokens.calls_close);
 }
 
 // The message text with `image` at each image part's offset.
@@ -166,10 +166,10 @@ std::string ImageMarker(const ext::ChatRequest& request) {
   }
 }
 
-void TurnStart(Writer& w, std::string_view role) {
-  w.Markup(T::kStart);
+void TurnStart(Writer& w, const Hy4Tokens& tokens, std::string_view role) {
+  w.Markup(tokens.start);
   w.Markup(role);
-  w.Markup(T::kMiddle);
+  w.Markup(tokens.middle);
 }
 
 // A tool argument value: strings raw, other values as tojson.
@@ -182,7 +182,85 @@ std::string ArgumentValue(const ChatMessage::ToolArgument& argument) {
   }
 }
 
+// A tag the vocabulary carries between fullwidth bars: `<｜hy_start…｜>`.
+std::string PipeToken(std::string_view name, std::string_view suffix) {
+  return "<｜" + std::string(name) + std::string(suffix) + "｜>";
+}
+
+// A tag between angle brackets, open or closed: `<…>` or `</…>`.
+std::string AngleTag(std::string_view name, std::string_view suffix,
+                     bool close) {
+  return (close ? "</" : "<") + std::string(name) + std::string(suffix) + ">";
+}
+
 }  // namespace
+
+Hy4Tokens MakeHy4Tokens(std::string_view suffix) {
+  Hy4Tokens tokens;
+  tokens.suffix = std::string(suffix);
+  tokens.start = PipeToken("hy_start", suffix);
+  tokens.middle = PipeToken("hy_middle", suffix);
+  tokens.end = PipeToken("hy_end", suffix);
+  tokens.think_open = AngleTag("think", suffix, false);
+  tokens.think_close = AngleTag("think", suffix, true);
+  tokens.calls_open = AngleTag("tool_calls", suffix, false);
+  tokens.calls_close = AngleTag("tool_calls", suffix, true);
+  tokens.call_open = AngleTag("tool_call", suffix, false);
+  tokens.call_close = AngleTag("tool_call", suffix, true);
+  tokens.key_open = AngleTag("arg_key", suffix, false);
+  tokens.key_close = AngleTag("arg_key", suffix, true);
+  tokens.value_open = AngleTag("arg_value", suffix, false);
+  tokens.value_close = AngleTag("arg_value", suffix, true);
+  tokens.response_open = AngleTag("tool_response", suffix, false);
+  tokens.response_close = AngleTag("tool_response", suffix, true);
+  tokens.reasoning_mode = PipeToken("reasoning_mode", suffix);
+  tokens.image_start = PipeToken("hy_image▁start", suffix);
+  tokens.image_pad = PipeToken("hy_image▁pad", suffix);
+  tokens.image_end = PipeToken("hy_image▁end", suffix);
+  tokens.call_header = tokens.calls_open + tokens.call_open;
+  return tokens;
+}
+
+const Hy4Tokens& OpensourceHy4Tokens() {
+  static const Hy4Tokens tokens = MakeHy4Tokens(":opensource");
+  return tokens;
+}
+
+std::string Hy4Tokens::SuffixOf(std::string_view start) {
+  constexpr std::string_view name = "<｜hy_start";
+  constexpr std::string_view tail = "｜>";
+  if (!start.starts_with(name) || !start.ends_with(tail) ||
+      start.size() < name.size() + tail.size())
+    return {};
+  return std::string(start.substr(name.size(),
+                                  start.size() - name.size() - tail.size()));
+}
+
+std::string Hy4TokenSuffix(const core::GgufReader& reader) {
+  // The template names the suffix once and builds every tag from it:
+  //   {%- set HYTK = ':opensource' %}
+  const auto rendered = reader.GetMetadataString("tokenizer.chat_template");
+  if (rendered) {
+    constexpr std::string_view name = "set HYTK";
+    const std::size_t at = rendered->find(name);
+    if (at != std::string_view::npos) {
+      const std::size_t open = rendered->find_first_of("'\"", at + name.size());
+      if (open != std::string_view::npos) {
+        const std::size_t close = rendered->find(rendered->at(open), open + 1);
+        if (close != std::string_view::npos)
+          return std::string(rendered->substr(open + 1, close - open - 1));
+      }
+    }
+  }
+  // A template that names none: the vocabulary's own turn start carries it.
+  constexpr std::string_view start = "<｜hy_start";
+  for (const std::string_view token :
+       reader.GetMetadataStringArray("tokenizer.ggml.tokens")) {
+    if (token.starts_with(start) && token.ends_with("｜>"))
+      return Hy4Tokens::SuffixOf(token);
+  }
+  return {};
+}
 
 std::string_view ReasoningEffortName(const ReasoningOptions& reasoning) {
   if (!reasoning.enabled.value_or(true)) return "no_think";
@@ -190,15 +268,15 @@ std::string_view ReasoningEffortName(const ReasoningOptions& reasoning) {
   return effort == ReasoningEffort::kMax || effort == ReasoningEffort::kXHigh ? "max" : "high";
 }
 
-std::string RenderChat(const ext::ChatRequest& request,
+std::string RenderChat(const Hy4Tokens& tokens, const ext::ChatRequest& request,
                        std::vector<std::size_t>* image_offsets,
                        std::vector<ContentSpan>* content_spans,
                        std::size_t* stable_prefix_bytes) {
   const auto& messages = request.messages;
   const std::string marker = image_offsets ? ImageMarker(request)
-                                           : std::string(T::kImageStart) +
-                                                 std::string(T::kImagePad) +
-                                                 std::string(T::kImageEnd);
+                                           : std::string(tokens.image_start) +
+                                                 std::string(tokens.image_pad) +
+                                                 std::string(tokens.image_end);
   if (content_spans)
     content_spans->clear();
   Writer w(content_spans);
@@ -208,7 +286,7 @@ std::string RenderChat(const ext::ChatRequest& request,
   const bool no_think = effort == "no_think";
   const bool preserved = request.reasoning.preserve_thinking.value_or(!tools.empty());
   const auto Mode = [&] {
-    w.Markup(T::kReasoningMode);
+    w.Markup(tokens.reasoning_mode);
     w.Markup("reasoning_effort:");
     w.Markup(effort);
   };
@@ -225,11 +303,11 @@ std::string RenderChat(const ext::ChatRequest& request,
   const bool leading_system =
       !messages.empty() && (messages[0].role == ChatRole::kSystem || messages[0].role == ChatRole::kDeveloper);
   if (!leading_system) {
-    TurnStart(w, "system");
+    TurnStart(w, tokens, "system");
     if (!tools.empty())
-      ToolsPrompt(w, tools);
+      ToolsPrompt(w, tokens, tools);
     Mode();
-    w.Markup(T::kEnd);
+    w.Markup(tokens.end);
   }
 
   // Tool-call ids of the last assistant turn, to order the responses after it.
@@ -259,13 +337,13 @@ std::string RenderChat(const ext::ChatRequest& request,
           matched = false;
         }
       }
-      TurnStart(w, "tool");
+      TurnStart(w, tokens, "tool");
       for (const ChatMessage* t : matched ? ordered : cluster) {
-        w.Markup(T::kResponseOpen);
+        w.Markup(tokens.response_open);
         Content(w, *t, marker);
-        w.Markup(T::kResponseClose);
+        w.Markup(tokens.response_close);
       }
-      w.Markup(T::kEnd);
+      w.Markup(tokens.end);
       call_ids.clear();
       i = end - 1;
       continue;
@@ -274,10 +352,10 @@ std::string RenderChat(const ext::ChatRequest& request,
       if (!m.images.empty())
         throw std::invalid_argument(
             "Hy4 Flash system messages cannot contain images");
-      TurnStart(w, "system");
+      TurnStart(w, tokens, "system");
       if (i == 0) {
         if (!tools.empty()) {
-          ToolsPrompt(w, tools);
+          ToolsPrompt(w, tokens, tools);
           if (!m.content.empty() || !m.framing_suffix.empty())
             w.Markup("\n\n");
         }
@@ -286,17 +364,17 @@ std::string RenderChat(const ext::ChatRequest& request,
       } else {
         Content(w, m, marker);
       }
-      w.Markup(T::kEnd);
+      w.Markup(tokens.end);
     } else if (m.role == ChatRole::kAssistant) {
-      TurnStart(w, "assistant");
-      w.Markup(T::kThinkOpen);
+      TurnStart(w, tokens, "assistant");
+      w.Markup(tokens.think_open);
       if (!no_think &&
           (preserved || static_cast<std::ptrdiff_t>(i) > last_user)) {
         if (!preserved && !m.thought.empty() && !stable)
           stable = w.str().size();
         w.Text(m.thought);
       }
-      w.Markup(T::kThinkClose);
+      w.Markup(tokens.think_close);
       Content(w, m, marker);
       if (!m.tool_calls.empty()) {
         call_ids.clear();
@@ -309,39 +387,39 @@ std::string RenderChat(const ext::ChatRequest& request,
           }
         }
         if (!complete) call_ids.clear();
-        w.Markup(T::kCallsOpen);
+        w.Markup(tokens.calls_open);
         for (const auto& call : m.tool_calls) {
-          w.Markup(T::kCallOpen);
+          w.Markup(tokens.call_open);
           w.Text(call.name);
           for (const auto& argument : call.arguments) {
-            w.Markup(T::kKeyOpen);
+            w.Markup(tokens.key_open);
             w.Text(argument.name);
-            w.Markup(T::kKeyClose);
-            w.Markup(T::kValueOpen);
+            w.Markup(tokens.key_close);
+            w.Markup(tokens.value_open);
             w.Text(ArgumentValue(argument));
-            w.Markup(T::kValueClose);
+            w.Markup(tokens.value_close);
           }
-          w.Markup(T::kCallClose);
+          w.Markup(tokens.call_close);
         }
-        w.Markup(T::kCallsClose);
+        w.Markup(tokens.calls_close);
       }
-      w.Markup(T::kEnd);
+      w.Markup(tokens.end);
       if (!m.tool_calls.empty()) continue;  // keep call_ids for the responses
     } else {
-      TurnStart(w, RoleName(m.role));
+      TurnStart(w, tokens, RoleName(m.role));
       Content(w, m, marker);
-      w.Markup(T::kEnd);
+      w.Markup(tokens.end);
     }
     call_ids.clear();
   }
 
   if (messages.empty() || messages.back().role != ChatRole::kAssistant) {
     if (!stable)
-      stable = w.str().size() + T::kStart.size();
-    TurnStart(w, "assistant");
-    w.Markup(T::kThinkOpen);
+      stable = w.str().size() + tokens.start.size();
+    TurnStart(w, tokens, "assistant");
+    w.Markup(tokens.think_open);
     if (no_think)
-      w.Markup(T::kThinkClose);
+      w.Markup(tokens.think_close);
   }
   std::string& out = w.str();
   std::size_t stable_bytes = stable.value_or(out.size());

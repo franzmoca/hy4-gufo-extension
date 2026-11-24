@@ -157,6 +157,20 @@ std::unique_ptr<Tokenizer> Tokenizer::Load(const core::GgufReader& reader, std::
   for (const auto m : merges) t->merge_rank_.emplace(std::string(m), rank++);
   t->bos_ = static_cast<std::int32_t>(reader.GetMetadataUint32("tokenizer.ggml.bos_token_id").value_or(0));
   t->eos_ = static_cast<std::int32_t>(reader.GetMetadataUint32("tokenizer.ggml.eos_token_id").value_or(0));
+  // The prompt's framing has to be spelled as this checkpoint spells it: a
+  // turn opened with another checkpoint's suffix is ordinary text to it, and
+  // its reply then comes back in the other checkpoint's tags.
+  t->hy4_ = MakeHy4Tokens(Hy4TokenSuffix(reader));
+  for (const std::string_view framing : {std::string_view(t->hy4_.start),
+                                         std::string_view(t->hy4_.middle),
+                                         std::string_view(t->hy4_.end),
+                                         std::string_view(t->hy4_.reasoning_mode)}) {
+    if (!t->IsSpecial(t->Find(framing))) {
+      *error = "hy4: the GGUF has no " + std::string(framing) +
+               " control token, so its tokens are spelled otherwise";
+      return nullptr;
+    }
+  }
   return t;
 }
 
