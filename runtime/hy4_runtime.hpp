@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <gufo/ext/experimental/state_memory.hpp>
+#include <gufo/ext/state.hpp>
 #include <memory>
 #include <span>
 #include <string>
@@ -131,6 +132,18 @@ public:
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(std::uint32_t max_context,
                                                        std::string* error);
+  /// Declares the buffers one session of `max_context` holds: full-context
+  /// KV and pooled indexer keys as kContext regions, fixed rings and scratch
+  /// as kFixed allocations.
+  [[nodiscard]] mem::StateDeclaration DeclareSessionState(
+      std::uint32_t max_context) const;
+  /// Bytes one session of `max_context` claims (page-rounded when
+  /// demand-mapped, plus any tap buffers if enabled).
+  [[nodiscard]] std::size_t SessionStateBytes(std::uint32_t max_context,
+                                              std::size_t tap_layers = 0) const;
+  /// Bytes of demand-mapped context buffers for one session of `max_context`
+  /// (0 when device memory is not demand-mapped).
+  [[nodiscard]] std::size_t DemandMappedBytes(std::uint32_t max_context) const;
   /// The context a session created for `max_context` holds (a multiple of kpool).
   [[nodiscard]] std::uint32_t SessionContext(std::uint32_t max_context) const;
   /// Latent rows a layer keeps for a session of `max_context` (Session::KvRing).
@@ -263,13 +276,7 @@ public:
   [[nodiscard]] const std::int32_t* TapSelection(std::uint32_t k, std::uint32_t* count) const;
 
   /// Forgets every evaluated token; the next evaluation starts at 0.
-  void Reset() {
-    history_.clear();
-    rope_.clear();
-    rope_delta_ = 0;
-    last_logits_.clear();
-    tap_ready_ = false;
-  }
+  void Reset();
   /// The images of the prompt being evaluated (null: none). Rows of an image
   /// span take its embeddings and rotate at 3D positions (docs/PLAN.md,
   /// decision 19).
@@ -294,14 +301,15 @@ public:
     write_user_ = user;
   }
 
-  /// Begins restoring a state of `tokens` evaluated tokens: returns the token
-  /// history to fill; the caller fills the rows, rings and logits.
-  [[nodiscard]] std::int32_t* BeginRestore(std::uint32_t tokens) {
-    history_.assign(tokens, 0);
-    RestoreRope(0, 0, {0, 0, 0});
-    last_logits_.assign(model_->config().n_vocab, 0.0f);
-    tap_ready_ = false;
-    return history_.data();
+  /// Begins restoring a state of `tokens` evaluated tokens: backs the
+  /// session's demand-mapped rows up to `tokens` and returns the token
+  /// history to fill (null on backing failure); the caller fills the rows,
+  /// rings and logits.
+  [[nodiscard]] std::int32_t* BeginRestore(std::uint32_t tokens);
+
+  /// The session's demand-mapped state account (null without demand mapping).
+  [[nodiscard]] std::shared_ptr<mem::StateAccount> StateAccount() const {
+    return state_ ? state_->account() : nullptr;
   }
 
   // Device state, for prompt-cache capture and restore. Every layer keeps
@@ -391,6 +399,11 @@ private:
   std::vector<ImageCopy> image_copies_;
   [[nodiscard]] std::array<std::int32_t, 3> PassRope(std::uint32_t p,
                                                      std::uint32_t pos0) const;
+  // Core-owned session state (demand-mapped kContext regions + kFixed rings).
+  std::unique_ptr<mem::SessionState> state_;
+  std::vector<std::shared_ptr<mem::Region>> kv_regions_;
+  std::vector<std::shared_ptr<mem::Region>> pool_regions_;
+  bool EnsureRows(std::uint32_t rows, std::string* error);
   // Per layer: latent rows [ring][kv_lora + n_rot] in binary16.
   std::vector<std::uint16_t*> cache_;
   std::vector<std::uint32_t> ring_;

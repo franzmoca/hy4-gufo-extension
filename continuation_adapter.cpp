@@ -397,6 +397,9 @@ void ContinuationAdapter::BeginRestore(cache::Slot& slot, std::span<const cache:
   Check(hipStreamSynchronize(model_->stream()));
   state.GuardAll();
   state.restore_tokens = state.session->BeginRestore(static_cast<std::uint32_t>(n));
+  if (!state.restore_tokens) {
+    throw std::runtime_error("Hy4 restore: failed to back session rows");
+  }
   state.expected = std::move(ordered);
   state.coverage.assign(descriptors_.size(), {});
   state.metadata = {};
@@ -467,7 +470,8 @@ cache::Completion ContinuationAdapter::CopyRowsIn(cache::Slot& slot, cache::Comp
       if (c.part == ContinuationPart::kTokens) {
         std::memcpy(destination, bytes.data(), bytes.size());
       } else {
-        Check(hip::CopySnapshotToDevice(destination, bytes.data(), bytes.size(), transfer.Native()));
+        Check(hip::CopySnapshotToDevice(destination, bytes.data(), bytes.size(),
+                                        transfer));
       }
     });
   } catch (...) {
@@ -552,7 +556,8 @@ cache::Completion ContinuationAdapter::LoadPrivatePiece(cache::Slot& slot, cache
         if (piece.host) {
           std::memcpy(destination, source, end - first);
         } else {
-          Check(hip::CopySnapshotToDevice(destination, source, end - first, transfer.Native()));
+          Check(hip::CopySnapshotToDevice(destination, source, end - first,
+                                          transfer));
         }
       }
     });
