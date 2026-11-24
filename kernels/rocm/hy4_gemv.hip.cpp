@@ -610,7 +610,7 @@ void dispatch_experts(const void* w, const void* w_up, uint64_t expert_bytes,
  * scratch (hy4_gemv_scratch_bytes): the launches that share one run on one
  * stream, in turn. Without scratch every launch takes the lane layout, which
  * computes the same bits. */
-constexpr uint64_t kSplitPartFloats = 16ull * 8 * 16384;
+constexpr uint64_t kSplitPartFloats = 16ull * 4 * 65536;
 constexpr uint64_t kSplitCounters = kSplitPartFloats / 32;
 struct SplitScratch {
   float* part = nullptr;
@@ -689,10 +689,6 @@ bool dispatch_slices(const void* w, const void* w_up, float limit,
                      uint32_t rows_per_x, int slices, Second second,
                      Tokens tokens, SplitScratch scratch, hipStream_t stream) {
   switch (slices) {
-    case 1:
-      launch<kType, 1, kCols>(w, w_up, limit, x, y, m, k, rows_per_x, second,
-                              tokens, scratch, stream);
-      return true;
     case 2:
       launch<kType, 2, kCols>(w, w_up, limit, x, y, m, k, rows_per_x, second,
                               tokens, scratch, stream);
@@ -759,19 +755,22 @@ int run(int type, const void* w, const void* w_up, float limit, const float* x,
     split.part = static_cast<float*>(scratch);
     split.counter = reinterpret_cast<uint32_t*>(split.part + kSplitPartFloats);
   }
-  // Eight slices were the fastest or within 5% at every Hy4 decode shape
-  // (1, 4, 8 and 16 tokens).
-  constexpr int kSlices = 8;
+  // Slice count depends only on (k, m) so single-token and multi-token passes
+  // sum identically: 4 slices when k <= 1024 (4 super-blocks/row, avoiding
+  // empty slices on wq_b), 4/2 slices on vocab-sized heads (m > 32768 / 65536)
+  // so split_gemv_kernel stays within the 16 MiB scratch up to 16 tokens, and
+  // 8 slices elsewhere.
+  const int slices = k <= 1024 ? 4 : m > 65536 ? 2 : m > 32768 ? 4 : 8;
   switch (type) {
     case HY4_TYPE_Q8_0:
-      return dispatch<8>(w, w_up, limit, x, y, m, k, m, kSlices, second, tokens,
+      return dispatch<8>(w, w_up, limit, x, y, m, k, m, slices, second, tokens,
                          split, stream);
     case HY4_TYPE_Q4_K:
-      return dispatch<12>(w, w_up, limit, x, y, m, k, m, kSlices, second,
-                          tokens, split, stream);
+      return dispatch<12>(w, w_up, limit, x, y, m, k, m, slices, second, tokens,
+                          split, stream);
     case HY4_TYPE_Q6_K:
-      return dispatch<14>(w, w_up, limit, x, y, m, k, m, kSlices, second,
-                          tokens, split, stream);
+      return dispatch<14>(w, w_up, limit, x, y, m, k, m, slices, second, tokens,
+                          split, stream);
     default:
       return 1;
   }
