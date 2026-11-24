@@ -275,10 +275,10 @@ __device__ __forceinline__ float finite_or_zero(float v) {
  * 16-token tiles of activations staged through LDS. Thread `tid` stages
  * kPer values of token row `st` at offset kPer sh of each stage from xs
  * (null: the row is past the batch and stays unstaged). */
-template<typename F, int kTiles, typename X>
+template<typename F, int kTiles, typename X, int kBlockThreads = kThreads>
 struct KLoop {
   static constexpr int kTok = 16 * kTiles;
-  static constexpr int kPer = kStageK * kTok / kThreads;
+  static constexpr int kPer = kStageK * kTok / kBlockThreads;
   static constexpr int kVec = kPer * sizeof(X) / 16;  // 16-byte loads per stage
   /* Wide formats hold more weight bytes per lane; a shorter ring keeps the
    * register count down. */
@@ -533,6 +533,101 @@ DenseChunks dense_chunks(uint64_t block_bytes, uint64_t tile_bytes,
   return {blocks, 1};
 }
 
+/* Narrow-N dense kernel for 1..64 remaining tokens: 4 waves (64 weight rows)
+ * per block for 4x more workgroups across the CUs, smaller LDS activation
+ * staging (9-18 KiB), and 2 or 4 16-token accumulator tiles instead of 8. */
+constexpr int kNarrowWaves = 4;
+constexpr int kNarrowThreads = kNarrowWaves * 32;  // 128
+constexpr int kNarrowRows = kNarrowWaves * 16;     // 64
+
+template<typename F, int kTiles, typename X, typename Y>
+__global__ __launch_bounds__(kNarrowThreads) void dense_f16_narrow_kernel(
+    const uint8_t* __restrict__ w, const X* __restrict__ x, Y* __restrict__ out,
+    uint32_t m, uint32_t n, uint32_t k, uint32_t groups, uint32_t t0,
+    const uint8_t* __restrict__ w2, Y* __restrict__ out2, uint32_t m2,
+    const float* __restrict__ gate) {
+  constexpr int kTok = 16 * kTiles;
+  __shared__ __attribute__((aligned(16))) _Float16 act[2 * kTok * kPitch];
+  const int tid = threadIdx.x, wave = tid / 32, lane = tid % 32, h = lane / 16;
+  const uint64_t row_bytes = (uint64_t)k / 256 * F::kBlockBytes;
+  const uint32_t z = blockIdx.x % groups;
+  uint32_t block = blockIdx.x / groups;
+  const uint32_t blocks1 = (m + kNarrowRows - 1) / kNarrowRows;
+  if (block >= blocks1) {
+    block -= blocks1;
+    w = w2;
+    out = out2;
+    m = m2;
+  }
+  const uint32_t row0 = block * kNarrowRows + wave * 16;
+  const uint32_t row = min(row0 + lane % 16, m - 1);
+  const uint8_t* wr = w + ((uint64_t)z * m + row) * row_bytes;
+  const uint32_t rows16 = (n - t0 + 15) / 16;
+  const int live = (int)(rows16 < kTiles ? rows16 : kTiles);
+  const uint64_t x_stride = (uint64_t)groups * k;
+  using L = KLoop<F, kTiles, X, kNarrowThreads>;
+  const uint32_t st = tid % kTok, sh = tid / kTok;
+  const X* xs = t0 + st < n
+                    ? x + (t0 + st) * x_stride + (uint64_t)z * k + L::kPer * sh
+                    : nullptr;
+
+  float8 acc[kTiles];
+#pragma unroll
+  for (int t = 0; t < kTiles; ++t)
+    acc[t] = float8{};
+  L::run(act, wr, xs, k, live, acc);
+
+  float* stage = reinterpret_cast<float*>(act);  // [16 tokens][kNarrowRows + 4]
+  constexpr int kStagePitch = kNarrowRows + 4;
+  static_assert(16 * kStagePitch * 4 <= sizeof(act));
+  const uint32_t valid = min((uint32_t)kNarrowRows, m - block * kNarrowRows);
+  const uint64_t out_stride = (uint64_t)groups * m;
+  const uint32_t s_token = tid / 8, s_col = (tid % 8) * 8;
+#pragma unroll
+  for (int t = 0; t < kTiles; ++t) {
+    if (t >= live)
+      break;
+    __syncthreads();
+#pragma unroll
+    for (int e = 0; e < 8; ++e)
+      stage[(lane % 16) * kStagePitch + wave * 16 + 2 * e + h] = acc[t][e];
+    __syncthreads();
+    const uint32_t token = t0 + t * 16 + s_token;
+    if (token < n && s_col < valid) {
+      const float4 lo = *reinterpret_cast<const float4*>(
+          stage + s_token * kStagePitch + s_col);
+      const float4 hi = *reinterpret_cast<const float4*>(
+          stage + s_token * kStagePitch + s_col + 4);
+      const uint64_t at =
+          token * out_stride + (uint64_t)z * m + block * kNarrowRows + s_col;
+      Y* o = out + at;
+      float v[8] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+      if (gate) {
+        const float4 g0 = *reinterpret_cast<const float4*>(gate + at);
+        const float4 g1 = *reinterpret_cast<const float4*>(gate + at + 4);
+        const float g[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          v[i] *= 1.0f / (1.0f + __builtin_expf(-g[i]));
+      }
+      if constexpr (sizeof(Y) == 4) {
+        *reinterpret_cast<float4*>(o) =
+            float4{finite_or_zero(v[0]), finite_or_zero(v[1]),
+                   finite_or_zero(v[2]), finite_or_zero(v[3])};
+        *reinterpret_cast<float4*>(o + 4) =
+            float4{finite_or_zero(v[4]), finite_or_zero(v[5]),
+                   finite_or_zero(v[6]), finite_or_zero(v[7])};
+      } else {
+        half8 hv;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          hv[i] = (_Float16)finite_or_zero(v[i]);
+        *reinterpret_cast<half8*>(o) = hv;
+      }
+    }
+  }
+}
+
 template<typename F, typename X, typename Y>
 int dense_launch(const DenseArgs& a, hipStream_t stream) {
   const auto* xt = static_cast<const X*>(a.x);
@@ -549,11 +644,26 @@ int dense_launch(const DenseArgs& a, hipStream_t stream) {
             a.w, xt, yt, a.m, a.n, a.k, a.groups, 0, a.w2, y2, a.m2, blocks,
             full, std::min(c.rows, blocks), std::min(c.tiles, full), a.gate);
   }
-  if (a.n % kTile)
-    dense_f16_kernel<F, false, X, Y>
-        <<<dim3(blocks * a.groups), kThreads, 0, stream>>>(
-            a.w, xt, yt, a.m, a.n, a.k, a.groups, full, a.w2, y2, a.m2, blocks,
-            1, blocks, 1, a.gate);
+  const uint32_t rem = a.n % kTile;
+  if (rem > 0) {
+    const uint32_t t0 = full * kTile;
+    const uint32_t nblocks = (a.m + kNarrowRows - 1) / kNarrowRows +
+                             (a.m2 + kNarrowRows - 1) / kNarrowRows;
+    if (rem <= 32) {
+      dense_f16_narrow_kernel<F, 2, X, Y>
+          <<<dim3(nblocks * a.groups), kNarrowThreads, 0, stream>>>(
+              a.w, xt, yt, a.m, a.n, a.k, a.groups, t0, a.w2, y2, a.m2, a.gate);
+    } else if (rem <= 64) {
+      dense_f16_narrow_kernel<F, 4, X, Y>
+          <<<dim3(nblocks * a.groups), kNarrowThreads, 0, stream>>>(
+              a.w, xt, yt, a.m, a.n, a.k, a.groups, t0, a.w2, y2, a.m2, a.gate);
+    } else {
+      dense_f16_kernel<F, false, X, Y>
+          <<<dim3(blocks * a.groups), kThreads, 0, stream>>>(
+              a.w, xt, yt, a.m, a.n, a.k, a.groups, full, a.w2, y2, a.m2,
+              blocks, 1, blocks, 1, a.gate);
+    }
+  }
   return hipGetLastError() == hipSuccess ? 0 : 1;
 }
 
