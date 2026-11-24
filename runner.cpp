@@ -874,13 +874,19 @@ private:
     const auto& proposals = plan.proposals;
     std::uint32_t kept = 1;
     for (std::uint32_t i = 0; i < proposals.size(); ++i) {
-      const auto logits = session.PassLogits(i);
-      const auto token = static_cast<std::int32_t>(work.Sample(logits));
+      std::int32_t token = 0;
+      std::optional<sampling::TokenLogprobs> logprobs;
+      if (!TryDeviceSample(session, i, work, &token)) {
+        const auto logits = session.PassLogits(i);
+        token = static_cast<std::int32_t>(work.Sample(logits));
+        logprobs = sampling::CollectLogprobs(
+            logits, static_cast<TextRunnerToken>(token),
+            sampler.config().logprobs);
+      }
       if (token != proposals[i]) {
         work.DeferSample(static_cast<sampling::TokenId>(token));
         break;
       }
-      auto logprobs = sampling::CollectLogprobs(logits, static_cast<TextRunnerToken>(token), sampler.config().logprobs);
       if (hy4.stop_at_eos() && IsStopToken(token)) {
         step.stop = true;
         step.terminal_logprobs = std::move(logprobs);
@@ -971,16 +977,87 @@ private:
     return copies->empty() ? Lookup::Match{} : match;
   }
 
+  // Device-side sampling without downloading logits: handles deferred draws,
+  // forced tokens, unmodified/grammar-compatible argmax, cached-mask greedy
+  // and plain or grammar-constrained softmax draws. Returns false when host
+  // logits are required (logprobs, filters, penalties, uncached grammar state
+  // or degenerate softmax).
+  static bool TryDeviceSample(const Session& session,
+                              std::optional<std::uint32_t> row,
+                              sampling::SamplerState& sampler,
+                              std::int32_t* out_token) {
+    const auto& cfg = sampler.config();
+    if (cfg.logprobs)
+      return false;
+    const auto saved = sampler.SaveDrawState();
+    if (saved.pending) {
+      sampler.RestoreDrawState({saved.rng, std::nullopt});
+      *out_token = static_cast<std::int32_t>(*saved.pending);
+      return true;
+    }
+    if (const auto forced = sampler.ForcedToken()) {
+      *out_token = static_cast<std::int32_t>(*forced);
+      return true;
+    }
+    const auto argmax = row ? session.Argmax(*row) : session.LastArgmax();
+    if (argmax &&
+        sampler.CanSelectArgmax(static_cast<sampling::TokenId>(*argmax))) {
+      *out_token = *argmax;
+      return true;
+    }
+    if (cfg.can_use_unmodified_argmax() && !cfg.penalties_enabled() &&
+        sampler.NeedsConstraintMask()) {
+      const auto mask = sampler.CachedConstraintBitmask();
+      if (!mask || !mask->restricts)
+        return false;
+      const auto nwords = static_cast<std::uint32_t>(mask->words.size());
+      return row ? session.DeviceSample(*row, mask->words.data(), nwords, 0.0f,
+                                        0.0, out_token)
+                 : session.DeviceSampleLast(mask->words.data(), nwords, 0.0f,
+                                            0.0, out_token);
+    }
+    const bool plain = cfg.temperature > 0.0f && cfg.top_k == 0 &&
+                       cfg.top_p == 1.0f && cfg.min_p <= 0.0f &&
+                       !cfg.penalties_enabled();
+    if (!plain)
+      return false;
+    std::shared_ptr<const sampling::TokenBitmask> mask;
+    if (sampler.NeedsConstraintMask()) {
+      mask = sampler.CachedConstraintBitmask();
+      if (!mask || !mask->restricts)
+        return false;
+    }
+    const double u = sampler.Uniform();
+    const std::uint32_t* words = mask ? mask->words.data() : nullptr;
+    const std::uint32_t nwords =
+        mask ? static_cast<std::uint32_t>(mask->words.size()) : 0;
+    const bool ok = row ? session.DeviceSample(*row, words, nwords,
+                                               cfg.temperature, u, out_token)
+                        : session.DeviceSampleLast(
+                              words, nwords, cfg.temperature, u, out_token);
+    if (ok)
+      return true;
+    sampler.RestoreDrawState(saved);
+    return false;
+  }
+
   TextDecodeSelection Select(Hy4TextRunnerState& hy4, sampling::SamplerState& sampler) const {
-    const auto& logits = hy4.session().LastLogits();
-    if (logits.size() != model_->config().n_vocab) throw std::runtime_error("Hy4 token selection has no logits");
-    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    std::int32_t token = 0;
+    std::optional<sampling::TokenLogprobs> logprobs;
+    if (!TryDeviceSample(hy4.session(), std::nullopt, sampler, &token)) {
+      const auto& logits = hy4.session().LastLogits();
+      if (logits.size() != model_->config().n_vocab)
+        throw std::runtime_error("Hy4 token selection has no logits");
+      token = static_cast<std::int32_t>(sampler.Sample(logits));
+      logprobs =
+          sampling::CollectLogprobs(logits, static_cast<TextRunnerToken>(token),
+                                    sampler.config().logprobs);
+    }
     const bool stop = hy4.stop_at_eos() && IsStopToken(token);
     return {.stop = stop,
             .token = static_cast<TextRunnerToken>(token),
             .piece = stop ? std::string{} : DecodeToken(token),
-            .logprobs = sampling::CollectLogprobs(logits, static_cast<TextRunnerToken>(token),
-                                                  sampler.config().logprobs)};
+            .logprobs = std::move(logprobs)};
   }
 
   std::shared_ptr<Model> model_;

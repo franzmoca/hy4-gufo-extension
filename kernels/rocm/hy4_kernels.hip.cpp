@@ -1998,6 +1998,331 @@ __global__ void ArgmaxRows(const float* x, const int32_t* idx, uint32_t count,
   out_i[blockIdx.x] = id;
 }
 
+// Batched finite argmax over `rows` rows of [dim] floats (blockIdx.y = row).
+__device__ __forceinline__ bool SampleBetter(float v, int32_t a, float best,
+                                             int32_t best_a) {
+  return a >= 0 && (best_a < 0 || v > best || (v == best && a < best_a));
+}
+
+__global__ void ArgmaxBatchPass1(const float* x, uint32_t dim, uint32_t chunk,
+                                 float* part_v, int32_t* part_i) {
+  __shared__ float sv[kBlock / 32];
+  __shared__ int32_t si[kBlock / 32];
+  const uint32_t row = blockIdx.y;
+  const float* xr = x + (uint64_t)row * dim;
+  float v = -INFINITY;
+  int32_t id = -1;
+  const uint32_t lo = blockIdx.x * chunk, hi = min(dim, lo + chunk);
+  for (uint32_t i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+    const float e = xr[i];
+    if (isfinite(e) && SampleBetter(e, (int32_t)i, v, id)) {
+      v = e;
+      id = (int32_t)i;
+    }
+  }
+  for (int o = warpSize / 2; o > 0; o >>= 1) {
+    const float ov = __shfl_xor(v, o);
+    const int32_t oi = __shfl_xor(id, o);
+    if (SampleBetter(ov, oi, v, id)) {
+      v = ov;
+      id = oi;
+    }
+  }
+  const int lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
+  if (lane == 0) {
+    sv[warp] = v;
+    si[warp] = id;
+  }
+  __syncthreads();
+  if (threadIdx.x != 0)
+    return;
+  for (int w = 1; w < (int)((blockDim.x + warpSize - 1) / warpSize); ++w)
+    if (SampleBetter(sv[w], si[w], v, id)) {
+      v = sv[w];
+      id = si[w];
+    }
+  part_v[(uint64_t)row * kArgBlocks + blockIdx.x] = v;
+  part_i[(uint64_t)row * kArgBlocks + blockIdx.x] = id;
+}
+
+__global__ void ArgmaxBatchPass2(const float* part_v, const int32_t* part_i,
+                                 int32_t* out) {
+  const uint32_t row = blockIdx.x;
+  const float* pv = part_v + (uint64_t)row * kArgBlocks;
+  const int32_t* pi = part_i + (uint64_t)row * kArgBlocks;
+  float v = -INFINITY;
+  int32_t id = -1;
+  for (uint32_t i = threadIdx.x; i < kArgBlocks; i += blockDim.x) {
+    if (SampleBetter(pv[i], pi[i], v, id)) {
+      v = pv[i];
+      id = pi[i];
+    }
+  }
+  for (int o = warpSize / 2; o > 0; o >>= 1) {
+    const float ov = __shfl_xor(v, o);
+    const int32_t oi = __shfl_xor(id, o);
+    if (SampleBetter(ov, oi, v, id)) {
+      v = ov;
+      id = oi;
+    }
+  }
+  __shared__ float sv[kBlock / 32];
+  __shared__ int32_t si[kBlock / 32];
+  const int lane = threadIdx.x % warpSize, warp = threadIdx.x / warpSize;
+  if (lane == 0) {
+    sv[warp] = v;
+    si[warp] = id;
+  }
+  __syncthreads();
+  if (threadIdx.x != 0)
+    return;
+  for (int w = 1; w < (int)((blockDim.x + warpSize - 1) / warpSize); ++w)
+    if (SampleBetter(sv[w], si[w], v, id)) {
+      v = sv[w];
+      id = si[w];
+    }
+  out[row] = id;
+}
+
+// Exact device sampling on one logit row, adapted from ds41-gufo-extension
+// (ds41_v41_sample_row, E131).
+constexpr uint32_t kSampleBlocks = 128, kSampleThreads = 256, kSamplePer = 8;
+constexpr double kSampleTiny = 1e-300;
+
+struct SampleScratch {
+  hy4_sample_result result;
+  float max[kSampleBlocks];
+  int32_t arg[kSampleBlocks];
+  int32_t big[kSampleBlocks];
+  double sum[kSampleBlocks];
+  float raw_max[kSampleBlocks];
+  int32_t raw_arg[kSampleBlocks];
+};
+static_assert(sizeof(SampleScratch) <= HY4_SAMPLE_SCRATCH_BYTES);
+
+__device__ __forceinline__ float SampleLogit(const float* logits,
+                                             const uint32_t* mask, uint32_t i) {
+  return !mask || ((mask[i >> 5] >> (i & 31)) & 1u) ? logits[i] : -INFINITY;
+}
+
+__device__ void SampleSpan(uint32_t n, uint32_t b, uint32_t* lo, uint32_t* hi) {
+  const uint32_t span = (n + kSampleBlocks - 1) / kSampleBlocks;
+  *lo = min(n, b * span);
+  *hi = min(n, *lo + span);
+}
+
+__global__ void __launch_bounds__(kSampleThreads)
+    SampleMaxKernel(const float* logits, const uint32_t* mask, uint32_t n,
+                    SampleScratch* s) {
+  __shared__ float sv[kSampleThreads], rv[kSampleThreads];
+  __shared__ int32_t sa[kSampleThreads], ra[kSampleThreads];
+  uint32_t lo, hi;
+  SampleSpan(n, blockIdx.x, &lo, &hi);
+  float v = -INFINITY, w = -INFINITY;
+  int32_t a = -1, b = -1;
+  for (uint32_t i = lo + threadIdx.x; i < hi; i += kSampleThreads) {
+    const float x = logits[i];
+    if (!isfinite(x))
+      continue;
+    if (SampleBetter(x, (int32_t)i, w, b))
+      w = x, b = (int32_t)i;
+    if (isfinite(SampleLogit(logits, mask, i)) &&
+        SampleBetter(x, (int32_t)i, v, a))
+      v = x, a = (int32_t)i;
+  }
+  sv[threadIdx.x] = v;
+  sa[threadIdx.x] = a;
+  rv[threadIdx.x] = w;
+  ra[threadIdx.x] = b;
+  __syncthreads();
+  for (uint32_t o = kSampleThreads / 2; o > 0; o >>= 1) {
+    if (threadIdx.x < o &&
+        SampleBetter(sv[threadIdx.x + o], sa[threadIdx.x + o], sv[threadIdx.x],
+                     sa[threadIdx.x]))
+      sv[threadIdx.x] = sv[threadIdx.x + o],
+      sa[threadIdx.x] = sa[threadIdx.x + o];
+    if (threadIdx.x < o &&
+        SampleBetter(rv[threadIdx.x + o], ra[threadIdx.x + o], rv[threadIdx.x],
+                     ra[threadIdx.x]))
+      rv[threadIdx.x] = rv[threadIdx.x + o],
+      ra[threadIdx.x] = ra[threadIdx.x + o];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    s->max[blockIdx.x] = sv[0];
+    s->arg[blockIdx.x] = sa[0];
+    s->raw_max[blockIdx.x] = rv[0];
+    s->raw_arg[blockIdx.x] = ra[0];
+  }
+}
+
+__device__ void SampleGlobalMax(const float* max, const int32_t* arg, float* v,
+                                int32_t* a) {
+  *v = -INFINITY;
+  *a = -1;
+  for (uint32_t b = 0; b < kSampleBlocks; ++b)
+    if (SampleBetter(max[b], arg[b], *v, *a))
+      *v = max[b], *a = arg[b];
+}
+
+__global__ void SampleArgmaxFinishKernel(const uint32_t* mask,
+                                         SampleScratch* s) {
+  if (threadIdx.x != 0)
+    return;
+  hy4_sample_result r{-1, 0, -1};
+  float mx;
+  int32_t arg;
+  SampleGlobalMax(s->max, s->arg, &mx, &arg);
+  r.token = arg;
+  r.degenerate = arg < 0 ? 1 : 0;
+  r.argmax = arg;
+  if (mask) {
+    float raw;
+    SampleGlobalMax(s->raw_max, s->raw_arg, &raw, &r.argmax);
+  }
+  s->result = r;
+}
+
+__device__ __forceinline__ double SampleTerm(float x, double mx, double t) {
+  return isfinite(x) ? exp(((double)x - mx) / t) : 0.0;
+}
+
+__global__ void __launch_bounds__(kSampleThreads)
+    SampleSumKernel(const float* logits, const uint32_t* mask, uint32_t n,
+                    float temperature, SampleScratch* s) {
+  __shared__ double ss[kSampleThreads];
+  __shared__ int32_t sb[kSampleThreads];
+  __shared__ float smax;
+  if (threadIdx.x == 0) {
+    int32_t a;
+    SampleGlobalMax(s->max, s->arg, &smax, &a);
+  }
+  __syncthreads();
+  uint32_t lo, hi;
+  SampleSpan(n, blockIdx.x, &lo, &hi);
+  const double mx = smax, t = temperature;
+  double sum = 0.0;
+  int32_t big = 0;
+  if (isfinite(smax)) {
+    for (uint32_t i = lo + threadIdx.x; i < hi; i += kSampleThreads) {
+      const double e = SampleTerm(SampleLogit(logits, mask, i), mx, t);
+      sum += e;
+      big += e > kSampleTiny;
+    }
+  }
+  ss[threadIdx.x] = sum;
+  sb[threadIdx.x] = big;
+  __syncthreads();
+  for (uint32_t o = kSampleThreads / 2; o > 0; o >>= 1) {
+    if (threadIdx.x < o) {
+      ss[threadIdx.x] += ss[threadIdx.x + o];
+      sb[threadIdx.x] += sb[threadIdx.x + o];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    s->sum[blockIdx.x] = ss[0];
+    s->big[blockIdx.x] = sb[0];
+  }
+}
+
+__global__ void __launch_bounds__(kSampleThreads)
+    SamplePickKernel(const float* logits, const uint32_t* mask, uint32_t n,
+                     float temperature, double u, SampleScratch* s) {
+  __shared__ double scan[kSampleThreads];
+  __shared__ double sh_total, sh_start;
+  __shared__ float sh_max;
+  __shared__ int32_t sh_owner, sh_found, sh_last, sh_done;
+  if (threadIdx.x == 0) {
+    hy4_sample_result r{-1, 0, -1};
+    int32_t arg;
+    SampleGlobalMax(s->max, s->arg, &sh_max, &arg);
+    r.argmax = arg;
+    if (mask) {
+      float raw;
+      SampleGlobalMax(s->raw_max, s->raw_arg, &raw, &r.argmax);
+    }
+    double total = 0.0;
+    int32_t big = 0;
+    for (uint32_t b = 0; b < kSampleBlocks; ++b) {
+      total += s->sum[b];
+      big += s->big[b];
+    }
+    sh_done = 1;
+    sh_total = total;
+    if (arg < 0 || !(total > 0.0) || big < 2) {
+      r.degenerate = 1;
+    } else {
+      sh_done = 0;
+      double left = u;
+      int32_t owner = -1, last = -1;
+      for (uint32_t b = 0; b < kSampleBlocks; ++b) {
+        const double w = s->sum[b] / total;
+        if (!(w > 0.0))
+          continue;
+        last = (int32_t)b;
+        if (left - w < 0.0) {
+          owner = (int32_t)b;
+          break;
+        }
+        left -= w;
+      }
+      sh_owner = owner >= 0 ? owner : last;
+      sh_start = owner >= 0 ? left : INFINITY;
+      if (sh_owner < 0)
+        r.degenerate = sh_done = 1;
+    }
+    s->result = r;
+  }
+  __syncthreads();
+  if (sh_done)
+    return;
+  uint32_t lo, hi;
+  SampleSpan(n, (uint32_t)sh_owner, &lo, &hi);
+  const double mx = sh_max, t = temperature, total = sh_total;
+  const uint32_t first = lo + threadIdx.x * kSamplePer;
+  double run[kSamplePer];
+  double local = 0.0;
+#pragma unroll
+  for (uint32_t j = 0; j < kSamplePer; ++j) {
+    const uint32_t idx = first + j;
+    run[j] = idx < hi
+                 ? SampleTerm(SampleLogit(logits, mask, idx), mx, t) / total
+                 : 0.0;
+    local += run[j];
+  }
+  scan[threadIdx.x] = local;
+  if (threadIdx.x == 0) {
+    sh_found = INT32_MAX;
+    sh_last = -1;
+  }
+  __syncthreads();
+  for (uint32_t o = 1; o < kSampleThreads; o <<= 1) {
+    const double add = threadIdx.x >= o ? scan[threadIdx.x - o] : 0.0;
+    __syncthreads();
+    scan[threadIdx.x] += add;
+    __syncthreads();
+  }
+  double left = sh_start - (scan[threadIdx.x] - local);
+  int32_t found = -1, last = -1;
+#pragma unroll
+  for (uint32_t j = 0; j < kSamplePer; ++j) {
+    if (!(run[j] > 0.0))
+      continue;
+    last = (int32_t)(first + j);
+    left -= run[j];
+    if (found < 0 && left < 0.0)
+      found = (int32_t)(first + j);
+  }
+  if (found >= 0)
+    atomicMin(&sh_found, found);
+  if (last >= 0)
+    atomicMax(&sh_last, last);
+  __syncthreads();
+  if (threadIdx.x == 0)
+    s->result.token = sh_found != INT32_MAX ? sh_found : sh_last;
+}
+
 // Q8_0 blocks of 32 binary16 values: d = max |v| / 127, q = round(v / d).
 __global__ void QuantizeQ8Half(const _Float16* src, BlockQ8_0* dst,
                                uint64_t blocks) {
@@ -3071,6 +3396,50 @@ int hy4_argmax(const float* x, uint32_t dim, float* work, int32_t* out,
                                                 part_i);
   ArgmaxRows<<<1, kBlock, 0, stream>>>(part_v, part_i, kArgBlocks, kArgBlocks,
                                        part_v + 2 * kArgBlocks, out);
+  return Status();
+}
+
+uint64_t hy4_argmax_work_floats_batch(uint32_t rows) {
+  return 2ull * rows * kArgBlocks;
+}
+
+int hy4_argmax_rows(const float* x, uint32_t rows, uint32_t dim, float* work,
+                    int32_t* out, hipStream_t stream) {
+  if (rows == 0)
+    return 0;
+  if (dim == 0)
+    return 1;
+  float* part_v = work;
+  int32_t* part_i =
+      reinterpret_cast<int32_t*>(work + (uint64_t)rows * kArgBlocks);
+  const uint32_t chunk = (dim + kArgBlocks - 1) / kArgBlocks;
+  ArgmaxBatchPass1<<<dim3(kArgBlocks, rows), kBlock, 0, stream>>>(
+      x, dim, chunk, part_v, part_i);
+  ArgmaxBatchPass2<<<rows, kBlock, 0, stream>>>(part_v, part_i, out);
+  return Status();
+}
+
+int hy4_sample_row(const float* logits, uint32_t dim, const uint32_t* mask,
+                   float temperature, double u, void* scratch,
+                   struct hy4_sample_result* out, hipStream_t stream) {
+  if (!logits || !scratch || !out || dim == 0 ||
+      dim > kSampleBlocks * kSampleThreads * kSamplePer)
+    return 1;
+  auto* s = static_cast<SampleScratch*>(scratch);
+  SampleMaxKernel<<<kSampleBlocks, kSampleThreads, 0, stream>>>(logits, mask,
+                                                                dim, s);
+  if (temperature <= 0.0f) {
+    SampleArgmaxFinishKernel<<<1, 1, 0, stream>>>(mask, s);
+  } else {
+    SampleSumKernel<<<kSampleBlocks, kSampleThreads, 0, stream>>>(
+        logits, mask, dim, temperature, s);
+    SamplePickKernel<<<1, kSampleThreads, 0, stream>>>(logits, mask, dim,
+                                                       temperature, u, s);
+  }
+  if (hipMemcpyAsync(out, &s->result, sizeof(*out), hipMemcpyDeviceToHost,
+                     stream) != hipSuccess ||
+      hipStreamSynchronize(stream) != hipSuccess)
+    return 1;
   return Status();
 }
 

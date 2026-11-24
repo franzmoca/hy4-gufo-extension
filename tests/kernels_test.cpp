@@ -2316,6 +2316,117 @@ void TestQuantizeQ4K() {
   Expect(rms_err(deq_grid, grid_ref) < 1e-3, "quantize_q4_k grid round-trip");
 }
 
+void TestSampleAndArgmaxBatch() {
+  const uint32_t rows = 5, dim = 4099;
+  std::vector<float> x(rows * dim);
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<float> dist(-5.0f, 5.0f);
+  for (float& v : x)
+    v = dist(rng);
+  // Plant ties, NaNs, infinities, and known winners.
+  x[0 * dim + 100] = 9.0f;
+  x[0 * dim + 200] = 9.0f;  // lower index 100 wins
+  x[0 * dim + 300] = std::numeric_limits<float>::quiet_NaN();
+  x[0 * dim + 400] = std::numeric_limits<float>::infinity();
+  x[1 * dim + 4098] = 12.0f;
+  for (uint32_t i = 0; i < dim; ++i)
+    x[2 * dim + i] =
+        std::numeric_limits<float>::quiet_NaN();  // no finite -> -1
+
+  float* dx = Device(x);
+  float* work = Device(std::vector<float>(hy4_argmax_work_floats_batch(rows)));
+  int32_t* dout = Device(std::vector<int32_t>(rows, -99));
+  Expect(hy4_argmax_rows(dx, rows, dim, work, dout, nullptr) == 0,
+         "argmax_rows status");
+  const auto got = Host(dout, rows);
+  Expect(got[0] == 100, "argmax_rows tie and non-finite");
+  Expect(got[1] == 4098, "argmax_rows tail");
+  Expect(got[2] == -1, "argmax_rows all NaN");
+  for (uint32_t r = 3; r < rows; ++r) {
+    int32_t ref = -1;
+    float best = -INFINITY;
+    for (uint32_t i = 0; i < dim; ++i) {
+      const float v = x[r * dim + i];
+      if (std::isfinite(v) && (ref < 0 || v > best)) {
+        best = v;
+        ref = static_cast<int32_t>(i);
+      }
+    }
+    Expect(got[r] == ref, "argmax_rows random");
+  }
+
+  // Device sampling: unmasked softmax, masked softmax, and masked greedy.
+  void* scratch = Device(std::vector<uint8_t>(HY4_SAMPLE_SCRATCH_BYTES));
+  const uint32_t nwords = (dim + 31) / 32;
+  std::vector<uint32_t> mask(nwords, 0);
+  // Admit only tokens 7, 1001, 2500, 4097 (excludes raw argmax 100 and 200).
+  const uint32_t allowed[] = {7, 1001, 2500, 4097};
+  for (uint32_t a : allowed)
+    mask[a >> 5] |= 1u << (a & 31);
+  x[0 * dim + 7] = 1.0f;
+  x[0 * dim + 1001] = 4.0f;
+  x[0 * dim + 2500] = 2.0f;
+  x[0 * dim + 4097] = 3.0f;
+  (void)hipMemcpy(dx, x.data(), dim * sizeof(float), hipMemcpyHostToDevice);
+  uint32_t* dmask = Device(mask);
+
+  hy4_sample_result res{};
+  // Masked greedy (temperature == 0).
+  Expect(hy4_sample_row(dx, dim, dmask, 0.0f, 0.0, scratch, &res, nullptr) == 0,
+         "sample_row masked greedy status");
+  Expect(res.degenerate == 0 && res.token == 1001 && res.argmax == 100,
+         "sample_row masked greedy winner and raw argmax");
+
+  // Masked softmax: verify cumulative distribution against FP64 host reference.
+  const float temp = 0.8f;
+  const double mx = 4.0;
+  double wts[4], total = 0.0;
+  for (int k = 0; k < 4; ++k) {
+    wts[k] = std::exp((static_cast<double>(x[allowed[k]]) - mx) / temp);
+    total += wts[k];
+  }
+  double cdf = 0.0;
+  for (int k = 0; k < 4; ++k) {
+    const double mid = (cdf + 0.5 * wts[k]) / total;
+    Expect(
+        hy4_sample_row(dx, dim, dmask, temp, mid, scratch, &res, nullptr) == 0,
+        "sample_row masked softmax status");
+    Expect(res.degenerate == 0 && res.token == static_cast<int32_t>(allowed[k]),
+           "sample_row masked softmax bin");
+    cdf += wts[k];
+  }
+
+  // Unmasked softmax on row 3.
+  double mx3 = -INFINITY;
+  for (uint32_t i = 0; i < dim; ++i)
+    mx3 = std::max<double>(mx3, x[3 * dim + i]);
+  double sum3 = 0.0;
+  for (uint32_t i = 0; i < dim; ++i)
+    sum3 += std::exp((static_cast<double>(x[3 * dim + i]) - mx3) / temp);
+  for (double u : {0.01, 0.25, 0.5, 0.75, 0.99}) {
+    double left = u * sum3;
+    int32_t ref_tok = static_cast<int32_t>(dim - 1);
+    for (uint32_t i = 0; i < dim; ++i) {
+      left -= std::exp((static_cast<double>(x[3 * dim + i]) - mx3) / temp);
+      if (left < 0.0) {
+        ref_tok = static_cast<int32_t>(i);
+        break;
+      }
+    }
+    Expect(hy4_sample_row(dx + 3 * dim, dim, nullptr, temp, u, scratch, &res,
+                          nullptr) == 0,
+           "sample_row unmasked softmax status");
+    Expect(res.degenerate == 0 && res.token == ref_tok,
+           "sample_row unmasked softmax exact");
+  }
+
+  // Empty mask -> degenerate.
+  uint32_t* dzero = Device(std::vector<uint32_t>(nwords, 0));
+  Expect(hy4_sample_row(dx, dim, dzero, temp, 0.5, scratch, &res, nullptr) == 0,
+         "sample_row empty mask status");
+  Expect(res.degenerate == 1, "sample_row empty mask degenerate");
+}
+
 int main() {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
@@ -2334,6 +2445,7 @@ int main() {
   TestMlaPrefill();
   TestRows();
   TestArgmax();
+  TestSampleAndArgmaxBatch();
   TestQuantizeHalf();
   TestQuantizeBf16();
   TestQuantizeQ4K();
