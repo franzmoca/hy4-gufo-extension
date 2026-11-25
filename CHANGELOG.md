@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+Built on upstream Gufo `abebd1c0`; needs extension API 0.3.43 or later.
+
+- Decode, speculative decoding, prefill and vision optimizations on `gfx1151`
+  ([E63](docs/EXPERIMENTS.md#e63-shape-aware-gemv-slices-and-16-mib-split-scratch-2026-11-25)
+  to
+  [E75](docs/EXPERIMENTS.md#e75-bit-level-fp8-decode-and-barrett-engram-modulo-2026-11-25)):
+  - **DFly2 drafting & verify:** quantized DFly2's LM head copy and FFN/fusion/correction
+    weights to Q4_K (load-time GPU quantization, 849 MiB resident), fused drafter attention
+    (`hy4_dfly_attention`), added narrow-N FP16 WMMA for multi-session draft batches, and
+    optimized grouped routed-expert GEMV with on-device plans, SGPR base offsets and
+    task-major dispatch. Draft latency drops 28–33% (single-user 7.51 → 5.38 ms on short
+    prompts, 12.06 → 8.67 ms on 3.7K; four-user 14.91 → 9.94 ms); end-to-end DFly2
+    throughput rises +4.6% to +9.4% single-user (32.1 tok/s at 3.7K) and +15.5% to +28.5%
+    at four concurrent users (67.0 tok/s). DFly2 automatically yields to plain AR above
+    five concurrent sessions (`HY4_DFLY_MAX_CONCURRENCY`), keeping prompt-lookup copies
+    active at all widths.
+  - **GPU sampling & decode fusions:** batched device argmax (`hy4_argmax_rows`) and
+    device softmax/masked-greedy sampling (`hy4_sample_row`) keep decode logits on the GPU
+    unless host access is required, with cached grammar bitmasks; five fused decode/drafter
+    kernels and pinned per-pass host metadata cut launch and H2D overhead; decode attention
+    partial splits and scratch are halved.
+  - **Prefill:** 64-query `MlaPrefill64` halves KV DRAM loads on sparse layers and pairs
+    tokens on SWA layers, on-GPU routed-expert planning removes all 41 per-layer syncs,
+    routed down-projection stores are coalesced via LDS `float4`, and Engram prefill
+    lookahead prefetches the next chunk while the current chunk runs.
+  - **Serving & vision:** bumped Gufo pin to `abebd1c0` for SDMA copy-engine prompt-cache
+    restores beside decode and demand-mapped `mem::SessionState` KV/pool regions; vision
+    attention shares K/V tiles in LDS (4× fewer global K/V reads) and folds zero-padding
+    into `AttnPack` (removing 81 `hipMemsetAsync` calls per image).
+  - **Correctness unchanged:** `--passcheck 8`, `--chunkcheck`, and `--batchcheck 6` stay
+    bit-exact (`0.0000` max logit diff), and `--kl-decode` matches baseline identically
+    (KL `0.05142 ± 0.00649`, 94.46% same top, clamped PPL `14.6885`).
 - The AngelSlim Q4_K_M trunk now serves chat, reasoning, tool calls and vision
   correctly. Its 24 suffixed special tokens share the same token IDs as
   Xylolabs and Tencent's public checkpoint (`120000`–`120124`) but carry the
