@@ -189,6 +189,8 @@ private:
   void* blas_ = nullptr;  // hipblasHandle_t
   void* gemv_scratch_ = nullptr;                 // hy4_gemv's, for stream_
   std::unique_ptr<EngramReader> engram_reader_;  // FP8 rows, direct reads
+  // Precomputed Barrett reciprocals floor(2^64 / p) for config_.engram_primes.
+  std::vector<std::uint64_t> engram_prime_inv_;
   std::int32_t image_token_ = -1;
 
   // Scratch for one evaluation of up to MaxChunk() tokens (device unless

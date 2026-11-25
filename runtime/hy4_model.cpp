@@ -26,6 +26,18 @@ namespace {
 
 constexpr std::string_view kEngramTable = "per_layer_token_embd.weight";
 
+// Exact x % d for any uint64_t x and uint32_t d >= 2 using precomputed
+// inv = floor(2^64 / d).
+inline std::uint64_t FastMod64(std::uint64_t x, std::uint32_t d,
+                               std::uint64_t inv) noexcept {
+  const auto q = static_cast<std::uint64_t>(
+      (static_cast<unsigned __int128>(x) * inv) >> 64);
+  std::uint64_t r = x - q * d;
+  if (r >= d)
+    r -= d;
+  return r;
+}
+
 }  // namespace
 
 struct Model::Shards {
@@ -96,6 +108,13 @@ std::unique_ptr<Model> Model::Load(const std::string& trunk_path,
         t->dimensions[1], c.engram_dim, error);
     if (!m->engram_reader_)
       return nullptr;
+    m->engram_prime_inv_.resize(c.engram_primes.size(), 0);
+    for (std::size_t i = 0; i < c.engram_primes.size(); ++i) {
+      if (c.engram_primes[i] >= 2) {
+        m->engram_prime_inv_[i] = static_cast<std::uint64_t>(
+            (static_cast<unsigned __int128>(1) << 64) / c.engram_primes[i]);
+      }
+    }
   }
 
   if (hipStreamCreateWithFlags(&m->stream_, hipStreamNonBlocking) != hipSuccess) {
@@ -258,6 +277,8 @@ void Model::EngramRows(std::span<const std::int32_t> history,
       c.engram_mult.data() + std::size_t{module} * n_gram;
   const std::uint32_t* primes =
       c.engram_primes.data() + std::size_t{module} * cols;
+  const std::uint64_t* pinv =
+      engram_prime_inv_.data() + std::size_t{module} * cols;
   const std::uint32_t* offs =
       c.engram_offsets.data() + std::size_t{module} * cols;
   for (std::uint32_t i = 0; i < n; ++i) {
@@ -275,7 +296,10 @@ void Model::EngramRows(std::span<const std::int32_t> history,
       for (std::uint32_t h = 0; h < n_head; ++h) {
         const std::uint32_t col = (o - 1) * n_head + h;
         const std::size_t at = std::size_t{i} * cols + col;
-        rows[at] = rolling % primes[col] + offs[col];
+        const std::uint64_t rem =
+            pinv[col] ? FastMod64(rolling, primes[col], pinv[col])
+                      : rolling % primes[col];
+        rows[at] = rem + offs[col];
         valid[at] = dead ? 0.0f : 1.0f;
       }
     }
@@ -314,6 +338,8 @@ void Model::EngramRowsLookahead(std::span<const std::int32_t> history,
       c.engram_mult.data() + std::size_t{module} * n_gram;
   const std::uint32_t* primes =
       c.engram_primes.data() + std::size_t{module} * cols;
+  const std::uint64_t* pinv =
+      engram_prime_inv_.data() + std::size_t{module} * cols;
   const std::uint32_t* offs =
       c.engram_offsets.data() + std::size_t{module} * cols;
   for (std::uint32_t i = 0; i < n; ++i) {
@@ -330,7 +356,10 @@ void Model::EngramRowsLookahead(std::span<const std::int32_t> history,
       rolling ^= toks[o] * mult[o];
       for (std::uint32_t h = 0; h < n_head; ++h) {
         const std::uint32_t col = (o - 1) * n_head + h;
-        rows[std::size_t{i} * cols + col] = rolling % primes[col] + offs[col];
+        const std::uint64_t rem =
+            pinv[col] ? FastMod64(rolling, primes[col], pinv[col])
+                      : rolling % primes[col];
+        rows[std::size_t{i} * cols + col] = rem + offs[col];
       }
     }
   }
