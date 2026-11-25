@@ -157,6 +157,13 @@ public:
                   std::span<const std::int32_t> tokens, std::uint32_t pos0,
                   std::uint32_t module, std::uint64_t* rows,
                   float* valid) const;
+  /// Hashes `next_tokens` that follow `cur_tokens` (starting at `pos0`) for
+  /// cross-pass Engram prefetching into EngramReader's cache.
+  void EngramRowsLookahead(std::span<const std::int32_t> history,
+                           std::span<const std::int32_t> cur_tokens,
+                           std::span<const std::int32_t> next_tokens,
+                           std::uint32_t pos0, std::uint32_t module,
+                           std::uint64_t* rows) const;
   /// Reads the FP8 Engram table's rows (EngramRows).
   [[nodiscard]] EngramReader& Engram() const { return *engram_reader_; }
   /// The image row token: Engram treats it as padding, and a session takes

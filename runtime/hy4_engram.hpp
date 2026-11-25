@@ -38,6 +38,9 @@ public:
   [[nodiscard]] std::shared_ptr<Gather> Start(
       std::span<const std::uint64_t> rows, std::uint8_t* out,
       bool urgent = false);
+  /// Queues low-priority background reads of `rows` into the row cache so a
+  /// subsequent Start() hits RAM without blocking on NVMe I/O.
+  void Prefetch(std::span<const std::uint64_t> rows);
   /// Waits for `gather`; false when a read failed.
   [[nodiscard]] bool Wait(Gather& gather);
 

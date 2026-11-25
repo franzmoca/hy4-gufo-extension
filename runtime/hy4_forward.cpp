@@ -772,6 +772,25 @@ bool Session::Evaluate(std::span<const std::int32_t> tokens,
   for (std::size_t i = 0; i < tokens.size(); i += chunk) {
     const std::size_t n = std::min<std::size_t>(chunk, tokens.size() - i);
     const bool last = i + n == tokens.size();
+    // Cross-pass Engram lookahead: warm the next chunk's NVMe rows in the
+    // background cache while the GPU computes the current chunk.
+    if (!last && !model_->config_.engram_layers.empty()) {
+      const std::size_t next_n =
+          std::min<std::size_t>(chunk, tokens.size() - (i + n));
+      const std::uint32_t modules =
+          static_cast<std::uint32_t>(model_->config_.engram_layers.size());
+      const std::uint32_t cols = model_->config_.EngramCols();
+      std::vector<std::uint64_t> lookahead(std::size_t{modules} * next_n *
+                                           cols);
+      const auto cur_span = tokens.subspan(i, n);
+      const auto next_span = tokens.subspan(i + n, next_n);
+      for (std::uint32_t e = 0; e < modules; ++e) {
+        model_->EngramRowsLookahead(
+            history_, cur_span, next_span, Position(), e,
+            lookahead.data() + std::size_t{e} * next_n * cols);
+      }
+      model_->Engram().Prefetch(lookahead);
+    }
     std::vector<float>* want = logits && (all_logits || last) ? &part : nullptr;
     if (!EvaluateChunk(tokens.subspan(i, n), want, all_logits, error)) return false;
     if (want) logits->insert(logits->end(), part.begin(), part.end());
@@ -1798,7 +1817,9 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, ex, error)) return false;
 
   // Router on the full-width input; experts in the latent space.
-  if (!MatVec(l.gate_inp, s.cur, s.logits_r, c.n_expert, c.n_embd, n, ex, error)) return false;
+  if (!MatVec(l.gate_inp, s.cur, s.logits_r, c.n_expert, c.n_embd, n, ex,
+              error))
+    return false;
   HY4_CHECK(hy4_route(s.logits_r, l.exp_bias ? l.exp_bias.f32() : nullptr,
                       s.ids, s.route_w, n, c.n_expert, used,
                       c.expert_norm ? 1 : 0, c.expert_scale, st));
