@@ -52,11 +52,17 @@ public:
   /// share one pass through the drafter's layers and each slot's
   /// correction and LM head, and each session drafts what Draft gives it
   /// alone, up to rounding in the layers' wider matrix products.
+  /// When `total_budget` > 0, total drafted tokens across all sessions in the
+  /// batch are capped at `total_budget`, prioritizing higher-confidence
+  /// sessions when a slot would exceed the budget.
+  /// When `min_accept_first` >= 0, slot 1 uses `min_accept_first` while
+  /// subsequent slots use `min_accept` (negative uses `min_accept` for all).
   [[nodiscard]] bool DraftBatch(
       std::span<const Session* const> sessions,
       std::span<const std::int32_t> anchors,
       std::span<const std::uint32_t> counts, float min_accept,
-      std::span<std::vector<std::int32_t>* const> drafts, std::string* error);
+      std::span<std::vector<std::int32_t>* const> drafts, std::string* error,
+      std::uint32_t total_budget = 0, float min_accept_first = -1.0f);
 
 private:
   struct LayerWeights;
