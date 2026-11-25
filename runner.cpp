@@ -28,6 +28,7 @@
 #include "continuation_adapter.hpp"
 #include "prompt_lookup.hpp"
 #include "runtime/hy4_dfly.hpp"
+#include "runtime/hy4_queued_draw.hpp"
 #include "runtime/hy4_runtime.hpp"
 #include "runtime/hy4_vision.hpp"
 #include "runtime/tokenizer.hpp"
@@ -730,6 +731,15 @@ public:
             }
           }
         }
+      } else {
+        // No verify rows left to draft into: these plans make no DFly2
+        // attempt, so they must not count as a rejected round.
+        const auto now = std::chrono::steady_clock::now();
+        for (DecodePlan* plan : drafting) {
+          plan->draft_count = 0;
+          plan->t0 = now;
+          plan->t1 = now;
+        }
       }
     }
     std::size_t next = 0;
@@ -1054,16 +1064,15 @@ private:
     const auto& cfg = sampler.config();
     if (cfg.logprobs)
       return false;
+    switch (TakeQueuedDraw(sampler, out_token)) {
+      case QueuedDraw::kToken:
+        return true;
+      case QueuedDraw::kHost:
+        return false;
+      case QueuedDraw::kNone:
+        break;
+    }
     const auto saved = sampler.SaveDrawState();
-    if (saved.pending) {
-      sampler.RestoreDrawState({saved.rng, std::nullopt});
-      *out_token = static_cast<std::int32_t>(*saved.pending);
-      return true;
-    }
-    if (const auto forced = sampler.ForcedToken()) {
-      *out_token = static_cast<std::int32_t>(*forced);
-      return true;
-    }
     const auto argmax = row ? session.Argmax(*row) : session.LastArgmax();
     if (argmax &&
         sampler.CanSelectArgmax(static_cast<sampling::TokenId>(*argmax))) {
