@@ -398,6 +398,30 @@ void TestHcDecodeShape(uint32_t hc, uint32_t dim) {
           Expect(Host(p_a, n * hc) == Host(p_b, n * hc),
                  what + " post identical");
           Expect(Host(y_b, n * dim) == y, what + " leaves y");
+          // Batched fused boundary (hy4_hc_post_pre_norm): bit-identical to
+          // hy4_hc_post_pre / hy4_hc_pre + hy4_rms_norm_half (including FP16).
+          uint16_t* oh_a = Device(std::vector<uint16_t>(n * dim));
+          Expect(hy4_rms_norm_half(x_a, dwx, o_a, oh_a, n, dim, dim, eps,
+                                   nullptr) == 0,
+                 what + " norm_half ref status");
+          float *h_c = Device(h), *p_c = Device(post0);
+          float *x_c = Device(std::vector<float>(n * dim)),
+                *o_c = Device(std::vector<float>(n * dim));
+          uint16_t* oh_c = Device(std::vector<uint16_t>(n * dim));
+          Expect(
+              hy4_hc_post_pre_norm(with_y ? y_a : nullptr, p_c, h_c, Device(fn),
+                                   Device(scale), Device(base), x_c, o_c, oh_c,
+                                   dwx, layer ? p_c : nullptr, n, hc, dim, eps,
+                                   hc_eps, magnitude, nullptr) == 0,
+              what + " post_pre_norm status");
+          Expect(Host(h_a, n * flat) == Host(h_c, n * flat),
+                 what + " post_pre_norm streams identical");
+          Expect(Host(o_a, n * dim) == Host(o_c, n * dim),
+                 what + " post_pre_norm f32 identical");
+          Expect(Host(oh_a, n * dim) == Host(oh_c, n * dim),
+                 what + " post_pre_norm f16 identical");
+          Expect(Host(p_a, n * hc) == Host(p_c, n * hc),
+                 what + " post_pre_norm post identical");
         }
 }
 

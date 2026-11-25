@@ -77,6 +77,19 @@ int hy4_hc_post_pre(const float* y, const float* post_prev, float* h,
                     uint32_t dim, float eps, float hc_eps, float magnitude,
                     hipStream_t stream);
 
+/* Batched half-layer boundary: optional hy4_hc_post(y, h, post_prev, h)
+ * folded into HcMixTokens (when y != NULL), followed by fused HcApply +
+ * RmsNorm writing FP32 `out` (optional) and/or binary16 `out_half` (optional)
+ * directly from registers for hc == 4 && dim <= 3072 (avoiding the DRAM
+ * round-trip through x_scratch). Bit-identical to hy4_hc_post_pre /
+ * hy4_hc_pre followed by hy4_rms_norm_half. */
+int hy4_hc_post_pre_norm(const float* y, const float* post_prev, float* h,
+                         const float* fn, const float* scale, const float* base,
+                         float* x_scratch, float* out, uint16_t* out_half,
+                         const float* out_norm, float* post, uint32_t n,
+                         uint32_t hc, uint32_t dim, float eps, float hc_eps,
+                         float magnitude, hipStream_t stream);
+
 /* A decode pass's half-layer boundary in two launches, with the results of
  * hy4_rms_norm(y, y_norm) (in place), hy4_hc_post_pre(y, post_prev, h, fn,
  * scale, base, x, post) and hy4_rms_norm(x, out_norm, out), all with eps, bit

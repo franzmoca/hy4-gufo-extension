@@ -1248,48 +1248,30 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
   }
   HY4_CHECK(hy4_hc_init(s.x, s.h, n, c.hc, c.n_embd, st));
 
-  auto norm_cur = [&](const Tensor& weight) {
-    return batched ? hy4_rms_norm_half(s.x, weight.f32(), s.cur, s.cur_half, n,
-                                       c.n_embd, c.n_embd, c.rms_eps, st)
-                   : hy4_rms_norm(s.x, weight.f32(), s.cur, n, c.n_embd,
-                                  c.n_embd, c.rms_eps, st);
-  };
-
   // A half's hy4_hc_post is deferred into the next pre-mix
-  // (hy4_hc_post_pre) unless something reads h in between. Decode passes
+  // (hy4_hc_post_pre_norm) unless something reads h in between. Decode passes
   // also defer the half's output norm (weight y_norm) and run the boundary,
   // norms included, as hy4_hc_decode.
   bool post_pending = false;
   const float* y_norm = nullptr;
-  auto hc_pre = [&](const Tensor& fn, const Tensor& scale, const Tensor& base,
-                    float* post, float magnitude) {
-    if (!post_pending)
-      return hy4_hc_pre(s.h, fn.f32(), scale.f32(), base.f32(), s.x, post, n,
-                        c.hc, c.n_embd, c.rms_eps, c.hc_eps, magnitude, st);
-    post_pending = false;
-    return hy4_hc_post_pre(s.y, s.post, s.h, fn.f32(), scale.f32(), base.f32(),
-                           s.x, post, n, c.hc, c.n_embd, c.rms_eps, c.hc_eps,
-                           magnitude, st);
-  };
-  // The boundary into a half (or the head): pre-mix into s.x, then s.cur =
-  // rms_norm(s.x, norm).
+  // The boundary into a half (or the head): pre-mix and norm directly into
+  // s.cur / s.cur_half.
   auto boundary = [&](const Tensor& fn, const Tensor& scale, const Tensor& base,
                       float* post, float magnitude, const Tensor& norm,
-                      bool half) {
+                      bool half, bool need_f32 = true) {
+    const float* y = post_pending ? s.y : nullptr;
+    post_pending = false;
     if (!batched) {
-      const float* y = post_pending ? s.y : nullptr;
-      post_pending = false;
       const float* yn = y_norm;
       y_norm = nullptr;
       return hy4_hc_decode(y, yn, s.post, s.h, fn.f32(), scale.f32(),
                            base.f32(), s.x, s.cur, norm.f32(), post, n, c.hc,
                            c.n_embd, c.rms_eps, c.hc_eps, magnitude, st);
     }
-    if (int rc = hc_pre(fn, scale, base, post, magnitude))
-      return rc;
-    return half ? norm_cur(norm)
-                : hy4_rms_norm(s.x, norm.f32(), s.cur, n, c.n_embd, c.n_embd,
-                               c.rms_eps, st);
+    return hy4_hc_post_pre_norm(
+        y, s.post, s.h, fn.f32(), scale.f32(), base.f32(), s.x,
+        need_f32 ? s.cur : nullptr, half ? s.cur_half : nullptr, norm.f32(),
+        post, n, c.hc, c.n_embd, c.rms_eps, c.hc_eps, magnitude, st);
   };
   // A pending post applied now, for something that reads h.
   auto apply_post = [&]() {
@@ -1320,8 +1302,14 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
                                  kEngramEps, st));
     }
 
+    const bool attn_needs_f32 =
+        c.has_indexer[il] || l.wq_a.type == HY4_TYPE_F32 ||
+        l.wq_a.type == HY4_TYPE_BF16 || l.wq_a.type == HY4_TYPE_F16 ||
+        l.wkv_a.type == HY4_TYPE_F32 || l.wkv_a.type == HY4_TYPE_BF16 ||
+        l.wkv_a.type == HY4_TYPE_F16 || l.attn_gate.type == HY4_TYPE_F32 ||
+        l.attn_gate.type == HY4_TYPE_BF16 || l.attn_gate.type == HY4_TYPE_F16;
     HY4_CHECK(boundary(l.hc_attn_fn, l.hc_attn_scale, l.hc_attn_base, s.post,
-                       c.hc_magnitude, l.attn_norm, true));
+                       c.hc_magnitude, l.attn_norm, true, attn_needs_f32));
     if (!Attention(rows, il, n, error))
       return false;
     // Attention normed s.y in batched passes only.
@@ -1329,8 +1317,13 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
     if (!batched)
       y_norm = l.attn_post_norm.f32();
 
+    const bool ffn_needs_f32 =
+        il >= c.n_dense_lead || l.ffn_gate.type == HY4_TYPE_F32 ||
+        l.ffn_gate.type == HY4_TYPE_BF16 || l.ffn_gate.type == HY4_TYPE_F16 ||
+        l.ffn_up.type == HY4_TYPE_F32 || l.ffn_up.type == HY4_TYPE_BF16 ||
+        l.ffn_up.type == HY4_TYPE_F16;
     HY4_CHECK(boundary(l.hc_ffn_fn, l.hc_ffn_scale, l.hc_ffn_base, s.post,
-                       c.hc_magnitude, l.ffn_norm, true));
+                       c.hc_magnitude, l.ffn_norm, true, ffn_needs_f32));
     if (!first.Ffn(il, n, error))
       return false;
     post_pending = true;
