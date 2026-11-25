@@ -1510,10 +1510,84 @@ __global__ void Swiglu(const float* gate, const float* up, const float* route_w,
   }
 }
 
+__global__ void SwigluHalf(const float* gate, const float* up,
+                           const float* route_w, _Float16* y_half, uint32_t dim,
+                           float limit) {
+  const uint32_t r = blockIdx.y;
+  const float rw = route_w ? route_w[r] : 1.0f;
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim;
+       c += gridDim.x * blockDim.x) {
+    float g = gate[(uint64_t)r * dim + c];
+    float u = up[(uint64_t)r * dim + c];
+    if (limit > 0.0f) {
+      g = fminf(g, limit);
+      u = fminf(fmaxf(u, -limit), limit);
+    }
+    float v = Silu(g) * u * rw;
+    asm volatile("" : "+v"(v));
+    y_half[(uint64_t)r * dim + c] = (_Float16)v;
+  }
+}
+
 __global__ void Add(const float* a, const float* b, float* out, uint64_t count) {
   for (uint64_t i = blockIdx.x * (uint64_t)blockDim.x + threadIdx.x; i < count;
        i += (uint64_t)gridDim.x * blockDim.x) {
     out[i] = a[i] + b[i];
+  }
+}
+
+template<uint32_t kPer>
+__global__ void __launch_bounds__(kBlock)
+    AddRmsNormFast(const float* a, const float* b, const float* weight,
+                   float* out, uint32_t dim, float eps) {
+  __shared__ float scratch[32];
+  const uint64_t base = (uint64_t)blockIdx.x * dim;
+  const float* ar = a + base;
+  const float* br = b + base;
+  float* yr = out + base;
+  float v[kPer];
+  float ss = 0.0f;
+#pragma unroll
+  for (uint32_t r = 0; r < kPer; ++r) {
+    const uint32_t c = threadIdx.x + r * kBlock;
+    float s = 0.0f;
+    if (c < dim) {
+      s = ar[c] + br[c];
+      ss += s * s;
+    }
+    v[r] = s;
+  }
+  ss = BlockSum(ss, scratch);
+  const float scale = rsqrtf(ss / (float)dim + eps);
+#pragma unroll
+  for (uint32_t r = 0; r < kPer; ++r) {
+    const uint32_t c = threadIdx.x + r * kBlock;
+    if (c < dim) {
+      const float nv = v[r] * scale;
+      yr[c] = weight ? nv * weight[c] : nv;
+    }
+  }
+}
+
+__global__ void __launch_bounds__(kBlock)
+    AddRmsNorm(const float* a, const float* b, const float* weight, float* out,
+               uint32_t dim, float eps) {
+  __shared__ float scratch[32];
+  const uint64_t base = (uint64_t)blockIdx.x * dim;
+  const float* ar = a + base;
+  const float* br = b + base;
+  float* yr = out + base;
+  float ss = 0.0f;
+  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float s = ar[i] + br[i];
+    yr[i] = s;
+    ss += s * s;
+  }
+  ss = BlockSum(ss, scratch);
+  const float scale = rsqrtf(ss / (float)dim + eps);
+  for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float nv = yr[i] * scale;
+    yr[i] = weight ? nv * weight[i] : nv;
   }
 }
 
@@ -1523,6 +1597,19 @@ __global__ void SumSlots(const float* y, float* out, uint32_t k, uint32_t dim) {
     float acc = 0.0f;
     for (uint32_t s = 0; s < k; ++s) acc += y[((uint64_t)t * k + s) * dim + c];
     out[(uint64_t)t * dim + c] = acc;
+  }
+}
+
+__global__ void SumSlotsHalf(const float* y, _Float16* out_half, uint32_t k,
+                             uint32_t dim) {
+  const uint32_t t = blockIdx.y;
+  for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < dim;
+       c += gridDim.x * blockDim.x) {
+    float acc = 0.0f;
+    for (uint32_t s = 0; s < k; ++s)
+      acc += y[((uint64_t)t * k + s) * dim + c];
+    asm volatile("" : "+v"(acc));
+    out_half[(uint64_t)t * dim + c] = (_Float16)acc;
   }
 }
 
@@ -3615,6 +3702,16 @@ int hy4_swiglu(const float* gate, const float* up, const float* route_w, float* 
   return Status();
 }
 
+int hy4_swiglu_half(const float* gate, const float* up, const float* route_w,
+                    uint16_t* y_half, uint32_t rows, uint32_t dim, float limit,
+                    hipStream_t stream) {
+  if (rows == 0)
+    return 0;
+  SwigluHalf<<<dim3(Blocks(dim, 64), rows), kBlock, 0, stream>>>(
+      gate, up, route_w, reinterpret_cast<_Float16*>(y_half), dim, limit);
+  return Status();
+}
+
 int hy4_route(const float* logits, const float* bias, int32_t* ids, float* weights, uint32_t n, uint32_t n_experts,
               uint32_t k, int norm, float scale, hipStream_t stream) {
   if (n == 0) return 0;
@@ -3631,9 +3728,32 @@ int hy4_sum_slots(const float* y, float* out, uint32_t n, uint32_t k, uint32_t d
   return Status();
 }
 
+int hy4_sum_slots_half(const float* y, uint16_t* out_half, uint32_t n,
+                       uint32_t k, uint32_t dim, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  SumSlotsHalf<<<dim3(Blocks(dim, 64), n), kBlock, 0, stream>>>(
+      y, reinterpret_cast<_Float16*>(out_half), k, dim);
+  return Status();
+}
+
 int hy4_add(const float* a, const float* b, float* out, uint64_t count, hipStream_t stream) {
   if (count == 0) return 0;
   Add<<<Blocks(count), kBlock, 0, stream>>>(a, b, out, count);
+  return Status();
+}
+
+int hy4_add_rms_norm(const float* a, const float* b, const float* weight,
+                     float* out, uint32_t rows, uint32_t dim, float eps,
+                     hipStream_t stream) {
+  if (rows == 0)
+    return 0;
+  constexpr uint32_t kPer = 12;
+  if (dim <= kPer * kBlock)
+    AddRmsNormFast<kPer>
+        <<<rows, kBlock, 0, stream>>>(a, b, weight, out, dim, eps);
+  else
+    AddRmsNorm<<<rows, kBlock, 0, stream>>>(a, b, weight, out, dim, eps);
   return Status();
 }
 

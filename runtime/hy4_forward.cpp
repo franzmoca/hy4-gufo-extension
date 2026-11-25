@@ -1327,10 +1327,8 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
     if (!first.Ffn(il, n, error))
       return false;
     post_pending = true;
-    if (batched)
-      HY4_CHECK(hy4_rms_norm(s.y, l.ffn_post_norm.f32(), s.y, n, c.n_embd,
-                             c.n_embd, c.rms_eps, st));
-    else
+    // Ffn normed s.y in batched passes only (fused with residual add on MoE).
+    if (!batched)
       y_norm = l.ffn_post_norm.f32();
 
     if (first.probe_) {
@@ -1790,24 +1788,60 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   Model::Scratch& s = *scratch_;
   hipStream_t st = m.stream_;
   const Exec ex{st, m.blas_, prompt_pass_, m.gemv_scratch_};
-  const std::uint16_t* cur_half =
-      n > Model::kVecMax || prompt_pass_ ? s.cur_half : nullptr;
+  const bool batched = n > Model::kVecMax || prompt_pass_;
+  const std::uint16_t* cur_half = batched ? s.cur_half : nullptr;
+  const auto f16_quant = [](const Tensor& w, std::uint32_t m, std::uint32_t k) {
+    return (w.type == HY4_TYPE_Q8_0 || w.type == HY4_TYPE_Q4_K ||
+            w.type == HY4_TYPE_Q6_K) &&
+           k % 256 == 0 && m % 16 == 0 && w.dims.size() >= 2 &&
+           w.dims[0] == k && w.dims[1] == m;
+  };
 
   if (il < c.n_dense_lead) {
     const std::uint32_t f = c.n_ff_dense;
-    if (!SwigluVec(l.ffn_gate, l.ffn_up, s.ffn_a, s.ffn_b, s.ffn_c, f, s.cur,
-                   c.n_embd, n, ex, error, cur_half))
-      return false;
-    return MatVec(l.ffn_down, s.ffn_c, s.y, c.n_embd, f, n, ex, error);
+    if (batched && f16_quant(l.ffn_down, c.n_embd, f)) {
+      if (!MatVecPair(l.ffn_gate, s.ffn_a, f, l.ffn_up, s.ffn_b, f, s.cur,
+                      c.n_embd, n, ex, error, cur_half))
+        return false;
+      auto* ffn_half = reinterpret_cast<std::uint16_t*>(s.ffn_c);
+      HY4_CHECK(
+          hy4_swiglu_half(s.ffn_a, s.ffn_b, nullptr, ffn_half, n, f, 0.0f, st));
+      if (!DenseF16(l.ffn_down, ffn_half, s.y, c.n_embd, f, n, HY4_F16_X_HALF,
+                    ex, error))
+        return false;
+    } else {
+      if (!SwigluVec(l.ffn_gate, l.ffn_up, s.ffn_a, s.ffn_b, s.ffn_c, f, s.cur,
+                     c.n_embd, n, ex, error, cur_half))
+        return false;
+      if (!MatVec(l.ffn_down, s.ffn_c, s.y, c.n_embd, f, n, ex, error))
+        return false;
+    }
+    if (batched)
+      HY4_CHECK(hy4_rms_norm(s.y, l.ffn_post_norm.f32(), s.y, n, c.n_embd,
+                             c.n_embd, c.rms_eps, st));
+    return true;
   }
 
   const std::uint32_t f = c.n_ff_exp;
   const std::uint32_t used = c.n_expert_used;
   // Shared expert first, into its own buffer.
-  if (!SwigluVec(l.gate_shexp, l.up_shexp, s.ffn_a, s.ffn_b, s.ffn_c, f, s.cur,
-                 c.n_embd, n, ex, error, cur_half))
-    return false;
-  if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, ex, error)) return false;
+  if (batched && f16_quant(l.down_shexp, c.n_embd, f)) {
+    if (!MatVecPair(l.gate_shexp, s.ffn_a, f, l.up_shexp, s.ffn_b, f, s.cur,
+                    c.n_embd, n, ex, error, cur_half))
+      return false;
+    auto* ffn_half = reinterpret_cast<std::uint16_t*>(s.ffn_c);
+    HY4_CHECK(
+        hy4_swiglu_half(s.ffn_a, s.ffn_b, nullptr, ffn_half, n, f, 0.0f, st));
+    if (!DenseF16(l.down_shexp, ffn_half, s.shared, c.n_embd, f, n,
+                  HY4_F16_X_HALF, ex, error))
+      return false;
+  } else {
+    if (!SwigluVec(l.gate_shexp, l.up_shexp, s.ffn_a, s.ffn_b, s.ffn_c, f,
+                   s.cur, c.n_embd, n, ex, error, cur_half))
+      return false;
+    if (!MatVec(l.down_shexp, s.ffn_c, s.shared, c.n_embd, f, n, ex, error))
+      return false;
+  }
 
   // Router on the full-width input; experts in the latent space.
   if (!MatVec(l.gate_inp, s.cur, s.logits_r, c.n_expert, c.n_embd, n, ex,
@@ -1816,7 +1850,7 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
   HY4_CHECK(hy4_route(s.logits_r, l.exp_bias ? l.exp_bias.f32() : nullptr,
                       s.ids, s.route_w, n, c.n_expert, used,
                       c.expert_norm ? 1 : 0, c.expert_scale, st));
-  if (n > Model::kVecMax || prompt_pass_) {
+  if (batched) {
     // The latent in binary16, the routed kernels' input format: each value
     // rounds once, as the kernels' staging rounded the FP32 latent.
     auto* latent = reinterpret_cast<std::uint16_t*>(s.latent);
@@ -1843,9 +1877,19 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
                              ExpertBytes(l.down_exps), mid, 1, d_rows, d_bounds,
                              d_tiles, max_tiles, nullptr, 0.0f, s.ffn_a,
                              c.n_latent, f, st));
-    HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
-    if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
-    HY4_CHECK(hy4_add(s.y, s.shared, s.y, std::uint64_t{n} * c.n_embd, st));
+    if (f16_quant(l.routed_up, c.n_embd, c.n_latent)) {
+      auto* moe_half = reinterpret_cast<std::uint16_t*>(s.moe);
+      HY4_CHECK(hy4_sum_slots_half(s.ffn_a, moe_half, n, used, c.n_latent, st));
+      if (!DenseF16(l.routed_up, moe_half, s.y, c.n_embd, c.n_latent, n,
+                    HY4_F16_X_HALF, ex, error))
+        return false;
+    } else {
+      HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
+      if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error))
+        return false;
+    }
+    HY4_CHECK(hy4_add_rms_norm(s.y, s.shared, l.ffn_post_norm.f32(), s.y, n,
+                               c.n_embd, c.rms_eps, st));
     return true;
   }
   if (!MatVec(l.routed_down, s.cur, s.latent, c.n_latent, c.n_embd, n, ex,
