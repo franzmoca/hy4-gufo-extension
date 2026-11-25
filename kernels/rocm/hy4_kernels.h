@@ -486,6 +486,15 @@ int hy4_f16_routed(int type, const void* w, const void* w_up,
 uint32_t hy4_f16_routed_plan(const int32_t* ids, uint32_t slots,
                              uint32_t n_experts, int32_t* rows, int32_t* bounds,
                              int32_t* tiles);
+/* Upper bound on tiles produced by hy4_f16_routed_plan_gpu. */
+uint32_t hy4_f16_routed_max_tiles(uint32_t slots, uint32_t n_experts);
+/* On-device equivalent of hy4_f16_routed_plan: builds rows[slots],
+ * bounds[n_experts + 1], and tiles[max_tiles] (unused entries set to -1)
+ * directly on GPU without host synchronization (n_experts <= 1024). */
+int hy4_f16_routed_plan_gpu(const int32_t* ids, uint32_t slots,
+                            uint32_t n_experts, int32_t* rows, int32_t* bounds,
+                            int32_t* tiles, uint32_t max_tiles,
+                            hipStream_t stream);
 
 #ifdef __cplusplus
 }

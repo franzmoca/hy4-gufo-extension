@@ -2131,6 +2131,42 @@ void TestF16Matmul() {
         ids.data(), slots, experts, rows.data(), bounds.data(), tiles.data());
     Expect(n_tiles == 2 + 3,
            "f16_routed_plan tiles " + std::to_string(n_tiles));
+    // Verify on-GPU routed plan matches bounds, active tiles, sentinels, and
+    // partitions every slot into its expert bucket.
+    {
+      const uint32_t max_tiles = hy4_f16_routed_max_tiles(slots, experts);
+      int32_t* d_in_ids = Device(ids);
+      int32_t* d_grows = Device(std::vector<int32_t>(slots, -1));
+      int32_t* d_gbounds = Device(std::vector<int32_t>(experts + 1, -1));
+      int32_t* d_gtiles = Device(std::vector<int32_t>(max_tiles, 99));
+      Expect(
+          hy4_f16_routed_plan_gpu(d_in_ids, slots, experts, d_grows, d_gbounds,
+                                  d_gtiles, max_tiles, nullptr) == 0,
+          "f16_routed_plan_gpu status");
+      const auto gbounds = Host(d_gbounds, experts + 1);
+      const auto gtiles = Host(d_gtiles, max_tiles);
+      const auto grows = Host(d_grows, slots);
+      Expect(gbounds == bounds, "f16_routed_plan_gpu bounds");
+      for (uint32_t t = 0; t < n_tiles; ++t)
+        Expect(gtiles[t] == tiles[t], "f16_routed_plan_gpu tile");
+      for (uint32_t t = n_tiles; t < max_tiles; ++t)
+        Expect(gtiles[t] == -1, "f16_routed_plan_gpu sentinel");
+      std::vector<int> seen(slots, 0);
+      for (uint32_t e = 0; e < experts; ++e) {
+        for (int32_t p = gbounds[e]; p < gbounds[e + 1]; ++p) {
+          const int32_t s = grows[p];
+          Expect(s >= 0 && s < (int32_t)slots && ids[s] == (int32_t)e,
+                 "f16_routed_plan_gpu bucket");
+          ++seen[s];
+        }
+      }
+      for (uint32_t s = 0; s < slots; ++s)
+        Expect(seen[s] == 1, "f16_routed_plan_gpu bijective");
+      (void)hipFree(d_in_ids);
+      (void)hipFree(d_grows);
+      (void)hipFree(d_gbounds);
+      (void)hipFree(d_gtiles);
+    }
     auto* dids = Device(rows);
     auto* dbounds = Device(bounds);
     auto* dtiles = Device(tiles);

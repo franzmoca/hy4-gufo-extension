@@ -838,6 +838,63 @@ int routed_launch(const void* w, const void* w_up, uint64_t expert_bytes,
   return hipGetLastError() == hipSuccess ? 0 : 1;
 }
 
+constexpr int kMaxPlanExperts = 1024;
+
+__global__ void __launch_bounds__(512)
+    routed_plan_kernel(const int32_t* __restrict__ ids, uint32_t slots,
+                       uint32_t n_experts, int32_t* __restrict__ rows,
+                       int32_t* __restrict__ bounds,
+                       int32_t* __restrict__ tiles, uint32_t max_tiles) {
+  __shared__ uint32_t counts[kMaxPlanExperts];
+  __shared__ uint32_t offsets[kMaxPlanExperts + 1];
+  __shared__ uint32_t tile_off[kMaxPlanExperts + 1];
+  const uint32_t tid = threadIdx.x;
+  for (uint32_t e = tid; e < n_experts; e += blockDim.x)
+    counts[e] = 0;
+  __syncthreads();
+  for (uint32_t s = tid; s < slots; s += blockDim.x) {
+    const int32_t e = ids[s];
+    if (e >= 0 && (uint32_t)e < n_experts)
+      atomicAdd(&counts[e], 1u);
+  }
+  __syncthreads();
+  // Prefix sums for row bounds and tile offsets (n_experts <= 1024).
+  if (tid == 0) {
+    uint32_t rsum = 0, tsum = 0;
+    for (uint32_t e = 0; e < n_experts; ++e) {
+      offsets[e] = rsum;
+      tile_off[e] = tsum;
+      const uint32_t c = counts[e];
+      rsum += c;
+      tsum += (c + kSlots - 1) / kSlots;
+    }
+    offsets[n_experts] = rsum;
+    tile_off[n_experts] = tsum;
+  }
+  __syncthreads();
+  for (uint32_t e = tid; e <= n_experts; e += blockDim.x)
+    bounds[e] = (int32_t)offsets[e];
+  for (uint32_t e = tid; e < n_experts; e += blockDim.x) {
+    const uint32_t c = counts[e];
+    const uint32_t nt = (c + kSlots - 1) / kSlots;
+    const uint32_t t0 = tile_off[e];
+    for (uint32_t k = 0; k < nt; ++k)
+      tiles[t0 + k] = (int32_t)(e | (k << 16));
+    counts[e] = offsets[e];
+  }
+  const uint32_t total_tiles = tile_off[n_experts];
+  for (uint32_t t = total_tiles + tid; t < max_tiles; t += blockDim.x)
+    tiles[t] = -1;
+  __syncthreads();
+  for (uint32_t s = tid; s < slots; s += blockDim.x) {
+    const int32_t e = ids[s];
+    if (e >= 0 && (uint32_t)e < n_experts) {
+      const uint32_t pos = atomicAdd(&counts[e], 1u);
+      rows[pos] = (int32_t)s;
+    }
+  }
+}
+
 }  // namespace
 
 int hy4_f16_dense(int type, const void* w, const void* x, void* out, uint32_t m,
@@ -918,6 +975,30 @@ uint32_t hy4_f16_routed_plan(const int32_t* ids, uint32_t slots,
     bounds[e] = bounds[e - 1];
   bounds[0] = 0;
   return n_tiles;
+}
+
+uint32_t hy4_f16_routed_max_tiles(uint32_t slots, uint32_t n_experts) {
+  const uint32_t bound = slots / kSlots + n_experts;
+  return slots < bound ? slots : bound;
+}
+
+int hy4_f16_routed_plan_gpu(const int32_t* ids, uint32_t slots,
+                            uint32_t n_experts, int32_t* rows, int32_t* bounds,
+                            int32_t* tiles, uint32_t max_tiles,
+                            hipStream_t stream) {
+  if (n_experts == 0 || n_experts > (uint32_t)kMaxPlanExperts)
+    return 1;
+  if (slots == 0) {
+    if (hipMemsetAsync(bounds, 0, (size_t)(n_experts + 1) * sizeof(int32_t),
+                       stream) != hipSuccess)
+      return 1;
+    return 0;
+  }
+  if (max_tiles < hy4_f16_routed_max_tiles(slots, n_experts))
+    return 1;
+  routed_plan_kernel<<<1, 512, 0, stream>>>(ids, slots, n_experts, rows, bounds,
+                                            tiles, max_tiles);
+  return hipGetLastError() == hipSuccess ? 0 : 1;
 }
 
 #if defined(__HIP_DEVICE_COMPILE__)
