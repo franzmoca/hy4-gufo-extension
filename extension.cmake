@@ -175,6 +175,8 @@ _hy4flash_test(tokenizer "cpu;tokenization;tools"
   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
 _hy4flash_test(config "cpu;loader"
   LINK_LIBRARIES gufo_hy4flash gufo_ext_core)
+_hy4flash_test(queued_draw "cpu;sampling"
+  LINK_LIBRARIES gufo_ext_core)
 _hy4flash_test(vision_prompt "cpu;vision"
   LINK_LIBRARIES gufo_hy4flash_text gufo_hy4flash_hip gufo_hy4flash gufo_ext_hip)
 _hy4flash_test(kernels "hip;gpu;gfx1151"

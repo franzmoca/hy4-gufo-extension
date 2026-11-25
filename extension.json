@@ -105,6 +105,12 @@
       ],
       "role": "test"
     },
+    "hy4flash_queued_draw_test": {
+      "requires": [
+        "testing"
+      ],
+      "role": "test"
+    },
     "hy4flash_vision_prompt_test": {
       "requires": [
         "testing"
