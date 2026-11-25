@@ -3975,7 +3975,9 @@ int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, uint32_t ring,
   if (heads == 64) {
     MlaPrefill64<64><<<dim3(n, 1), 512, 0, stream>>>(
         qh, kh, ring, lo, pos, window, sel, n_sel, sinks, scale, oh, n);
-  } else if (heads == 32 && window > 0 && sel == nullptr && n >= 2) {
+  } else if (heads == 32 && window > 0 && sel == nullptr) {
+    // Every pass width, n == 1 included: its 32-aligned key tiles must match
+    // so that a token's result does not depend on the pass it is in.
     MlaPrefill64<32><<<dim3((n + 1) / 2, 1), 512, 0, stream>>>(
         qh, kh, ring, lo, pos, window, nullptr, 0, sinks, scale, oh, n);
   } else {
