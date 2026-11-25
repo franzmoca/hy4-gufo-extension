@@ -81,6 +81,10 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E73 | On-GPU prefill routed-expert plan, coalesced down stores and Engram lookahead | retained |
 | E74 | Vision attention LDS K/V sharing and folded `AttnPack` zero-padding | retained |
 | E75 | Bit-level `Fp8E4M3` decode and Barrett reciprocal Engram modulo | retained |
+| E76 | Fused prefill hyper-connection apply and binary16 RMS norm (`hy4_hc_post_pre_norm`) | retained |
+| E77 | Prefill FP16 activation pipeline (`hy4_swiglu_half`, `hy4_sum_slots_half`) and `hy4_add_rms_norm` | retained |
+| E78 | `DraftBatch` active-row compaction and dynamic multi-session verify-row budget | retained |
+| E79 | Slot-aware DFly2 stopping and adaptive cooldown | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1658,4 +1662,90 @@ End-to-end summary (`Hy4-flash-Q4_K_M` + DFly2, `e682c07` vs `623c0d2`):
   `cut3712` 43.91 → 50.71 tok/s (+15.5%, draft 19.77 → 16.29 ms, verify 145.33 → 127.92 ms)
 
 Retained.
+
+## E76: Fused prefill hyper-connection apply and binary16 RMS norm (`hy4_hc_post_pre_norm`) (2026-11-25)
+
+In prefill passes, `boundary()` previously ran `HcApply` (12 blocks per token,
+each re-reducing all 48 `partial` slices and writing FP32 `s.x` to DRAM)
+followed by a separate `hy4_rms_norm_half` pass reading `s.x` back (`~7.7 GB`
+of DRAM traffic across 84 boundaries at 3,712 tokens). Extending
+`HcApplyNormFast<4, 12>` to emit optional FP32 `s.cur` and binary16 `s.cur_half`
+directly from registers (`hy4_hc_post_pre_norm`) eliminates the `s.x` DRAM
+round-trip, 11× redundant `partial` reductions, and 84 launches, and skips
+writing FP32 `s.cur` on the 28 SWA attention and lead-dense FFN boundaries that
+consume only `s.cur_half`.
+
+Bit-identical to `hy4_hc_post_pre` + `hy4_rms_norm_half` (`hy4flash.kernels`,
+`--chunkcheck 399`/`320` exact). Warm `pp3712` improves from ~4.03 s (~920
+tok/s) to 3.968 s (935.6 tok/s). Retained.
+
+## E77: Prefill FP16 activation pipeline (`hy4_swiglu_half`, `hy4_sum_slots_half`) and `hy4_add_rms_norm` (2026-11-25)
+
+In `hy4_dense_bench` at 3,712 tokens, `shexp_down` and `routed_up` ran at 28.8
+TFLOPS on FP32 activations versus 37.5 TFLOPS on FP16 activations (`routed_down`),
+even though `KLoop` rounds FP32 inputs to binary16 on load. Adding bit-exact
+`hy4_swiglu_half` (for `ffn_down` and `down_shexp`) and `hy4_sum_slots_half`
+(for `routed_up`) switches all three projections to `HY4_F16_X_HALF`, doubling
+`KLoop::kAhead` (`2 → 4`) and halving activation read bandwidth. Fusing
+`hy4_add(s.y, s.shared)` with `l.ffn_post_norm` in `hy4_add_rms_norm` removes
+41 launches and 3.7 GB of `s.y` DRAM traffic on MoE layers.
+
+Warm `pp3712` improves from 3.968 s (935.6 tok/s) to 3.906–3.932 s (944–950
+tok/s), with `--chunkcheck 399`/`320` exact (`0.0000`) and `--kl-decode`
+unchanged (`0.05142 ± 0.00649`, 94.46% same top, clamped PPL `14.6885`).
+Two additional prefill micro-experiments were tested and **rejected**:
+- Replacing `other_half` (`permlanex16`) with direct `ds_load_b128` in
+  `KLoop::frag(t)` saturated LDS and slowed `hy4_dense_bench` by 21%
+  (30.68 → 37.29 ms at 3,712 tokens).
+- Staging `routed_f16_kernel<kPair=true>` FP16 outputs through LDS for
+  coalesced `uint4` stores added a third barrier per round and measured flat
+  (3.906 → 3.911 s warm `pp3712`).
+
+Retained.
+
+## E78: `DraftBatch` active-row compaction and dynamic multi-session verify-row budget (2026-11-25)
+
+In `Drafter::DraftBatch`, when some sessions dropped below the confidence
+threshold on a slot, the Q4_K LM head prefix GEMV still ran over all `na` rows
+and copied `b.prefix` to `b.logits`. Compacting `b.hk` to only the `kept`
+active rows (and writing directly to `b.logits` when `kept == 1`) avoids wasted
+head rows.
+
+In `Hy4TextRunner::DecodeBatch`, sessions were previously hard-capped to
+`16 / ns` verify rows each (e.g., max 3 drafts at 4 users), leaving verify rows
+unused whenever other sessions stopped early. Passing the remaining batch
+budget `total_budget = Session::kTapRows - used_rows` into `DraftBatch` (capped
+per session at `draft_tokens_ = 7`, prioritizing higher-confidence sessions when
+a slot would exceed the budget) packs more accepted drafts into the same single
+16-row verify pass:
+- `ns=4`, `cut400`: 67.01 → 70.24 tok/s (+4.8%; +34.7% vs `623c0d2` baseline),
+  accepted 1.83 → 2.16/sess
+- `ns=4`, `cut3712`: 50.60 → 51.08 tok/s (+0.9%), accepted 0.83 → 0.91/sess
+
+Retained.
+
+## E79: Slot-aware DFly2 stopping and adaptive cooldown (2026-11-25)
+
+With Wave 1–2 cuts to draft latency (5.4–8.6 ms) and marginal verify cost
+(~9.1 ms/real token), sweeping `min_accept` showed that a single flat `0.45`
+threshold caused 53% zero-draft rounds on `cut400` (wasting the already-paid
+5-layer DFly2 trunk pass), while lowering the threshold globally to `0.15`
+over-drafted overconfident later slots (`k >= 3`) on `cut3712`.
+
+`DraftBatch` now accepts a separate slot-1 threshold `min_accept_first`
+(`HY4_DFLY_MIN_ACCEPT_FIRST`, default `0.30` at `ns <= 2`, `min_accept` at
+`ns >= 3` where trunk cost is amortized and low-confidence drafts slow verify
+for every session in the batch). `Hy4TextRunnerState` also tracks a per-session
+EWMA of accepted tokens per DFly2 round (`HY4_DFLY_ADAPTIVE`, default on),
+entering a 4-step DFly2 cooldown if acceptance stays below break-even (`< 0.22`
+after 6 rounds) while keeping prompt-lookup copies active every step.
+
+Single-user (`ns=1`, 192 tokens, `min_accept = 0.45` vs `min_accept_first = 0.30`):
+- `cut400`: 25.49 → 26.49 tok/s (+3.9%; +8.7% vs `623c0d2` baseline),
+  zero-draft rounds 64 → 36, accepted 0.63 → 0.76
+- `cut3712`: 32.18 → 32.76 tok/s (+1.8%; +11.7% vs `623c0d2` baseline),
+  zero-draft rounds 11 → 0, accepted 1.82 → 1.95
+
+All replies stay bit-identical to plain AR (`--passcheck 8`, `--batchcheck 6`
+and `--kl-decode` unchanged). Retained.
 
