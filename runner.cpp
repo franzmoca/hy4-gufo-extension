@@ -651,29 +651,43 @@ public:
     std::vector<TextDecodeStep> steps(decodes.size());
     std::vector<std::optional<DecodePlan>> plans(decodes.size());
     const bool allow_dfly = decodes.size() <= dfly_max_concurrency_;
+    // Allow each session's prompt-lookup copy its fair share so copies never
+    // starve other sessions, while DFly2 shares the remaining verify rows
+    // dynamically inside Session::kTapRows across all drafting sessions.
+    const std::size_t copy_rows =
+        std::max<std::size_t>(1, Session::kTapRows / decodes.size());
+    const std::size_t dfly_max_rows =
+        Session::kTapRows > decodes.size()
+            ? Session::kTapRows - decodes.size() + 1
+            : 1;
     for (std::size_t i = 0; i < decodes.size(); ++i) {
       try {
-        plans[i] = PrepareDecode(
-            decodes[i].state.get(), decodes[i].max_tokens,
-            decodes[i].sampler.get(),
-            std::max<std::size_t>(1, Session::kTapRows / decodes.size()),
-            allow_dfly);
+        plans[i] = PrepareDecode(decodes[i].state.get(), decodes[i].max_tokens,
+                                 decodes[i].sampler.get(), copy_rows,
+                                 allow_dfly, dfly_max_rows);
       } catch (...) {
         steps[i].failure = std::current_exception();
       }
     }
     {
       std::vector<DecodePlan*> drafting;
-      for (auto& plan : plans)
-        if (plan)
-          drafting.push_back(&*plan);
-      try {
-        DraftPlans(drafting);
-      } catch (...) {
-        for (std::size_t i = 0; i < decodes.size(); ++i) {
-          if (plans[i] && plans[i]->draft_count != 0) {
-            steps[i].failure = std::current_exception();
-            plans[i].reset();
+      std::size_t used_rows = 0;
+      for (auto& plan : plans) {
+        if (!plan)
+          continue;
+        used_rows += plan->tokens.size();
+        drafting.push_back(&*plan);
+      }
+      if (used_rows < Session::kTapRows) {
+        try {
+          DraftPlans(drafting,
+                     static_cast<std::uint32_t>(Session::kTapRows - used_rows));
+        } catch (...) {
+          for (std::size_t i = 0; i < decodes.size(); ++i) {
+            if (plans[i] && plans[i]->draft_count != 0) {
+              steps[i].failure = std::current_exception();
+              plans[i].reset();
+            }
           }
         }
       }
@@ -770,7 +784,8 @@ private:
   // proposes at most its share of the pass's rows.
   DecodePlan PrepareDecode(TextRunnerState& state, std::size_t max_tokens,
                            sampling::SamplerState& sampler,
-                           std::size_t max_rows, bool allow_dfly) const {
+                           std::size_t max_rows, bool allow_dfly,
+                           std::size_t dfly_max_rows = 0) const {
     DecodePlan plan{
         .hy4 = &RequireState(state), .sampler = &sampler, .work = sampler};
     auto& hy4 = *plan.hy4;
@@ -784,14 +799,18 @@ private:
     sampling::SamplerState& work = plan.work;
     TextDecodeSelection anchor = Select(hy4, work);
     plan.sampled = true;
-    const std::size_t room = std::min<std::size_t>(
-        {max_tokens - 1, max_context_ - hy4.position() - 1, max_rows - 1});
-    if (!anchor.stop && room > 0) {
-      plan.copy = Copy(hy4, static_cast<std::int32_t>(anchor.token), work, room,
-                       &plan.proposals);
+    const std::size_t base_room = std::min<std::size_t>(
+        max_tokens - 1, max_context_ - hy4.position() - 1);
+    const std::size_t copy_room =
+        std::min<std::size_t>(base_room, max_rows - 1);
+    const std::size_t draft_room = std::min<std::size_t>(
+        base_room, (dfly_max_rows ? dfly_max_rows : max_rows) - 1);
+    if (!anchor.stop && copy_room > 0) {
+      plan.copy = Copy(hy4, static_cast<std::int32_t>(anchor.token), work,
+                       copy_room, &plan.proposals);
     }
     const bool draft = allow_dfly && !anchor.stop && plan.proposals.empty() &&
-                       drafter_ && session.TapsReady() && room > 0;
+                       drafter_ && session.TapsReady() && draft_room > 0;
     if (anchor.stop || (plan.proposals.empty() && !draft)) {
       plan.step.stop = anchor.stop;
       if (anchor.stop) {
@@ -810,7 +829,7 @@ private:
 
     if (draft)
       plan.draft_count = static_cast<std::uint32_t>(
-          std::min<std::size_t>(draft_tokens_, room));
+          std::min<std::size_t>(draft_tokens_, draft_room));
     plan.tokens = {anchor_token};
     plan.tokens.insert(plan.tokens.end(), plan.proposals.begin(),
                        plan.proposals.end());
@@ -819,7 +838,8 @@ private:
 
   // DFly2's drafts for the plans that draft, in one drafter pass for all of
   // them, appended to their tokens.
-  void DraftPlans(std::span<DecodePlan* const> plans) const {
+  void DraftPlans(std::span<DecodePlan* const> plans,
+                  std::uint32_t total_budget = 0) const {
     std::vector<const Session*> sessions;
     std::vector<std::int32_t> anchors;
     std::vector<std::uint32_t> counts;
@@ -836,7 +856,7 @@ private:
     if (!sessions.empty()) {
       std::string error;
       if (!drafter_->DraftBatch(sessions, anchors, counts, min_accept_, drafts,
-                                &error))
+                                &error, total_budget))
         throw std::runtime_error("Hy4 draft failed: " + error);
     }
     const auto t1 = std::chrono::steady_clock::now();

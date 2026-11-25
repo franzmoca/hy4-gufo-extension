@@ -606,7 +606,8 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
                          std::span<const std::uint32_t> counts,
                          float min_accept,
                          std::span<std::vector<std::int32_t>* const> drafts,
-                         std::string* error) {
+                         std::string* error, std::uint32_t total_budget,
+                         float min_accept_first) {
   const auto ns = static_cast<std::uint32_t>(sessions.size());
   if (ns == 0)
     return true;
@@ -766,7 +767,10 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
     going[s] = counts[s] > 0;
   }
   const std::size_t vstride = c.n_vocab;
+  std::uint32_t total_drafted = 0;
   for (std::uint32_t k = 1; k <= max_count; ++k) {
+    if (total_budget > 0 && total_drafted >= total_budget)
+      break;
     std::uint32_t active[kMaxSessions];
     std::uint32_t na = 0;
     for (std::uint32_t s = 0; s < ns; ++s)
@@ -800,61 +804,100 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
     HY4_CHECK(hipMemcpyAsync(io.conf, b.conf, na * sizeof(float),
                              hipMemcpyDeviceToHost, st));
     HY4_CHECK(hipStreamSynchronize(st));
+    const float slot_thr =
+        (k == 1 && min_accept_first >= 0.0f) ? min_accept_first : min_accept;
+    std::uint32_t kept_j[kMaxSessions];
     std::uint32_t kept = 0;
     for (std::uint32_t j = 0; j < na; ++j) {
       const std::uint32_t s = active[j];
       accept[s] *= 1.0f / (1.0f + std::exp(-(io.conf[j] + confidence_b_)));
-      if (accept[s] < min_accept)
+      if (accept[s] < slot_thr)
         going[s] = false;
       else
-        ++kept;
+        kept_j[kept++] = j;
     }
     if (kept == 0)
       break;
-    // The head's prefix for every row at once (a stopped session's row is
-    // computed and ignored), then each session's own table and argmax.
+    // If a shared verify-row budget caps this slot, keep the highest-confidence
+    // sessions and stop the rest (kept <= kMaxSessions = 8).
+    if (total_budget > 0 && total_drafted + kept > total_budget) {
+      const std::uint32_t allow = total_budget - total_drafted;
+      for (std::uint32_t a = 1; a < kept; ++a) {
+        const std::uint32_t key = kept_j[a];
+        const float key_acc = accept[active[key]];
+        std::uint32_t b = a;
+        while (b > 0 && accept[active[kept_j[b - 1]]] < key_acc) {
+          kept_j[b] = kept_j[b - 1];
+          --b;
+        }
+        kept_j[b] = key;
+      }
+      for (std::uint32_t r = allow; r < kept; ++r)
+        going[active[kept_j[r]]] = false;
+      kept = allow;
+      for (std::uint32_t a = 1; a < kept; ++a) {
+        const std::uint32_t key = kept_j[a];
+        std::uint32_t b = a;
+        while (b > 0 && kept_j[b - 1] > key) {
+          kept_j[b] = kept_j[b - 1];
+          --b;
+        }
+        kept_j[b] = key;
+      }
+    }
+    // Compact b.hk into b.hs when some sessions dropped out so the Q4_K head
+    // GEMV runs over only the `kept` active rows.
+    const float* hk_in = b.hk;
+    if (kept < na) {
+      for (std::uint32_t r = 0; r < kept; ++r) {
+        HY4_CHECK(hipMemcpyAsync(b.hs + std::size_t{r} * kHidden,
+                                 b.hk + std::size_t{kept_j[r]} * kHidden,
+                                 kHidden * sizeof(float),
+                                 hipMemcpyDeviceToDevice, st));
+      }
+      hk_in = b.hs;
+    }
+    // The head's prefix for every kept row at once, then each session's own
+    // table and argmax.
     Tensor prefix = head_;
     prefix.dims = {kHidden, head_rows_};
-    float* first = na == 1 ? b.logits : b.prefix;
-    if (na > 1 && b.prefix == nullptr) {
+    float* first = kept == 1 ? b.logits : b.prefix;
+    if (kept > 1 && b.prefix == nullptr) {
       if (!DeviceAlloc(&b.prefix, std::size_t{kMaxSessions} * head_rows_,
                        &allocations_))
         return Fail(error, "hy4 dfly: head prefix allocation failed");
       first = b.prefix;
     }
-    if (!MatVec(prefix, b.hk, first, head_rows_, kHidden, na, ex, error))
+    if (!MatVec(prefix, hk_in, first, head_rows_, kHidden, kept, ex, error))
       return false;
-    for (std::uint32_t j = 0; j < na; ++j) {
-      const std::uint32_t s = active[j];
-      if (!going[s])
-        continue;
-      float* logits = b.logits + j * vstride;
-      if (na > 1)
-        HY4_CHECK(hipMemcpyAsync(logits, b.prefix + std::size_t{j} * head_rows_,
+    for (std::uint32_t r = 0; r < kept; ++r) {
+      const std::uint32_t s = active[kept_j[r]];
+      float* logits = b.logits + r * vstride;
+      if (kept > 1)
+        HY4_CHECK(hipMemcpyAsync(logits, b.prefix + std::size_t{r} * head_rows_,
                                  head_rows_ * sizeof(float),
                                  hipMemcpyDeviceToDevice, st));
       const auto table_rows =
           tables[s] ? static_cast<std::uint32_t>(tables[s]->ids.size()) : 0u;
       if (table_rows) {
         const Tensor table{tables[s]->rows, head_.type, {kHidden, table_rows}};
-        if (!MatVec(table, b.hk + std::size_t{j} * kHidden, logits + head_rows_,
-                    table_rows, kHidden, 1, ex, error))
+        if (!MatVec(table, hk_in + std::size_t{r} * kHidden,
+                    logits + head_rows_, table_rows, kHidden, 1, ex, error))
           return false;
       }
       HY4_CHECK(hy4_argmax(logits, head_rows_ + table_rows, b.best_work,
-                           b.best + j, st));
+                           b.best + r, st));
     }
-    HY4_CHECK(hipMemcpyAsync(io.best, b.best, na * sizeof(std::int32_t),
+    HY4_CHECK(hipMemcpyAsync(io.best, b.best, kept * sizeof(std::int32_t),
                              hipMemcpyDeviceToHost, st));
     HY4_CHECK(hipStreamSynchronize(st));
-    for (std::uint32_t j = 0; j < na; ++j) {
-      const std::uint32_t s = active[j];
-      if (!going[s])
-        continue;
-      prev[s] = static_cast<std::uint32_t>(io.best[j]) < head_rows_
-                    ? io.best[j]
-                    : tables[s]->ids[io.best[j] - head_rows_];
+    for (std::uint32_t r = 0; r < kept; ++r) {
+      const std::uint32_t s = active[kept_j[r]];
+      prev[s] = static_cast<std::uint32_t>(io.best[r]) < head_rows_
+                    ? io.best[r]
+                    : tables[s]->ids[io.best[r] - head_rows_];
       drafts[s]->push_back(prev[s]);
+      ++total_drafted;
     }
   }
   return true;
