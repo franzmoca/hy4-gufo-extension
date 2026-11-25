@@ -2620,6 +2620,252 @@ __global__ void __launch_bounds__(32 * kMlaWaves)
   }
 }
 
+// 64-query MlaPrefill: 16 waves (512 threads) = 4 groups of 16 queries x 4
+// dim-splits share each 32-key kt tile in LDS, halving KV loads vs the
+// 32-query kernel.
+// - kHeads == 64: all 64 heads of 1 token (supports dense, SWA and sparse sel).
+// - kHeads == 32: 2 consecutive tokens x 32 heads (dense/SWA, sel == nullptr),
+//   with key tiles aligned to 32-key boundaries for pass independence.
+template<uint32_t kHeads>
+__global__ void __launch_bounds__(512)
+    MlaPrefill64(const _Float16* q, const _Float16* keys, uint32_t ring,
+                 int32_t lo, const int32_t* pos, uint32_t window,
+                 const int32_t* sel, uint32_t n_sel, const float* sinks,
+                 float scale, _Float16* out, uint32_t n) {
+  constexpr uint32_t kQ = 64;
+  constexpr uint32_t kToks = kHeads == 32 ? 2u : 1u;
+  constexpr uint32_t kThreads = 512;
+  constexpr uint32_t kVecLoads = kMlaTile * (kMlaDk / 8);              // 2304
+  constexpr uint32_t kGroups = (kVecLoads + kThreads - 1) / kThreads;  // 5
+  __shared__ __align__(16) _Float16 kt[kMlaTile * kMlaKtPitch];
+  __shared__ __align__(16) _Float16 probs[kQ * kMlaProbPitch];
+  __shared__ float part[kMlaSplit][kQ][16];
+  __shared__ int32_t rows[kMlaTile];
+  __shared__ float m_s[kQ], l_s[kQ], alpha_s[kQ];
+
+  const uint32_t t0 = blockIdx.x * kToks;
+  const uint32_t tid = threadIdx.x;
+  const uint32_t lane = tid % 32;
+  const uint32_t wave = tid / 32;
+  const uint32_t row = lane % 16;
+  const uint32_t half = lane / 16;
+  const uint32_t qg = (wave / kMlaSplit) * 16;  // 0, 16, 32, 48
+  const uint32_t sub = wave % kMlaSplit;
+
+  const uint32_t t_wave = kToks == 2 ? t0 + (qg / 32) : t0;
+  const uint32_t h_wave = kToks == 2 ? (qg % 32) : qg;
+  const uint32_t t_valid = t_wave < n ? t_wave : (n - 1);
+
+  MlaHalf16 qa[kMlaQkSteps];
+  {
+    const _Float16* qr = q +
+                         ((uint64_t)t_valid * kHeads + h_wave + row) * kMlaDk +
+                         sub * (kMlaDk / kMlaSplit);
+#pragma unroll
+    for (uint32_t s = 0; s < kMlaQkSteps; ++s)
+      qa[s] = MlaLoad16(qr + s * 16);
+  }
+  if (tid < kQ) {
+    const uint32_t h = kToks == 2 ? (tid % 32) : tid;
+    m_s[tid] = sinks ? sinks[h] : -INFINITY;
+    l_s[tid] = sinks ? 1.0f : 0.0f;
+  }
+  MlaFloat8 acc[kMlaPvTiles] = {};
+
+  const int32_t p0 = pos[t0];
+  const int32_t p1 = (kToks == 2 && t0 + 1 < n) ? pos[t0 + 1] : p0;
+  const int32_t lo0 = window ? max(lo, p0 - (int32_t)window + 1) : lo;
+  const int32_t lo1 = window ? max(lo, p1 - (int32_t)window + 1) : lo;
+
+  const int32_t* sel_t = (kToks == 1 && sel && p0 >= (int32_t)n_sel)
+                             ? sel + (uint64_t)t0 * n_sel
+                             : nullptr;
+  const int32_t lo_min = min(lo0, lo1);
+  const int32_t p_max = max(p0, p1);
+  const int32_t k_base0 = (kToks == 2 && window) ? (lo_min & ~31) : lo_min;
+  const uint32_t steps = sel_t             ? n_sel
+                         : p_max >= lo_min ? (uint32_t)(p_max - k_base0 + 1)
+                                           : 0u;
+
+  const uint32_t qi = tid / 8;
+  const uint32_t kl = tid % 8;
+  const uint32_t k0 = kl * 4;
+  const bool is_t1 = kToks == 2 && qi >= 32;
+  const int32_t my_lo = is_t1 ? lo1 : lo0;
+  const int32_t my_p = is_t1 ? p1 : p0;
+  const bool wave_t1 = kToks == 2 && qg >= 32;
+  const int32_t wave_lo = wave_t1 ? lo1 : lo0;
+  const int32_t wave_p = wave_t1 ? p1 : p0;
+
+  for (uint32_t j0 = 0; j0 < steps; j0 += kMlaTile) {
+    if (tid < kMlaTile) {
+      int32_t k = -1;
+      if (sel_t) {
+        k = MlaKey(sel_t, lo0, j0 + tid, steps, p0, lo0);
+      } else {
+        const int32_t cand = k_base0 + (int32_t)(j0 + tid);
+        if (cand >= lo_min && cand <= p_max)
+          k = cand;
+      }
+      rows[tid] = k >= 0 ? (int32_t)((uint32_t)k % ring) : -1;
+    }
+    __syncthreads();
+    {
+      uint4 v[kGroups];
+#pragma unroll
+      for (uint32_t g = 0; g < kGroups; ++g) {
+        const uint32_t i = tid + g * kThreads;
+        v[g] = make_uint4(0, 0, 0, 0);
+        if (i < kVecLoads) {
+          const uint32_t r = i / (kMlaDk / 8);
+          const uint32_t c = (i % (kMlaDk / 8)) * 8;
+          if (rows[r] >= 0)
+            v[g] = *reinterpret_cast<const uint4*>(
+                keys + (uint64_t)rows[r] * kMlaDk + c);
+        }
+      }
+#pragma unroll
+      for (uint32_t g = 0; g < kGroups; ++g) {
+        const uint32_t i = tid + g * kThreads;
+        if (i < kVecLoads)
+          *reinterpret_cast<uint4*>(kt + i / (kMlaDk / 8) * kMlaKtPitch +
+                                    (i % (kMlaDk / 8)) * 8) = v[g];
+      }
+    }
+    __syncthreads();
+
+    MlaFloat8 sc[2] = {};
+    {
+      const _Float16* kr = kt + row * kMlaKtPitch + sub * (kMlaDk / kMlaSplit);
+#pragma unroll
+      for (uint32_t s = 0; s < kMlaQkSteps; ++s)
+#pragma unroll
+        for (uint32_t b = 0; b < 2; ++b)
+          sc[b] = MlaWmma(qa[s], MlaLoad16(kr + b * 16 * kMlaKtPitch + s * 16),
+                          sc[b]);
+    }
+    // Exchange 16 keys at a time so part[4][64][16] stays 16 KiB.
+    // Lanes 0..3 collect b=0 (keys 0..15) and lanes 4..7 collect b=1 (keys
+    // 16..31) so every lane owns the exact same 4 contiguous keys as
+    // MlaPrefill, keeping softmax reduction bit-identical.
+    float x[4];
+#pragma unroll
+    for (uint32_t b = 0; b < 2; ++b) {
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i)
+        part[sub][qg + 2 * i + half][row] = sc[b][i];
+      __syncthreads();
+      if ((kl >> 2) == b) {
+        const uint32_t base_k = (kl & 3) * 4;
+#pragma unroll
+        for (uint32_t kk = 0; kk < 4; ++kk) {
+          const uint32_t kidx = base_k + kk;
+          bool valid = rows[b * 16 + kidx] >= 0;
+          if (kToks == 2 && valid) {
+            const int32_t kpos = k_base0 + (int32_t)(j0 + b * 16 + kidx);
+            valid = kpos >= my_lo && kpos <= my_p;
+          }
+          x[kk] = valid ? (part[0][qi][kidx] + part[1][qi][kidx] +
+                           part[2][qi][kidx] + part[3][qi][kidx]) *
+                              scale
+                        : -INFINITY;
+        }
+      }
+      if (b == 0)
+        __syncthreads();
+    }
+    {
+      const float m_old = m_s[qi];
+      float mx = m_old;
+#pragma unroll
+      for (uint32_t k = 0; k < 4; ++k)
+        mx = fmaxf(mx, x[k]);
+#pragma unroll
+      for (uint32_t o = 1; o < 8; o <<= 1)
+        mx = fmaxf(mx, __shfl_xor(mx, o));
+      float sum = 0.0f;
+#pragma unroll
+      for (uint32_t k = 0; k < 4; ++k) {
+        const float e = x[k] == -INFINITY ? 0.0f : __expf(x[k] - mx);
+        sum += e;
+        probs[qi * kMlaProbPitch + k0 + k] = (_Float16)e;
+      }
+#pragma unroll
+      for (uint32_t o = 1; o < 8; o <<= 1)
+        sum += __shfl_xor(sum, o);
+      if (kl == 0) {
+        const bool active_q =
+            kToks == 1 || (k_base0 + (int32_t)j0 <= my_p &&
+                           k_base0 + (int32_t)j0 + (int32_t)kMlaTile > my_lo);
+        if (active_q) {
+          const float alpha = mx == -INFINITY ? 1.0f : __expf(m_old - mx);
+          l_s[qi] = l_s[qi] * alpha + sum;
+          m_s[qi] = mx;
+          alpha_s[qi] = alpha;
+        } else {
+          alpha_s[qi] = 1.0f;
+        }
+      }
+    }
+    __syncthreads();
+
+    const bool active_w =
+        kToks == 1 || (k_base0 + (int32_t)j0 <= wave_p &&
+                       k_base0 + (int32_t)j0 + (int32_t)kMlaTile > wave_lo);
+    if (active_w) {
+#pragma unroll
+      for (uint32_t i = 0; i < 8; ++i) {
+        const float a = alpha_s[qg + 2 * i + half];
+#pragma unroll
+        for (uint32_t c = 0; c < kMlaPvTiles; ++c)
+          acc[c][i] *= a;
+      }
+#pragma unroll
+      for (uint32_t b = 0; b < 2; ++b) {
+        const MlaHalf16 pa =
+            MlaLoad16(probs + (qg + row) * kMlaProbPitch + b * 16);
+#pragma unroll
+        for (uint32_t c = 0; c < kMlaPvTiles; c += 2) {
+          const uint32_t d = sub * (kMlaDv / kMlaSplit) + c * 16 + 2 * row;
+          uint32_t ev[8], od[8];
+#pragma unroll
+          for (uint32_t k = 0; k < 16; k += 2) {
+            const uint32_t w0 = *reinterpret_cast<const uint32_t*>(
+                kt + (b * 16 + k) * kMlaKtPitch + d);
+            const uint32_t w1 = *reinterpret_cast<const uint32_t*>(
+                kt + (b * 16 + k + 1) * kMlaKtPitch + d);
+            ev[k / 2] = __builtin_amdgcn_perm(w1, w0, 0x05040100u);
+            od[k / 2] = __builtin_amdgcn_perm(w1, w0, 0x07060302u);
+          }
+          acc[c] = MlaWmma(pa, __builtin_bit_cast(MlaHalf16, ev), acc[c]);
+          acc[c + 1] =
+              MlaWmma(pa, __builtin_bit_cast(MlaHalf16, od), acc[c + 1]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (t_wave >= n)
+    return;
+#pragma unroll
+  for (uint32_t i = 0; i < 8; ++i) {
+    const uint32_t qidx = qg + 2 * i + half;
+    const uint32_t h = h_wave + 2 * i + half;
+    const float l = l_s[qidx];
+    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+    _Float16* orow = out + ((uint64_t)t_wave * kHeads + h) * kMlaDv +
+                     sub * (kMlaDv / kMlaSplit) + 2 * row;
+#pragma unroll
+    for (uint32_t c = 0; c < kMlaPvTiles; c += 2) {
+      const _Float16 v[2] = {(_Float16)(acc[c][i] * inv),
+                             (_Float16)(acc[c + 1][i] * inv)};
+      *reinterpret_cast<uint32_t*>(orow + c * 16) =
+          __builtin_bit_cast(uint32_t, v);
+    }
+  }
+}
+
 // Splits Q8_0 blocks into their values as binary16 (exact for int8) and
 // their scales as FP32.
 __global__ void Q8_0Split(const uint8_t* src, uint64_t blocks, _Float16* q,
@@ -3339,12 +3585,22 @@ int hy4_mla_prefill(const uint16_t* q, const uint16_t* keys, uint32_t ring,
                     uint32_t dk, uint32_t dv, hipStream_t stream) {
   if (n == 0)
     return 0;
-  if (dk != kMlaDk || dv != kMlaDv || heads % kMlaHeads != 0)
+  if (dk != kMlaDk || dv != kMlaDv || heads == 0 || heads % kMlaHeads != 0 ||
+      ring == 0)
     return 1;
-  MlaPrefill<<<dim3(n, heads / kMlaHeads), 32 * kMlaWaves, 0, stream>>>(
-      reinterpret_cast<const _Float16*>(q),
-      reinterpret_cast<const _Float16*>(keys), ring, lo, pos, window, sel,
-      n_sel, sinks, scale, reinterpret_cast<_Float16*>(out), heads);
+  const auto* qh = reinterpret_cast<const _Float16*>(q);
+  const auto* kh = reinterpret_cast<const _Float16*>(keys);
+  auto* oh = reinterpret_cast<_Float16*>(out);
+  if (heads == 64) {
+    MlaPrefill64<64><<<dim3(n, 1), 512, 0, stream>>>(
+        qh, kh, ring, lo, pos, window, sel, n_sel, sinks, scale, oh, n);
+  } else if (heads == 32 && window > 0 && sel == nullptr && n >= 2) {
+    MlaPrefill64<32><<<dim3((n + 1) / 2, 1), 512, 0, stream>>>(
+        qh, kh, ring, lo, pos, window, nullptr, 0, sinks, scale, oh, n);
+  } else {
+    MlaPrefill<<<dim3(n, heads / kMlaHeads), 32 * kMlaWaves, 0, stream>>>(
+        qh, kh, ring, lo, pos, window, sel, n_sel, sinks, scale, oh, heads);
+  }
   return Status();
 }
 
