@@ -128,15 +128,17 @@ void EngramReader::Worker() {
   std::vector<std::uint8_t> buf;
   std::unique_lock lock(mutex_);
   for (;;) {
-    wake_.wait(lock, [&] { return stop_ || !jobs_.empty(); });
+    wake_.wait(lock,
+               [&] { return stop_ || !jobs_.empty() || !prefetch_.empty(); });
     if (stop_)
       return;
+    std::deque<Job>& queue = jobs_.empty() ? prefetch_ : jobs_;
     Job batch[kReadBatch];
     const std::size_t count = std::min(
-        jobs_.size() >= kWorkers * kReadBatch ? kReadBatch : 1, jobs_.size());
+        queue.size() >= kWorkers * kReadBatch ? kReadBatch : 1, queue.size());
     for (std::size_t i = 0; i < count; ++i) {
-      batch[i] = jobs_.front();
-      jobs_.pop_front();
+      batch[i] = queue.front();
+      queue.pop_front();
     }
     lock.unlock();
     bool ok[kReadBatch];
@@ -207,10 +209,10 @@ void EngramReader::Prefetch(std::span<const std::uint64_t> rows) {
   {
     const std::lock_guard lock(mutex_);
     // Avoid backing up the queue behind large prefetches if many are queued.
-    if (jobs_.size() > kWorkers * 64)
+    if (prefetch_.size() > kWorkers * 64)
       return;
     for (std::uint64_t row : unique)
-      jobs_.push_back({row, nullptr, nullptr});
+      prefetch_.push_back({row, nullptr, nullptr});
   }
   if (unique.size() >= kWorkers) {
     wake_.notify_all();
