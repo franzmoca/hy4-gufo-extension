@@ -301,6 +301,11 @@ int hy4_sigmoid_mul(float* x, const float* gate, uint64_t count, hipStream_t str
  * of dim floats. */
 int hy4_swiglu(const float* gate, const float* up, const float* route_w, float* y, uint32_t rows,
                uint32_t dim, float limit, hipStream_t stream);
+/* hy4_swiglu rounded to binary16 after the FP32 product (matches feeding
+ * hy4_swiglu's output into hy4_f16_dense). */
+int hy4_swiglu_half(const float* gate, const float* up, const float* route_w,
+                    uint16_t* y_half, uint32_t rows, uint32_t dim, float limit,
+                    hipStream_t stream);
 
 /* Sigmoid routing (llama.cpp gating 2 with expert bias): probs =
  * sigmoid(logits), pick the k largest probs + bias, weights = probs of the
@@ -310,9 +315,18 @@ int hy4_route(const float* logits, const float* bias, int32_t* ids, float* weigh
 
 /* out[t] = sum_s y[t, s] over k slots of dim floats. */
 int hy4_sum_slots(const float* y, float* out, uint32_t n, uint32_t k, uint32_t dim, hipStream_t stream);
+/* hy4_sum_slots rounded to binary16 after the FP32 sum (matches feeding
+ * hy4_sum_slots's output into hy4_f16_dense). */
+int hy4_sum_slots_half(const float* y, uint16_t* out_half, uint32_t n,
+                       uint32_t k, uint32_t dim, hipStream_t stream);
 
 /* out = a + b (count floats); out may alias either. */
 int hy4_add(const float* a, const float* b, float* out, uint64_t count, hipStream_t stream);
+/* out[r] = rms_norm(a[r] + b[r], weight, eps) for rows of dim floats (out may
+ * alias a or b). Bit-identical to hy4_add + hy4_rms_norm. */
+int hy4_add_rms_norm(const float* a, const float* b, const float* weight,
+                     float* out, uint32_t rows, uint32_t dim, float eps,
+                     hipStream_t stream);
 
 /* Engram rows: out[t, c, 0:d] = rms_norm(fp8 rows[t, c]) * norm_w[c] *
  * valid[t, c], rows given as FP8 E4M3 bytes [n][cols][d]. */

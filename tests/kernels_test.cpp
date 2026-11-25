@@ -2634,6 +2634,56 @@ void TestDecodeFusions() {
   const auto pr1 = Host(po1, pring * d), pr2 = Host(po2, pring * d);
   Expect(std::memcmp(pr1.data(), pr2.data(), pr1.size() * sizeof(float)) == 0,
          "kpool_pool_rope bit-exact");
+
+  // 6. Prefill FP16 activation fusions: swiglu_half, sum_slots_half,
+  // add_rms_norm (both fast dim<=3072 and general dim>3072).
+  {
+    const uint32_t rows = 5, dim = 512, k = 8;
+    const auto ga = Random(rows * dim, -4, 4), up = Random(rows * dim, -4, 4);
+    float* yf = Device(std::vector<float>(rows * dim));
+    uint16_t* yh = Device(std::vector<uint16_t>(rows * dim));
+    uint16_t* yh_ref = Device(std::vector<uint16_t>(rows * dim));
+    std::vector<int32_t> pos(rows);
+    for (uint32_t i = 0; i < rows; ++i)
+      pos[i] = (int32_t)i;
+    int32_t* dpos = Device(pos);
+    Expect(hy4_swiglu(Device(ga), Device(up), nullptr, yf, rows, dim, 0.0f,
+                      nullptr) == 0 &&
+               hy4_store_rows_half(yf, dim, yh_ref, rows, dpos, rows, dim,
+                                   nullptr) == 0 &&
+               hy4_swiglu_half(Device(ga), Device(up), nullptr, yh, rows, dim,
+                               0.0f, nullptr) == 0,
+           "swiglu_half status");
+    Expect(Host(yh, rows * dim) == Host(yh_ref, rows * dim),
+           "swiglu_half bit-exact");
+
+    const auto sl = Random(rows * k * dim, -2, 2);
+    float* sf = Device(std::vector<float>(rows * dim));
+    uint16_t* sh = Device(std::vector<uint16_t>(rows * dim));
+    uint16_t* sh_ref = Device(std::vector<uint16_t>(rows * dim));
+    Expect(hy4_sum_slots(Device(sl), sf, rows, k, dim, nullptr) == 0 &&
+               hy4_store_rows_half(sf, dim, sh_ref, rows, dpos, rows, dim,
+                                   nullptr) == 0 &&
+               hy4_sum_slots_half(Device(sl), sh, rows, k, dim, nullptr) == 0,
+           "sum_slots_half status");
+    Expect(Host(sh, rows * dim) == Host(sh_ref, rows * dim),
+           "sum_slots_half bit-exact");
+
+    for (uint32_t adim : {3072u, 3328u}) {
+      const auto a = Random(rows * adim, -3, 3), b = Random(rows * adim, -3, 3);
+      const auto w = Random(adim, 0.5f, 1.5f);
+      float *da1 = Device(a), *db1 = Device(b), *dw = Device(w);
+      float *da2 = Device(a), *db2 = Device(b);
+      Expect(
+          hy4_add(da1, db1, da1, uint64_t{rows} * adim, nullptr) == 0 &&
+              hy4_rms_norm(da1, dw, da1, rows, adim, adim, eps, nullptr) == 0 &&
+              hy4_add_rms_norm(da2, db2, dw, da2, rows, adim, eps, nullptr) ==
+                  0,
+          "add_rms_norm status");
+      Expect(Host(da1, rows * adim) == Host(da2, rows * adim),
+             "add_rms_norm bit-exact");
+    }
+  }
 }
 
 int main() {
