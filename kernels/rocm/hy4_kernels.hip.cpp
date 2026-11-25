@@ -66,18 +66,14 @@ __device__ __forceinline__ float Sigmoid(float x) { return 1.0f / (1.0f + expf(-
 __device__ __forceinline__ float Silu(float x) { return x / (1.0f + expf(-x)); }
 
 __device__ __forceinline__ float Fp8E4M3(uint8_t v) {
-  const int sign = v >> 7;
-  const int exp = (v >> 3) & 0xF;
-  const int man = v & 0x7;
-  float r;
-  if (exp == 0) {
-    r = ldexpf((float)man, -9);  // man / 8 * 2^-6
-  } else if (exp == 0xF && man == 0x7) {
-    r = NAN;
-  } else {
-    r = ldexpf(1.0f + (float)man * 0.125f, exp - 7);
-  }
-  return sign ? -r : r;
+  const uint32_t sign = (uint32_t)(v >> 7) << 31;
+  const uint32_t exp = (v >> 3) & 0xFu;
+  const uint32_t man = v & 0x7u;
+  if (exp == 0)
+    return __uint_as_float(__float_as_uint((float)man * 0x1p-9f) | sign);
+  if (exp == 0xFu && man == 0x7u)
+    return __uint_as_float(sign | 0x7fc00000u);
+  return __uint_as_float(sign | ((exp + 120u) << 23) | (man << 20));
 }
 
 int Status() { return hipGetLastError() == hipSuccess ? 0 : 1; }
