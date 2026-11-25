@@ -282,4 +282,58 @@ void Model::EngramRows(std::span<const std::int32_t> history,
   }
 }
 
+void Model::EngramRowsLookahead(std::span<const std::int32_t> history,
+                                std::span<const std::int32_t> cur_tokens,
+                                std::span<const std::int32_t> next_tokens,
+                                std::uint32_t pos0, std::uint32_t module,
+                                std::uint64_t* rows) const {
+  const Config& c = config_;
+  const std::uint32_t n_gram = c.engram_ngram;
+  const std::uint32_t n_head = c.engram_heads_per_ngram;
+  const std::uint32_t cols = c.EngramCols();
+  const std::uint32_t cur_n = static_cast<std::uint32_t>(cur_tokens.size());
+  const std::uint32_t n = static_cast<std::uint32_t>(next_tokens.size());
+  constexpr std::int64_t kDead = -1;
+  auto cid = [&](std::int64_t t) -> std::int64_t {
+    return t < 0 || t >= static_cast<std::int64_t>(c.engram_token_map.size()) ||
+                   t == image_token_
+               ? kDead
+               : c.engram_token_map[t];
+  };
+  const std::int64_t pad = c.engram_token_map[c.engram_pad];
+  const std::int64_t next_pos0 = static_cast<std::int64_t>(pos0) + cur_n;
+  auto token_at = [&](std::int64_t p) -> std::int64_t {
+    if (p < pos0)
+      return history[static_cast<std::size_t>(p)];
+    if (p < next_pos0)
+      return cur_tokens[static_cast<std::size_t>(p - pos0)];
+    return next_tokens[static_cast<std::size_t>(p - next_pos0)];
+  };
+  std::vector<std::uint64_t> toks(n_gram);
+  const std::uint64_t* mult =
+      c.engram_mult.data() + std::size_t{module} * n_gram;
+  const std::uint32_t* primes =
+      c.engram_primes.data() + std::size_t{module} * cols;
+  const std::uint32_t* offs =
+      c.engram_offsets.data() + std::size_t{module} * cols;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    const std::int64_t p = next_pos0 + i;
+    std::int64_t id = cid(next_tokens[i]);
+    const bool dead = id == kDead;
+    toks[0] = static_cast<std::uint64_t>(dead ? pad : id);
+    for (std::uint32_t s = 1; s < n_gram; ++s) {
+      id = p - s < 0 ? kDead : cid(token_at(p - s));
+      toks[s] = static_cast<std::uint64_t>(id == kDead ? pad : id);
+    }
+    std::uint64_t rolling = toks[0] * mult[0];
+    for (std::uint32_t o = 1; o < n_gram; ++o) {
+      rolling ^= toks[o] * mult[o];
+      for (std::uint32_t h = 0; h < n_head; ++h) {
+        const std::uint32_t col = (o - 1) * n_head + h;
+        rows[std::size_t{i} * cols + col] = rolling % primes[col] + offs[col];
+      }
+    }
+  }
+}
+
 }  // namespace gufo::models::hy4_flash

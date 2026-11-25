@@ -800,19 +800,37 @@ __global__ __launch_bounds__(kThreads) void routed_f16_kernel(
       }
     }
   } else {
-    if (row0 >= m)
-      return;
+    // Stage each 16-slot tile through LDS so every slot leaves as two
+    // coalesced 16-byte float4 stores instead of scattered 4-byte writes.
+    float* stage = reinterpret_cast<float*>(smem);  // [16 slots][256 + 4]
+    constexpr int kStagePitch = kRows + 4;
+    static_assert(16 * kStagePitch * 4 <= kActBytes);
+    const uint32_t valid = min((uint32_t)kRows, m - blockIdx.x * kRows);
+    const uint32_t s_tok = tid / 32, s_col = (tid % 32) * 8;
 #pragma unroll
     for (int t = 0; t < 8; ++t) {
       if (t >= live)
-        continue;
-      const int32_t slot = slot_of[t * 16 + lane % 16];
-      if (slot < 0)
-        continue;
+        break;
+      __syncthreads();
 #pragma unroll
       for (int e = 0; e < 8; ++e)
-        static_cast<float*>(y)[(uint64_t)slot * m + row0 + 2 * e + h] =
-            finite_or_zero(acc[t][e]);
+        stage[(lane % 16) * kStagePitch + wave * 16 + 2 * e + h] = acc[t][e];
+      __syncthreads();
+      const int32_t slot = slot_of[t * 16 + s_tok];
+      if (slot >= 0 && s_col < valid) {
+        const float4 lo = *reinterpret_cast<const float4*>(
+            stage + s_tok * kStagePitch + s_col);
+        const float4 hi = *reinterpret_cast<const float4*>(
+            stage + s_tok * kStagePitch + s_col + 4);
+        float* o = static_cast<float*>(y) + (uint64_t)slot * m +
+                   blockIdx.x * kRows + s_col;
+        *reinterpret_cast<float4*>(o) =
+            float4{finite_or_zero(lo.x), finite_or_zero(lo.y),
+                   finite_or_zero(lo.z), finite_or_zero(lo.w)};
+        *reinterpret_cast<float4*>(o + 4) =
+            float4{finite_or_zero(hi.x), finite_or_zero(hi.y),
+                   finite_or_zero(hi.z), finite_or_zero(hi.w)};
+      }
     }
   }
 }

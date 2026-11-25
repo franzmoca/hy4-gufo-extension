@@ -73,7 +73,7 @@ bool EngramReader::ReadCached(std::uint64_t row, std::uint8_t* dst) {
   if (entry.busy.test_and_set(std::memory_order_acquire))
     return false;
   const bool hit = entry.valid && entry.row == row;
-  if (hit)
+  if (hit && dst != nullptr)
     std::memcpy(dst, cache_rows_.data() + slot * row_bytes_, row_bytes_);
   entry.busy.clear(std::memory_order_release);
   return hit;
@@ -109,7 +109,8 @@ bool EngramReader::ReadOne(std::uint64_t row, std::uint8_t* dst,
     got += n;
   }
   const std::uint8_t* src = base + (offset - begin);
-  std::memcpy(dst, src, row_bytes_);
+  if (dst != nullptr)
+    std::memcpy(dst, src, row_bytes_);
   // A busy slot is skipped: readers never wait for another row.
   const std::size_t slot =
       (row * 0x9e3779b97f4a7c15ULL >> 20) & (cache_count_ - 1);
@@ -144,6 +145,8 @@ void EngramReader::Worker() {
     lock.lock();
     bool finished = false;
     for (std::size_t i = 0; i < count; ++i) {
+      if (batch[i].gather == nullptr)
+        continue;
       Gather& g = *batch[i].gather;
       g.failed = g.failed || !ok[i];
       finished = --g.pending == 0 || finished;
@@ -186,6 +189,35 @@ std::shared_ptr<EngramReader::Gather> EngramReader::Start(
       wake_.notify_one();
   }
   return gather;
+}
+
+void EngramReader::Prefetch(std::span<const std::uint64_t> rows) {
+  if (rows.empty())
+    return;
+  std::vector<std::uint64_t> unique;
+  unique.reserve(rows.size());
+  for (std::uint64_t row : rows) {
+    if (row < rows_ && !ReadCached(row, nullptr))
+      unique.push_back(row);
+  }
+  if (unique.empty())
+    return;
+  std::ranges::sort(unique);
+  unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+  {
+    const std::lock_guard lock(mutex_);
+    // Avoid backing up the queue behind large prefetches if many are queued.
+    if (jobs_.size() > kWorkers * 64)
+      return;
+    for (std::uint64_t row : unique)
+      jobs_.push_back({row, nullptr, nullptr});
+  }
+  if (unique.size() >= kWorkers) {
+    wake_.notify_all();
+  } else {
+    for (std::size_t i = 0; i < unique.size(); ++i)
+      wake_.notify_one();
+  }
 }
 
 bool EngramReader::Wait(Gather& gather) {
