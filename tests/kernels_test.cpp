@@ -912,6 +912,46 @@ void TestMlaPrefill() {
     Expect(differ == 0, "mla_prefill selection below n_sel matches causal (" +
                             std::to_string(differ) + ")");
   }
+  {  // 64-head causal + sparse selection (MlaPrefill64<64>).
+    const uint32_t h64 = 64, n_sel = 40;
+    auto q64 = Random(n * h64 * dk, -1, 1);
+    std::vector<uint16_t> q64bits(q64.size());
+    for (std::size_t i = 0; i < q64.size(); ++i) {
+      q64bits[i] = HalfBits(q64[i]);
+      q64[i] = (float)HalfValue(q64bits[i]);
+    }
+    const auto s64 = Random(h64, -1, 1);
+    std::vector<int32_t> sel(n * n_sel, -1);
+    std::vector<std::vector<int32_t>> keys(n);
+    std::uniform_int_distribution<int32_t> any(0, ring - 1);
+    for (uint32_t t = 0; t < n; ++t) {
+      if (pos[t] < (int32_t)n_sel) {
+        for (int32_t k = 0; k <= pos[t]; ++k)
+          keys[t].push_back(k);
+      } else {
+        for (uint32_t i = 0; i < n_sel; ++i) {
+          if (i % 5 == 4)
+            continue;
+          const int32_t k = any(g_rng);
+          sel[t * n_sel + i] = k;
+          if (k <= pos[t])
+            keys[t].push_back(k);
+        }
+      }
+    }
+    auto* out64 = Device(std::vector<uint16_t>(n * h64 * dv));
+    Expect(hy4_mla_prefill(Device(q64bits), dc, ring, 0, dp, 0, Device(sel),
+                           n_sel, Device(s64), scale, out64, n, h64, dk, dv,
+                           nullptr) == 0,
+           "mla_prefill 64h sparse status");
+    const auto bits64 = Host(out64, n * h64 * dv);
+    std::vector<float> got64(bits64.size());
+    for (std::size_t i = 0; i < bits64.size(); ++i)
+      got64[i] = (float)HalfValue(bits64[i]);
+    Near(got64,
+         MlaReference(q64, cache, ring, keys, s64.data(), scale, h64, dk, dv),
+         4e-3, "mla_prefill 64h sparse");
+  }
   Expect(hy4_mla_prefill(dq, dc, ring, 0, dp, 0, nullptr, 0, ds, scale, nullptr,
                          n, 24, dk, dv, nullptr) != 0,
          "mla_prefill rejects 24 heads");
