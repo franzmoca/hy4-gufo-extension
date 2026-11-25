@@ -2,8 +2,7 @@
 
 These model-private kernels derive from llama.cpp commit
 `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a` (MIT, The ggml authors),
-originally under `ggml/src/ggml-cuda/`. The DS4 adapter also carries changes
-from `xangel82/DS4-GB10-GX10-DSpark-CUDA`, commit `910501e`.
+originally under `ggml/src/ggml-cuda/`.
 
 Gufo builds this directory with HIP for AMD `gfx1151`. Device headers use
 `.hip.hpp`; translation units use `.hip.cpp`. The adapter calls HIP/hipBLAS
@@ -18,7 +17,12 @@ tensor entry points are removed; the V4.1 decoder owns its HIP graph
 execution.
 
 This copy comes from `ds41-gufo-extension` at `eb8ece9`
-([UPSTREAM.md](../../../UPSTREAM.md)). When importing upstream changes,
+([UPSTREAM.md](../../../UPSTREAM.md)). Hy4 keeps only what its engine calls:
+`hy4_mmq_dense_typed` (mmq) and the `hy4_mmq_moe_vec*_typed` matvecs (mmvq),
+for Q8_0, Q4_K and Q6_K, the only quantized types in Hy4's GGUFs. DS4.1's
+other entry points, its routed-expert tiling, the `mmid` expert grouping, the
+fused DS4 prefill path and its D2R stubs, and the tiles for the V4.1 types are
+removed. The vendored kernel headers stay as imported. When importing upstream changes,
 retain the HIP implementation and check the result with the KL gate in
 [QUALITY.md](../../../docs/QUALITY.md).
 

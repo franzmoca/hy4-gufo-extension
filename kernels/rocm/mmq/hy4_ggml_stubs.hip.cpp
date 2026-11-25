@@ -162,15 +162,6 @@ struct hy4_naive_pool : public hy4_ggml_hip_pool {
 
 } // anonymous namespace
 
-extern "C" void hy4_pool_release_cached(void) {
-    std::lock_guard<std::mutex> lock(g_hy4_pool_mutex);
-    for (const hy4_cached_buffer & b : g_hy4_pool_free) {
-        hy4_ggml_hip_set_device(b.device);
-        (void)hipFreeAsync(b.ptr, b.stream);
-    }
-    g_hy4_pool_free.clear();
-}
-
 std::unique_ptr<hy4_ggml_hip_pool> hy4_ggml_hip_context::new_pool_for_device(int device, int /*stream_no*/) {
     return std::unique_ptr<hy4_ggml_hip_pool>(new hy4_naive_pool(device));
 }

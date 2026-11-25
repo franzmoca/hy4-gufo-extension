@@ -37,19 +37,9 @@ if(ENGINE_ENABLE_HIP)
   set(HY4FLASH_MMQ_SOURCES
     ${HY4FLASH_MMQ_DIR}/hy4_ggml_stubs.hip.cpp
     ${HY4FLASH_MMQ_DIR}/hy4_mmq.hip.cpp
-    ${HY4FLASH_MMQ_DIR}/hy4_mmq_d2r.hip.cpp
-    ${HY4FLASH_MMQ_DIR}/mmid.hip.cpp
     ${HY4FLASH_MMQ_DIR}/mmvq.hip.cpp
     ${HY4FLASH_MMQ_DIR}/quantize.hip.cpp)
   add_library(gufo_hy4flash_mmq STATIC ${HY4FLASH_MMQ_SOURCES})
-  foreach(hy4_mmq_type Q5_K Q6_K IQ1_S IQ1_M IQ2_XS IQ2_S)
-    set(hy4_mmq_type_source
-      "${CMAKE_CURRENT_BINARY_DIR}/hy4_mmq_v41_${hy4_mmq_type}.hip.cpp")
-    file(GENERATE OUTPUT ${hy4_mmq_type_source} CONTENT
-      "#define HY4_MMQ_TYPE GGML_TYPE_${hy4_mmq_type}\n#include \"hy4_mmq_v41_types.hip.cpp\"\n")
-    target_sources(gufo_hy4flash_mmq PRIVATE ${hy4_mmq_type_source})
-    list(APPEND HY4FLASH_MMQ_SOURCES ${hy4_mmq_type_source})
-  endforeach()
   set_source_files_properties(${HY4FLASH_MMQ_SOURCES} PROPERTIES LANGUAGE HIP)
   set_target_properties(gufo_hy4flash_mmq PROPERTIES
     HIP_STANDARD 17

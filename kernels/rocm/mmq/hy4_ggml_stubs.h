@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // hy4_ggml_stubs.h - minimal ggml-API stubs for ds4's vendored mmq kernels.
 //
-// The mmq.hip.hpp / mma.hip.hpp / vecdotq.hip.hpp / quantize.hip.hpp / mmid.hip.hpp / common.hip.hpp
+// The mmq.hip.hpp / mma.hip.hpp / vecdotq.hip.hpp / quantize.hip.hpp / common.hip.hpp
 // files in this directory are vendored verbatim from llama.cpp's ggml-cuda
 // backend (MIT, copyright 2023-2026 The ggml authors). They transitively
 // #include "ggml.h", "ggml-impl.h", "ggml-hip.h" - in ds4 those names
