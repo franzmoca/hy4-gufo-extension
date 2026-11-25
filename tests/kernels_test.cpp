@@ -2467,6 +2467,115 @@ void TestSampleAndArgmaxBatch() {
   Expect(res.degenerate == 1, "sample_row empty mask degenerate");
 }
 
+void TestDecodeFusions() {
+  // 1. hy4_rms_norm_add == hy4_rms_norm + hy4_add
+  const uint32_t rows = 5, dim = 256;
+  const float eps = 1e-6f;
+  const auto y = Random(rows * dim), x = Random(rows * dim), w = Random(dim);
+  float* dy = Device(y);
+  float* dx1 = Device(x);
+  float* dx2 = Device(x);
+  float* dw = Device(w);
+  float* tmp = Device(std::vector<float>(rows * dim));
+  Expect(hy4_rms_norm(dy, dw, tmp, rows, dim, dim, eps, nullptr) == 0 &&
+             hy4_add(dx1, tmp, dx1, rows * dim, nullptr) == 0,
+         "rms_norm_add ref status");
+  Expect(hy4_rms_norm_add(dy, dw, dx2, rows, dim, eps, nullptr) == 0,
+         "rms_norm_add status");
+  const auto r1 = Host(dx1, rows * dim), r2 = Host(dx2, rows * dim);
+  Expect(std::memcmp(r1.data(), r2.data(), r1.size() * sizeof(float)) == 0,
+         "rms_norm_add bit-exact");
+
+  // 2. hy4_rms_norm_pair_cat == 2x hy4_rms_norm into [rows][2*dim]
+  const auto w2 = Random(dim);
+  float* dw2 = Device(w2);
+  float* cat1 = Device(std::vector<float>(rows * 2 * dim));
+  float* cat2 = Device(std::vector<float>(rows * 2 * dim));
+  Expect(
+      hy4_copy_2d(cat1, 2 * dim, dy, dim, dim, rows, nullptr) == 0 &&
+          hy4_copy_2d(cat1 + dim, 2 * dim, dx1, dim, dim, rows, nullptr) == 0 &&
+          hy4_rms_norm(cat1, dw, cat1, rows, dim, 2 * dim, eps, nullptr) == 0 &&
+          hy4_rms_norm(cat1 + dim, dw2, cat1 + dim, rows, dim, 2 * dim, eps,
+                       nullptr) == 0,
+      "rms_norm_pair_cat ref status");
+  Expect(hy4_rms_norm_pair_cat(dy, dw, dx1, dw2, cat2, rows, dim, eps,
+                               nullptr) == 0,
+         "rms_norm_pair_cat status");
+  const auto c1 = Host(cat1, rows * 2 * dim), c2 = Host(cat2, rows * 2 * dim);
+  Expect(std::memcmp(c1.data(), c2.data(), c1.size() * sizeof(float)) == 0,
+         "rms_norm_pair_cat bit-exact");
+
+  // 3. hy4_gemv_q8_0_pair_strided == 2x hy4_gemv_q8_0_grouped + 2x copy_2d
+  const uint32_t m = 128, k = 128, n = 7;
+  const auto qw1 = RandomQuant(HY4_TYPE_Q8_0, m, k);
+  const auto qw2 = RandomQuant(HY4_TYPE_Q8_0, m, k);
+  const auto ix = Random(n * k);
+  auto* dqw1 = Device(qw1);
+  auto* dqw2 = Device(qw2);
+  auto* dix = Device(ix);
+  float* out1 = Device(std::vector<float>(n * 2 * m));
+  float* out2 = Device(std::vector<float>(n * 2 * m));
+  Expect(hy4_gemv_q8_0_grouped(dqw1, dix, out1, m, k, 1, n, k, 0, 2 * m, 0,
+                               nullptr) == 0 &&
+             hy4_gemv_q8_0_grouped(dqw2, dix, out1 + m, m, k, 1, n, k, 0, 2 * m,
+                                   0, nullptr) == 0,
+         "gemv_q8_0_pair_strided ref status");
+  Expect(
+      hy4_gemv_q8_0_pair_strided(dqw1, dqw2, dix, out2, m, k, n, nullptr) == 0,
+      "gemv_q8_0_pair_strided status");
+  const auto p1 = Host(out1, n * 2 * m), p2 = Host(out2, n * 2 * m);
+  Expect(std::memcmp(p1.data(), p2.data(), p1.size() * sizeof(float)) == 0,
+         "gemv_q8_0_pair_strided bit-exact");
+
+  // 4. hy4_mla_prep_store == hy4_mla_prep + hy4_store_rows_half
+  const uint32_t ql = 256, kvl = 128, nrot = 64, dk = kvl + nrot, ring = 32;
+  const auto qr = Random(n * ql), kva = Random(n * dk);
+  const auto qn = Random(ql), kvn = Random(kvl);
+  std::vector<int32_t> pos(n);
+  for (uint32_t i = 0; i < n; ++i)
+    pos[i] = 10 + static_cast<int32_t>(i);
+  float *dqr1 = Device(qr), *dqr2 = Device(qr);
+  float *dkva1 = Device(kva), *dkva2 = Device(kva);
+  float *dqn = Device(qn), *dkvn = Device(kvn);
+  int32_t* dpos = Device(pos);
+  uint16_t* kv1 = Device(std::vector<uint16_t>(ring * dk, 0));
+  uint16_t* kv2 = Device(std::vector<uint16_t>(ring * dk, 0));
+  Expect(
+      hy4_mla_prep(dqr1, dqn, ql, dkva1, dkvn, kvl, dk, dpos, nullptr, nrot,
+                   10000.0f, eps, n, nullptr) == 0 &&
+          hy4_store_rows_half(dkva1, dk, kv1, ring, dpos, n, dk, nullptr) == 0,
+      "mla_prep_store ref status");
+  Expect(
+      hy4_mla_prep_store(dqr2, dqn, ql, dkva2, dkvn, kvl, dk, dpos, nullptr,
+                         nrot, 10000.0f, eps, kv2, ring, dpos, n, nullptr) == 0,
+      "mla_prep_store status");
+  const auto k1 = Host(kv1, ring * dk), k2 = Host(kv2, ring * dk);
+  Expect(std::memcmp(k1.data(), k2.data(), k1.size() * sizeof(uint16_t)) == 0,
+         "mla_prep_store bit-exact");
+
+  // 5. hy4_kpool_pool_rope == hy4_kpool_pool + hy4_rope_3d
+  const uint32_t kpool = 4, d = 128, ng = 3, pring = 16;
+  const auto krows = Random(ring * 2 * d);
+  const auto ape = Random(kpool * d), nw = Random(d);
+  std::vector<int32_t> grps{2, 3, 4}, gpos{8, 12, 16};
+  float *dkr = Device(krows), *dape = Device(ape), *dnw = Device(nw);
+  int32_t *dgrps = Device(grps), *dgpos = Device(gpos);
+  float* po1 = Device(std::vector<float>(pring * d, 0.0f));
+  float* po2 = Device(std::vector<float>(pring * d, 0.0f));
+  Expect(hy4_kpool_pool(dkr, ring, dgrps, ng, kpool, dape, dnw, eps, po1, pring,
+                        d, nullptr) == 0 &&
+             hy4_rope_3d(po1 + std::size_t{grps[0]} * d, dgpos, nullptr, ng, 1,
+                         d, 0, d - nrot, nrot, 10000.0f, nullptr) == 0,
+         "kpool_pool_rope ref status");
+  Expect(hy4_kpool_pool_rope(dkr, ring, dgrps, dgpos, nullptr, ng, kpool, dape,
+                             dnw, eps, nrot, 10000.0f, po2, pring, d,
+                             nullptr) == 0,
+         "kpool_pool_rope status");
+  const auto pr1 = Host(po1, pring * d), pr2 = Host(po2, pring * d);
+  Expect(std::memcmp(pr1.data(), pr2.data(), pr1.size() * sizeof(float)) == 0,
+         "kpool_pool_rope bit-exact");
+}
+
 int main() {
   int devices = 0;
   if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0) {
@@ -2486,6 +2595,7 @@ int main() {
   TestRows();
   TestArgmax();
   TestSampleAndArgmaxBatch();
+  TestDecodeFusions();
   TestQuantizeHalf();
   TestQuantizeBf16();
   TestQuantizeQ4K();

@@ -10,7 +10,7 @@ namespace gufo::models::hy4_flash {
 
 /// Device scratch for one evaluation of up to Model::MaxChunk() tokens.
 struct Model::Scratch {
-  // Inputs.
+  // Inputs (device) and pinned host staging.
   std::int32_t* tokens = nullptr;  // [chunk]
   std::int32_t* pos = nullptr;     // [chunk]
   std::int32_t* groups = nullptr;  // [chunk] complete kpool groups
@@ -23,6 +23,14 @@ struct Model::Scratch {
   // pass has image rows (rope_3d).
   std::int32_t* rope = nullptr;
   std::int32_t* rope_hw = nullptr;
+  std::int32_t* tokens_host = nullptr;
+  std::int32_t* pos_host = nullptr;
+  std::int32_t* rope_host = nullptr;
+  std::int32_t* rope_hw_host = nullptr;
+  std::int32_t* n_pool_host = nullptr;
+  std::int32_t* groups_host = nullptr;
+  std::int32_t* group_pos_host = nullptr;
+  std::int32_t* group_hw_host = nullptr;
   bool rope_3d = false;
   // The pass takes the batched (prompt) kernels.
   bool batched = false;

@@ -294,6 +294,13 @@ bool Model::AllocScratchRows(Scratch& s, std::uint32_t n,
       Dev(&s.n_pool, [&](std::size_t n) { return n; }) &&
       Dev(&s.rope, [&](std::size_t n) { return n; }) &&
       Dev(&s.rope_hw, [&](std::size_t n) { return 2 * n; }) &&
+      HostAlloc(&s.tokens_host, n, owned) && HostAlloc(&s.pos_host, n, owned) &&
+      HostAlloc(&s.rope_host, n, owned) &&
+      HostAlloc(&s.rope_hw_host, 2 * n, owned) &&
+      HostAlloc(&s.n_pool_host, n, owned) &&
+      HostAlloc(&s.groups_host, n, owned) &&
+      HostAlloc(&s.group_pos_host, n, owned) &&
+      HostAlloc(&s.group_hw_host, 2 * n, owned) &&
       HostAlloc(&s.engram_host, std::size_t{modules} * n * cols * c.engram_dim,
                 owned) &&
       HostAlloc(&s.engram_valid_host, std::size_t{modules} * n * cols, owned) &&
@@ -982,26 +989,67 @@ bool Session::PrepareRows(std::span<const std::int32_t> tokens,
   if (!EnsureRows(pos0 + n, error))
     return false;
   if (write_hook_) write_hook_(write_user_, pos0, pos0 + n);
-  std::vector<std::int32_t> pos(n), rope_t(n), rope_hw(2 * n);
+  std::int32_t* h_tok = s.tokens_host + row0;
+  std::int32_t* h_pos = s.pos_host + row0;
+  std::int32_t* h_rope = s.rope_host + row0;
+  std::int32_t* h_hw = s.rope_hw_host + 2 * row0;
+  std::int32_t* h_npool = s.n_pool_host + row0;
   for (std::uint32_t i = 0; i < n; ++i) {
-    pos[i] = static_cast<std::int32_t>(pos0 + i);
-    rope_t[i] = rope[i][0];
-    rope_hw[2 * i] = rope[i][1];
-    rope_hw[2 * i + 1] = rope[i][2];
+    h_tok[i] = tokens[i];
+    h_pos[i] = static_cast<std::int32_t>(pos0 + i);
+    h_rope[i] = rope[i][0];
+    h_hw[2 * i] = rope[i][1];
+    h_hw[2 * i + 1] = rope[i][2];
+    h_npool[i] = static_cast<std::int32_t>((pos0 + i) / c.kpool);
   }
-  HY4_CHECK(hipMemcpyAsync(s.tokens + row0, tokens.data(),
-                           n * sizeof(std::int32_t), hipMemcpyHostToDevice,
-                           st));
-  HY4_CHECK(hipMemcpyAsync(s.pos + row0, pos.data(), n * sizeof(std::int32_t),
+  HY4_CHECK(hipMemcpyAsync(s.tokens + row0, h_tok, n * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, st));
-  HY4_CHECK(hipMemcpyAsync(s.rope + row0, rope_t.data(),
-                           n * sizeof(std::int32_t), hipMemcpyHostToDevice,
-                           st));
-  HY4_CHECK(hipMemcpyAsync(s.rope_hw + 2 * row0, rope_hw.data(),
-                           2 * n * sizeof(std::int32_t), hipMemcpyHostToDevice,
-                           st));
+  HY4_CHECK(hipMemcpyAsync(s.pos + row0, h_pos, n * sizeof(std::int32_t),
+                           hipMemcpyHostToDevice, st));
+  HY4_CHECK(hipMemcpyAsync(s.rope + row0, h_rope, n * sizeof(std::int32_t),
+                           hipMemcpyHostToDevice, st));
+  HY4_CHECK(hipMemcpyAsync(s.n_pool + row0, h_npool, n * sizeof(std::int32_t),
+                           hipMemcpyHostToDevice, st));
+  if (s.rope_3d) {
+    HY4_CHECK(hipMemcpyAsync(s.rope_hw + 2 * row0, h_hw,
+                             2 * n * sizeof(std::int32_t),
+                             hipMemcpyHostToDevice, st));
+  }
   chunk_rope_ = std::move(rope);
   chunk_delta_ = delta;
+  // Precompute and upload kpool groups completed in this pass once, reused
+  // across all 14 indexer layers.
+  chunk_group_offset_ = row0;
+  chunk_group_count_ = 0;
+  chunk_group_3d_ = false;
+  std::int32_t* h_grp = s.groups_host + row0;
+  std::int32_t* h_gpos = s.group_pos_host + row0;
+  std::int32_t* h_ghw = s.group_hw_host + 2 * row0;
+  for (std::uint32_t i = 0; i < n; ++i) {
+    const std::uint32_t p = pos0 + i;
+    if (p % c.kpool == c.kpool - 1) {
+      const std::uint32_t ng = chunk_group_count_++;
+      h_grp[ng] = static_cast<std::int32_t>(p / c.kpool);
+      const auto r = PassRope(p / c.kpool * c.kpool, pos0);
+      h_gpos[ng] = r[0];
+      h_ghw[2 * ng] = r[1];
+      h_ghw[2 * ng + 1] = r[2];
+      chunk_group_3d_ = chunk_group_3d_ || r[1] != r[0] || r[2] != r[0];
+    }
+  }
+  if (chunk_group_count_ > 0) {
+    HY4_CHECK(hipMemcpyAsync(s.groups + row0, h_grp,
+                             chunk_group_count_ * sizeof(std::int32_t),
+                             hipMemcpyHostToDevice, st));
+    HY4_CHECK(hipMemcpyAsync(s.group_pos + row0, h_gpos,
+                             chunk_group_count_ * sizeof(std::int32_t),
+                             hipMemcpyHostToDevice, st));
+    if (chunk_group_3d_) {
+      HY4_CHECK(hipMemcpyAsync(s.group_hw + 2 * row0, h_ghw,
+                               2 * chunk_group_count_ * sizeof(std::int32_t),
+                               hipMemcpyHostToDevice, st));
+    }
+  }
   return true;
 }
 
@@ -1472,12 +1520,20 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
                   n, ex, error, cur_half))
     return false;
   const std::int32_t* hw = s.rope_3d ? s.rope_hw : nullptr;
+  const bool fused_kv_store = !batched && parts.size() == 1;
   if (!batched) {
-    // Decode: both latent norms and the key's rope in one launch, then the
-    // query's rope, which also stores its tail in qfull.
-    HY4_CHECK(hy4_mla_prep(s.qr, l.q_a_norm.f32(), c.q_lora, s.kva,
-                           l.kv_a_norm.f32(), c.kv_lora, dk, s.rope, hw,
-                           c.n_rot, base, c.rms_eps, n, st));
+    // Decode: both latent norms, key rope and (for single-session passes)
+    // binary16 KV cache store in one launch, then query rope into qfull.
+    if (fused_kv_store) {
+      HY4_CHECK(hy4_mla_prep_store(s.qr, l.q_a_norm.f32(), c.q_lora, s.kva,
+                                   l.kv_a_norm.f32(), c.kv_lora, dk, s.rope, hw,
+                                   c.n_rot, base, c.rms_eps, first.cache_[il],
+                                   first.ring_[il], s.pos, n, st));
+    } else {
+      HY4_CHECK(hy4_mla_prep(s.qr, l.q_a_norm.f32(), c.q_lora, s.kva,
+                             l.kv_a_norm.f32(), c.kv_lora, dk, s.rope, hw,
+                             c.n_rot, base, c.rms_eps, n, st));
+    }
     if (!MatVec(l.wq_b, s.qr, s.q, heads * c.head_k, c.q_lora, n, ex, error))
       return false;
     HY4_CHECK(hy4_rope_3d_copy(s.q, s.rope, hw, n, heads,
@@ -1514,7 +1570,7 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
     return false;
   // Each session's rows: its cache, its keys and its selection.
   for (const Rows& part : parts) {
-    if (!part.session->Attend(il, part.row0, part.n, error))
+    if (!part.session->Attend(il, part.row0, part.n, fused_kv_store, error))
       return false;
   }
   if (batched) {
@@ -1552,7 +1608,7 @@ bool Session::Attention(std::span<const Rows> parts, std::uint32_t il,
 }
 
 bool Session::Attend(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
-                     std::string* error) {
+                     bool kv_stored, std::string* error) {
   Model& m = *model_;
   const Config& c = m.config_;
   const Layer& l = m.weights_.layers[il];
@@ -1562,8 +1618,10 @@ bool Session::Attend(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
   const std::uint32_t heads = c.n_head[il];
   const std::uint32_t dk = c.kv_lora + c.n_rot;
   const std::int32_t* pos = s.pos + row0;
-  HY4_CHECK(hy4_store_rows_half(s.kva + std::size_t{row0} * dk, dk, cache_[il],
-                                ring_[il], pos, n, dk, st));
+  if (!kv_stored) {
+    HY4_CHECK(hy4_store_rows_half(s.kva + std::size_t{row0} * dk, dk,
+                                  cache_[il], ring_[il], pos, n, dk, st));
+  }
 
   const std::int32_t* sel = nullptr;
   std::uint32_t n_sel = 0;
@@ -1627,11 +1685,19 @@ bool Session::IndexerProject(std::span<const Rows> parts, std::uint32_t il,
   if (!MatVec(l.idx_k, s.cur, s.ik, d, c.n_embd, n, ex, error, cur_half))
     return false;
   HY4_CHECK(hy4_rms_norm(s.ik, l.idx_k_norm.f32(), s.ik, n, d, d, c.rms_eps, st));
-  if (!MatVec(l.idx_value, s.ik, s.ffn_a, d, d, n, ex, error)) return false;
-  if (!MatVec(l.idx_gate, s.ik, s.ffn_b, d, d, n, ex, error)) return false;
-  // The scratch may be demand-mapped, which hipMemcpy2DAsync rejects.
-  HY4_CHECK(hy4_copy_2d(s.ivg, 2 * d, s.ffn_a, d, d, n, st));
-  HY4_CHECK(hy4_copy_2d(s.ivg + d, 2 * d, s.ffn_b, d, d, n, st));
+  if (l.idx_value.type == HY4_TYPE_Q8_0 && l.idx_gate.type == HY4_TYPE_Q8_0 &&
+      d % 32 == 0) {
+    HY4_CHECK(hy4_gemv_q8_0_pair_strided(l.idx_value.data, l.idx_gate.data,
+                                         s.ik, s.ivg, d, d, n, st));
+  } else {
+    if (!MatVec(l.idx_value, s.ik, s.ffn_a, d, d, n, ex, error))
+      return false;
+    if (!MatVec(l.idx_gate, s.ik, s.ffn_b, d, d, n, ex, error))
+      return false;
+    // The scratch may be demand-mapped, which hipMemcpy2DAsync rejects.
+    HY4_CHECK(hy4_copy_2d(s.ivg, 2 * d, s.ffn_a, d, d, n, st));
+    HY4_CHECK(hy4_copy_2d(s.ivg + d, 2 * d, s.ffn_b, d, d, n, st));
+  }
 
   // Query side, when some session's tokens see more pools than the top-k
   // keeps (below that every pool is selected: plain causal attention).
@@ -1668,36 +1734,16 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
                            idx_rows_[il], Model::kIndexerRing, s.pos + row0, n,
                            2 * d, st));
 
-  // Pool the groups these rows complete; a pooled key is roped at its first
-  // member's position.
-  std::vector<std::int32_t> groups, group_pos, group_hw;
-  bool group_3d = false;
-  for (std::uint32_t i = 0; i < n; ++i) {
-    const std::uint32_t p = pos0 + i;
-    if (p % c.kpool == c.kpool - 1) {
-      groups.push_back(static_cast<std::int32_t>(p / c.kpool));
-      const auto r = PassRope(p / c.kpool * c.kpool, pos0);
-      group_pos.push_back(r[0]);
-      group_hw.push_back(r[1]);
-      group_hw.push_back(r[2]);
-      group_3d = group_3d || r[1] != r[0] || r[2] != r[0];
-    }
-  }
+  // Pool the groups these rows complete (precomputed and uploaded once in
+  // PrepareRows); a pooled key is roped at its first member's position.
   const std::uint32_t pool_rows = max_context_ / c.kpool + 1;
-  if (!groups.empty()) {
-    const std::uint32_t ng = static_cast<std::uint32_t>(groups.size());
-    HY4_CHECK(hipMemcpyAsync(s.groups, groups.data(), ng * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-    HY4_CHECK(hipMemcpyAsync(s.group_pos, group_pos.data(), ng * sizeof(std::int32_t), hipMemcpyHostToDevice, st));
-    if (group_3d) {
-      HY4_CHECK(hipMemcpyAsync(s.group_hw, group_hw.data(),
-                               2 * ng * sizeof(std::int32_t),
-                               hipMemcpyHostToDevice, st));
-    }
-    HY4_CHECK(hy4_kpool_pool(idx_rows_[il], Model::kIndexerRing, s.groups, ng, c.kpool, l.idx_ape.f32(), l.idx_comp_norm.f32(),
-                             c.rms_eps, idx_pooled_[il], pool_rows, d, st));
-    HY4_CHECK(hy4_rope_3d(idx_pooled_[il] + std::size_t(groups[0]) * d,
-                          s.group_pos, group_3d ? s.group_hw : nullptr, ng, 1,
-                          d, 0, d - c.n_rot, c.n_rot, base, st));
+  if (chunk_group_count_ > 0) {
+    HY4_CHECK(hy4_kpool_pool_rope(
+        idx_rows_[il], Model::kIndexerRing, s.groups + chunk_group_offset_,
+        s.group_pos + chunk_group_offset_,
+        chunk_group_3d_ ? s.group_hw + 2 * chunk_group_offset_ : nullptr,
+        chunk_group_count_, c.kpool, l.idx_ape.f32(), l.idx_comp_norm.f32(),
+        c.rms_eps, c.n_rot, base, idx_pooled_[il], pool_rows, d, st));
   }
 
   // Selection, once a token sees more pools than the top-k keeps; below
@@ -1705,11 +1751,6 @@ bool Session::Indexer(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
   const std::uint32_t top = c.idx_top_k / c.kpool - 1;
   const std::uint32_t n_pool_max = (pos0 + n - 1) / c.kpool;
   if (n_pool_max <= top) return true;
-  std::vector<std::int32_t> n_pool(n);
-  for (std::uint32_t i = 0; i < n; ++i) n_pool[i] = static_cast<std::int32_t>((pos0 + i) / c.kpool);
-  HY4_CHECK(hipMemcpyAsync(s.n_pool + row0, n_pool.data(),
-                           n * sizeof(std::int32_t), hipMemcpyHostToDevice,
-                           st));
   // Scores and selections in slices of kScoreRows tokens, so that the score
   // buffer stays [kScoreRows][pools] however wide the pass; each token's
   // selection depends only on its own visible pools.
