@@ -45,14 +45,14 @@ cmake --build --preset release --parallel 4
 ## Install as a module
 
 `gufo extension install` builds the extension against the Gufo you run, so it
-needs the extension API of the pinned revision (0.3.29, Gufo `main` `0a473ebf`)
+needs the extension API of the pinned revision (0.3.43, Gufo `main` `abebd1c0`)
 or later in the same 0.3 series. The v0.35.0 release, and the `latest`
 container built from it, report API 0.3.20 and are rejected. Use the `edge`
 container, which follows `main`:
 
 ```sh
 podman pull ghcr.io/gufo-org/toolboxes/gufo-runtime:edge
-gufo extension install https://github.com/franzmoca/hy4-gufo-extension@v0.2.1 --yes
+gufo extension install https://github.com/franzmoca/hy4-gufo-extension@v0.3.0 --yes
 ```
 
 Mount the extensions volume at `/home/gufo/.local/share/gufo/extensions` so

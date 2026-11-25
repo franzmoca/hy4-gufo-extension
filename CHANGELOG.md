@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-25)
 
 Built on upstream Gufo `abebd1c0`; needs extension API 0.3.43 or later.
 
