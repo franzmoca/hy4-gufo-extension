@@ -68,6 +68,19 @@ noted. Design decisions are numbered in [PLAN.md](PLAN.md).
 | E60 | Decode time after E59 | analysis |
 | E61 | Vision tower GEMMs on hipBLASLt | retained |
 | E62 | Prepared image cache | retained |
+| E63 | Shape-aware GEMV slices and 16 MiB split scratch | retained |
+| E64 | Halved decode attention partial splits and scratch | retained |
+| E65 | Grouped routed-expert GEMV: on-device plan, SGPR offsets and task-major dispatch | retained |
+| E66 | DFly2 Q4_K head/FFN, GPU load quantization and fused drafter attention | retained |
+| E67 | Restore `n=1` occupancy in decode attention and single-slot expert GEMV | retained |
+| E68 | Gufo `abebd1c0`: SDMA copy-engine restores and demand-mapped `SessionState` | retained |
+| E69 | Narrow-N FP16 WMMA specialization and multi-user DFly2 concurrency gating | retained |
+| E70 | GPU sampling, lazy logits download and cached grammar bitmasks | retained |
+| E71 | 64-query `MlaPrefill64` blocking for sparse and SWA prefill | retained |
+| E72 | Fused decode/drafter kernels and pinned per-pass host metadata | retained |
+| E73 | On-GPU prefill routed-expert plan, coalesced down stores and Engram lookahead | retained |
+| E74 | Vision attention LDS K/V sharing and folded `AttnPack` zero-padding | retained |
+| E75 | Bit-level `Fp8E4M3` decode and Barrett reciprocal Engram modulo | retained |
 
 ## E1: DFly2 at fixed draft lengths (2026-11-19)
 
@@ -1477,4 +1490,172 @@ The first token is now the prefill of the new turn's tokens (about 175 ms).
 The rest of the wall time is the request itself: 20 MB of base64 JSON
 parsed and decoded per turn, which needs `--max-request-bytes` above its 8
 MB default. Retained.
+
+## E63: Shape-aware GEMV slices and 16 MiB split scratch (2026-11-25)
+
+`hy4_gemv` previously chose a fixed split count over a 4 MiB scratch buffer,
+under-utilizing the 40 CUs on smaller projections and capping split parallelism
+on multi-token verify passes. The dispatch now picks slice counts by `(m, k, n)`
+shape over a 16 MiB split scratch buffer (`hy4_gemv.hip.cpp`), matching the
+single-token reduction order bit for bit (`--passcheck 8` exact). Retained.
+
+## E64: Halved decode attention partial splits and scratch (2026-11-25)
+
+`MlaDecode` split the KV cache into 2× more partial tiles than needed on
+`gfx1151`, doubling partial scratch writes and reduction passes in
+`MlaDecodeReduce`. Halving the split factor cuts decode attention scratch and
+reduces partial-reduction overhead while keeping the per-key reduction exact.
+Retained.
+
+## E65: Grouped routed-expert GEMV: on-device plan, SGPR offsets and task-major dispatch (2026-11-25)
+
+Multi-token verify passes (`n = 2..16`) previously sorted/grouped active routed
+experts on the host or suffered repeated expert reads and VGPR base-address
+pressure. `hy4_expert_plan` now groups slots by expert directly on the GPU, and
+`hy4_gemv_experts` uses SGPR expert base offsets with task-major dispatch so
+shared experts across verify tokens or concurrent sessions are read once from
+DRAM.
+
+On `--batchcheck 6` (3 sessions × 5 rows = 15-row verify passes), batched
+verify throughput rises from 49.6 to 53.4 tok/s (+7.7%) with `0/30` logit row
+diffs; on 4-session DFly2 (`cut400`), verify drops from 200.83 to 159.50 ms
+(-20.6%). Retained.
+
+## E66: DFly2 Q4_K head/FFN, GPU load quantization and fused drafter attention (2026-11-25)
+
+DFly2 previously quantized its LM head copy and five drafter layers on the CPU
+to Q8_0 (1.35 GiB resident), and ran unfused drafter attention. Load-time GPU
+quantization kernels (`hy4_q4k_quant.hip.cpp`) now quantize DFly2's LM head
+copy, FFN projections, MTP fusion, and hidden-correction projections to Q4_K on
+the GPU (0.20–0.35 s load time, 849 MiB resident), and `hy4_dfly_attention`
+fuses the drafter's cross-attention over the target's tapped sparse KV rows and
+the draft block's own keys.
+
+Draft latency drops 28% single-user (7.51 → 5.42 ms on `cut400`, 12.06 → 8.74
+ms on `cut3712`) and 33% at four users (14.91 → 9.98 ms on `cut400`). Greedy
+replies stay identical to plain AR because the exact trunk verifies every
+proposal. Retained.
+
+## E67: Restore `n=1` occupancy in decode attention and single-slot expert GEMV (2026-11-25)
+
+After E63–E66, `n=1` plain AR regressed by 1.1% (19.19 → 18.97 tok/s) because
+`MlaDecode` used fewer waves per block and `expert_single_kernel` used more
+waves than optimal for single-token occupancy on `gfx1151`. Restoring
+`Hpw=1, Warps=8` in `MlaDecode` and `kSingleWaves=4` in `expert_single_kernel`
+recovers plain AR to 19.16–19.20 tok/s while preserving all multi-token and
+DFly2 gains. Retained.
+
+## E68: Gufo `abebd1c0`: SDMA copy-engine restores and demand-mapped `SessionState` (2026-11-25)
+
+Bumped the pinned Gufo revision from `0a473ebf` to `abebd1c0` (`api_version >=
+0.3.43`). `ContinuationAdapter` now copies prompt-cache snapshots onto the GPU
+through `hip::CopySnapshotToDevice(..., transfer)` so restores use the SDMA
+copy engine beside active decode streams instead of stalling compute.
+`Model::CreateSession` declares non-SWA KV caches and pooled indexer keys as
+demand-mapped `kContext` regions via `mem::SessionState::Create`, growing them
+via `EnsureRows` + `MapAhead` and releasing pages via `TrimTo(0)` on `Reset()`,
+and reports accurate demand-mapped `ResourceClaim` and `StateAccount`
+accounting. (`shared_restore` is not used because Hy4's 1,152-byte latent row
+does not divide 2 MiB pages.) Retained.
+
+## E69: Narrow-N FP16 WMMA specialization and multi-user DFly2 concurrency gating (2026-11-25)
+
+`dense_f16_kernel` (`kTile=128`, 16 waves) left most of its token tiles and CUs
+idle on narrow batches (`n = 1..64`, including `Drafter::DraftBatch` at
+`ns = 3..8` and prefill tails). Added `dense_f16_narrow_kernel` (4 waves = 64
+rows/block, `kTiles=2` for `rem <= 32` and `kTiles=4` for `rem <= 64`),
+bit-identical to `kTile=128` (`kernels` test).
+
+In `Hy4TextRunner::DecodeBatch`, DFly2 drafting is automatically skipped when
+`decodes.size() > dfly_max_concurrency_` (default `5`, overridden by
+`HY4_DFLY_MAX_CONCURRENCY`), avoiding negative-ROI 1-draft overhead at 6–8
+concurrent users while keeping prompt-lookup `Copy()` active at all widths.
+Retained.
+
+## E70: GPU sampling, lazy logits download and cached grammar bitmasks (2026-11-25)
+
+Decode passes (`Step`, `Verify`, `DecodeBatch`) previously copied full FP32
+logits (`120,832 × 4 B = 483 KiB` per row) to the host after every step. Added
+batched `hy4_argmax_rows` (`1..16` rows) and `hy4_sample_row` (adapted from
+DS41 `239e274`, supporting plain softmax, packed-bitmask grammar softmax, and
+`temperature <= 0` masked greedy). Decode passes now leave logits resident on
+device, download only `1..16` `int32_t` argmaxes, and flush lazily via
+`EnsureLogits()` only if another session overwrites the shared buffer or host
+logits are requested (e.g., logprobs or penalties). `TryDeviceSample` uses
+`CachedConstraintBitmask()` and caches the uploaded GPU mask across steps.
+Retained.
+
+## E71: 64-query `MlaPrefill64` blocking for sparse and SWA prefill (2026-11-25)
+
+Added `MlaPrefill64<kHeads>` (16 waves = 512 threads, 64 queries sharing each
+32-key `kt` tile in LDS): `kHeads=64` covers all 64 heads of a token on sparse
+layers (including `sel != nullptr`), and `kHeads=32` pairs 2 tokens × 32 heads
+on SWA layers (`window > 0 && sel == nullptr && n >= 2`), covering all 42 Hy4
+layers and halving KV DRAM traffic when scattered sparse KV exceeds the 32 MiB
+LLC. Micro-benchmarked faster across all shapes (~4% at short context) and
+verified bit-exact on `--chunkcheck 399`, `--chunkcheck 320` and `TestMlaPrefill`.
+(`no-real-true16` was tested on `MlaPrefill` and slowed it by 5%, so default
+true16 was kept.) Retained.
+
+## E72: Fused decode/drafter kernels and pinned per-pass host metadata (2026-11-25)
+
+Added five bit-exact fused kernels (`TestDecodeFusions`):
+- `hy4_mla_prep_store`: fuses `q_a_norm`, `kv_a_norm`, key RoPE, and single-session
+  binary16 KV store (-42 launches/token);
+- `hy4_gemv_q8_0_pair_strided`: fuses indexer `idx_value` + `idx_gate` and
+  interleaved `s.ivg` write (-42 launches across 14 indexer layers);
+- `hy4_kpool_pool_rope`: fuses kpool pooling, APE, norm and RoPE (-14 launches
+  when pooling completes);
+- `hy4_rms_norm_add` (-5 launches/draft) and `hy4_rms_norm_pair_cat`
+  (-21 launches/draft) in DFly2.
+
+Host metadata (`tokens`, `pos`, `rope`, `rope_hw`, `n_pool`, `groups`,
+`group_pos`, `group_hw` and DFly2 `HostIo`) is staged in pinned memory and
+`n_pool`/`groups` are precomputed and uploaded once in `PrepareRows` instead of
+per layer. Retained.
+
+## E73: On-GPU prefill routed-expert plan, coalesced down stores and Engram lookahead (2026-11-25)
+
+- `hy4_f16_routed_plan_gpu` computes the routed-expert histogram, prefix sums,
+  tile list (with `-1` sentinels) and slot scatter on the GPU, removing all 41
+  per-layer `hipStreamSynchronize` + D2H/H2D stalls in prefill `Session::Ffn`.
+- `routed_f16_kernel` (`!kPair`, down projection) stages each 16-slot tile
+  through LDS (reusing `smem`) for coalesced `float4` stores instead of
+  scattered 4-byte writes.
+- `EngramReader::Prefetch` and `Model::EngramRowsLookahead` prefetch the next
+  chunk's Engram rows while the current chunk evaluates.
+- A BF16 WMMA router (`hy4_sgemm_nt_bf16_wmma`) was prototyped and **rejected**:
+  truncating FP32 router activations to BF16 degraded `--kl-decode`
+  (0.05142 → 0.05469 KL, clamped PPL 14.6885 → 14.9218) and slowed `pp3712`
+  (888.1 → 795.6 tok/s) compared to `hy4_sgemm_nt_bf16`.
+
+Retained (without router WMMA). `pp3712` runs at 888.1 tok/s (4.180 s) with
+`--kl-decode` unchanged (`KL 0.05142 ± 0.00649`, 94.46% same top, clamped PPL
+`14.6885`).
+
+## E74: Vision attention LDS K/V sharing and folded `AttnPack` zero-padding (2026-11-25)
+
+In `hy4_vision.hip.cpp`, `AttnPack` now writes zero-padding directly for padded
+head/sequence slots, eliminating all 81 `hipMemsetAsync` clears per image.
+Vision attention cooperatively stages K and V tiles into an overlapping LDS
+union (`20.7 KiB`, 5 `uint4` loads/thread), reducing global K/V reads 4× across
+the 4 query waves. Passed `hy4flash.vision_kernels`. Retained.
+
+## E75: Bit-level `Fp8E4M3` decode and Barrett reciprocal Engram modulo (2026-11-25)
+
+Replaced `ldexpf` in `Fp8E4M3` with exact IEEE-754 bit manipulation and
+precomputed 64-bit Barrett reciprocals (`FastMod64`) for `engram_primes` in
+`EngramRows` and `EngramRowsLookahead`. (HIP graph capture for decode was
+evaluated and skipped because mid-layer async Engram NVMe gathers at layers 1
+and 15 and dynamic kpool/sparse switching break single-graph capture.)
+
+End-to-end summary (`Hy4-flash-Q4_K_M` + DFly2, `e682c07` vs `623c0d2`):
+- Plain AR (`cut400 --gen 128`, `n=1`): 19.19 → 19.20 tok/s
+- Batched verify (`batchcheck 6`, 3×5): 49.6 → 53.4 tok/s (+7.7%, `0/30` diffs)
+- DFly2 `ns=1`: `cut400` 24.37 → 25.48 tok/s (+4.6%, draft 7.51 → 5.38 ms);
+  `cut3712` 29.34 → 32.11 tok/s (+9.4%, draft 12.06 → 8.67 ms, verify 83.95 → 79.25 ms)
+- DFly2 `ns=4`: `cut400` 52.15 → 66.99 tok/s (+28.5%, draft 14.91 → 9.94 ms, verify 200.83 → 158.93 ms);
+  `cut3712` 43.91 → 50.71 tok/s (+15.5%, draft 19.77 → 16.29 ms, verify 145.33 → 127.92 ms)
+
+Retained.
 
