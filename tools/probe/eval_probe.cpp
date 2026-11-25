@@ -18,7 +18,8 @@
 // --kl-divergence-base file (its tokens and log-probabilities) and reports
 // the KL divergence from it, the same-top-token rate and the perplexity;
 // --kl-decode BASE scores the same way with the scored half run as one-token
-// decoding passes.
+// decoding passes. --keepcheck N verifies the prompt's last N tokens and
+// checks that after Keep the device draws from the kept row.
 
 #include <algorithm>
 #include <chrono>
@@ -105,6 +106,7 @@ int main(int argc, char** argv) {
   std::uint32_t passcheck = 0;
   std::uint32_t batchcheck = 0;
   std::uint32_t chunkcheck = 0;
+  std::uint32_t keepcheck = 0;
   int repeat =
       1;  // timed prefills, each on a fresh session; the last one decodes
   for (int i = 3; i + 1 < argc; i += 2) {
@@ -123,6 +125,8 @@ int main(int argc, char** argv) {
       passcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--batchcheck")
       batchcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
+    else if (a == "--keepcheck")
+      keepcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--chunkcheck") chunkcheck = static_cast<std::uint32_t>(std::atoi(argv[i + 1]));
     else if (a == "--repeat")
       repeat = std::max(1, std::atoi(argv[i + 1]));
@@ -254,6 +258,44 @@ int main(int argc, char** argv) {
     std::printf("chunkcheck %u: %d/%zu same top, max |dlogit| %.4f, mean KL %.6f\n", split, same, rows, max_diff,
                 sum_kl / double(rows));
     return 0;
+  }
+  if (keepcheck) {
+    // Verify the prompt's last `keepcheck` tokens, keep the first k of them
+    // and draw greedily on the device: the draw must be the host argmax of
+    // the kept row, with or without a host download of the pass logits
+    // before Keep (as a host-sampled verify row does).
+    const std::uint32_t n = std::min<std::uint32_t>(
+        keepcheck, static_cast<std::uint32_t>(prompt.size()) - 1);
+    const std::size_t head = prompt.size() - n;
+    int bad = 0, cases = 0;
+    for (int downloaded = 0; downloaded < 2; ++downloaded) {
+      for (std::uint32_t k = 1; k <= n; ++k) {
+        auto se = model->CreateSession(ctx, &error);
+        if (!se || !se->Prompt(std::span(prompt.data(), head), &error) ||
+            !se->Verify(std::span(prompt.data() + head, n), &error)) {
+          std::fprintf(stderr, "keepcheck failed: %s\n", error.c_str());
+          return 1;
+        }
+        if (downloaded)
+          (void)se->PassLogits(0);
+        se->Keep(k);
+        std::int32_t device = -1;
+        const bool ok = se->DeviceSampleLast(nullptr, 0, 0.0f, 0.0, &device);
+        const auto& l = se->LastLogits();
+        const auto host = static_cast<std::int32_t>(
+            std::max_element(l.begin(), l.end()) - l.begin());
+        ++cases;
+        if (!ok || device != host) {
+          ++bad;
+          std::printf("keep %u of %u (%s): device %d, host %d\n", k, n,
+                      downloaded ? "downloaded" : "resident", ok ? device : -1,
+                      host);
+        }
+      }
+    }
+    std::printf("keepcheck %u: %d of %d device draws differ from the kept row\n",
+                n, bad, cases);
+    return bad == 0 ? 0 : 1;
   }
   if (batchcheck) {
     // Three sessions over the prompt's first 100%, 60% and 30%: `batchcheck`

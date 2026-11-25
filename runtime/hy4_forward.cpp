@@ -884,10 +884,15 @@ void Session::Keep(std::uint32_t tokens) {
   if (logits_on_host_) {
     const auto row = PassLogits(tokens - 1);
     last_logits_.assign(row.begin(), row.end());
-  } else if (logits_count_ >= tokens) {
+  }
+  // The device rows stay valid after a host copy: device sampling must read
+  // the kept row, not the last row of the pass.
+  if (logits_count_ >= tokens) {
     logits_row0_ += tokens - 1;
     logits_count_ = 1;
     last_row_ = 0;
+  } else if (logits_on_host_) {
+    logits_count_ = 0;
   }
   // The pass left its last tap_rows_ (= evaluated) rows.
   if (tap_ready_) tap_row_ = tap_rows_ - (evaluated - tokens) - 1;
@@ -1029,11 +1034,7 @@ bool Session::PrepareRows(std::span<const std::int32_t> tokens,
                            hipMemcpyHostToDevice, st));
   HY4_CHECK(hipMemcpyAsync(s.n_pool + row0, h_npool, n * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, st));
-  if (s.rope_3d) {
-    HY4_CHECK(hipMemcpyAsync(s.rope_hw + 2 * row0, h_hw,
-                             2 * n * sizeof(std::int32_t),
-                             hipMemcpyHostToDevice, st));
-  }
+  // rope_hw is uploaded by Pass for all parts once any part has image rows.
   chunk_rope_ = std::move(rope);
   chunk_delta_ = delta;
   // Precompute and upload kpool groups completed in this pass once, reused
@@ -1162,6 +1163,12 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
     if (!part.session->PrepareRows(tokens, part.row0, error))
       return false;
   }
+  // Every row's height/width positions once any part has image rows: the
+  // ropes then read s.rope_hw for text rows of other parts too.
+  if (s.rope_3d)
+    HY4_CHECK(hipMemcpyAsync(s.rope_hw, s.rope_hw_host,
+                             2 * std::size_t{n} * sizeof(std::int32_t),
+                             hipMemcpyHostToDevice, st));
   // Layers after which a prompt pass yields to the host's decode rounds.
   std::vector<std::uint32_t> yield_after;
   if (prompt && first.yield_ && first.yield_groups_ > 1) {
@@ -1273,6 +1280,15 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
         need_f32 ? s.cur : nullptr, half ? s.cur_half : nullptr, norm.f32(),
         post, n, c.hc, c.n_embd, c.rms_eps, c.hc_eps, magnitude, st);
   };
+  // Whether a batched projection of s.cur reads the FP32 rows: everything
+  // but the binary16-input kernels of MatVec (quantized, k % 256 == 0,
+  // m % 16 == 0).
+  auto reads_f32 = [&](const Tensor& t) {
+    const bool quantized = t.type == HY4_TYPE_Q8_0 || t.type == HY4_TYPE_Q4_K ||
+                           t.type == HY4_TYPE_Q6_K;
+    return !quantized || t.dims.size() < 2 || c.n_embd % 256 != 0 ||
+           t.dims[1] % 16 != 0;
+  };
   // A pending post applied now, for something that reads h.
   auto apply_post = [&]() {
     if (y_norm &&
@@ -1302,12 +1318,8 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
                                  kEngramEps, st));
     }
 
-    const bool attn_needs_f32 =
-        c.has_indexer[il] || l.wq_a.type == HY4_TYPE_F32 ||
-        l.wq_a.type == HY4_TYPE_BF16 || l.wq_a.type == HY4_TYPE_F16 ||
-        l.wkv_a.type == HY4_TYPE_F32 || l.wkv_a.type == HY4_TYPE_BF16 ||
-        l.wkv_a.type == HY4_TYPE_F16 || l.attn_gate.type == HY4_TYPE_F32 ||
-        l.attn_gate.type == HY4_TYPE_BF16 || l.attn_gate.type == HY4_TYPE_F16;
+    const bool attn_needs_f32 = c.has_indexer[il] || reads_f32(l.wq_a) ||
+                                reads_f32(l.wkv_a) || reads_f32(l.attn_gate);
     HY4_CHECK(boundary(l.hc_attn_fn, l.hc_attn_scale, l.hc_attn_base, s.post,
                        c.hc_magnitude, l.attn_norm, true, attn_needs_f32));
     if (!Attention(rows, il, n, error))
@@ -1318,10 +1330,7 @@ bool Session::Pass(std::span<const PassPart> parts, std::string* error) {
       y_norm = l.attn_post_norm.f32();
 
     const bool ffn_needs_f32 =
-        il >= c.n_dense_lead || l.ffn_gate.type == HY4_TYPE_F32 ||
-        l.ffn_gate.type == HY4_TYPE_BF16 || l.ffn_gate.type == HY4_TYPE_F16 ||
-        l.ffn_up.type == HY4_TYPE_F32 || l.ffn_up.type == HY4_TYPE_BF16 ||
-        l.ffn_up.type == HY4_TYPE_F16;
+        il >= c.n_dense_lead || reads_f32(l.ffn_gate) || reads_f32(l.ffn_up);
     HY4_CHECK(boundary(l.hc_ffn_fn, l.hc_ffn_scale, l.hc_ffn_base, s.post,
                        c.hc_magnitude, l.ffn_norm, true, ffn_needs_f32));
     if (!first.Ffn(il, n, error))
