@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "name": "hy4flash",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "api_version": ">= 0.3.43",
   "entry": "hy4flash_register",
   "registration_target": "gufo_hy4flash",

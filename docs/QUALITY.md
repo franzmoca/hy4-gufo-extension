@@ -117,6 +117,15 @@ with DFly2 and the vision sidecar:
 | `batch`, `prefill-scheduling` | passed (2026-11-20, after E48-E51) |
 | `tool-images` | passed but `tool_images_two_calls`: the model answers `red, blue` to "separated by a comma and no spaces" |
 
+Release 0.3.0 (2026-11-25), installed as a module with
+`gufo extension install` into Gufo `abebd1c0`'s SDK build, DFly2, the vision
+sidecar and `--context 32768`: `conversation`, `long-context`, `cache` (disk
+restart included), `reasoning-budget`, `image-inputs`, `batch`,
+`prefill-scheduling` and `tool-images` passed. In `tools`, `native-tools`
+passed and `auto-tools` stopped at the 12-token limit case above, which ends
+its run. 0.3.1 removes only code the engine never calls and gives the same
+logits, so these results hold for it.
+
 Release 0.1.0 (2026-11-20), the `nix build` of this extension at Gufo
 `0a473ebf`, `--context 32768`: `conversation`, `long-context`, `cache`,
 `reasoning-budget`, `image-inputs`, `batch` and `prefill-scheduling` passed;

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.1 (2026-11-25)
+
+Built on upstream Gufo `abebd1c0`; needs extension API 0.3.43 or later.
+
+- The vendored MMQ layer keeps only what the engine calls:
+  `hy4_mmq_dense_typed` and the `hy4_mmq_moe_vec*_typed` matvecs, for Q8_0,
+  Q4_K and Q6_K, the only quantized types in the Xylolabs and AngelSlim GGUFs.
+  DS4.1's other entry points, its routed-expert tiling, the `mmid` grouping,
+  the fused DS4 prefill path with its D2R stubs, and the tiles for the V4.1
+  weight types are removed (about 1,970 lines). Logits are unchanged:
+  `--kl-decode` gives KL `0.05142 ± 0.00649`, 94.46% same top, clamped PPL
+  `14.6885` as in 0.3.0, and `--passcheck 8`, `--batchcheck 6` and
+  `--chunkcheck 800` stay bit-exact. A GGUF with other quantized types (Q5_K,
+  IQ types) was not served before and is now refused at the MMQ layer too.
+
 ## 0.3.0 (2026-11-25)
 
 Built on upstream Gufo `abebd1c0`; needs extension API 0.3.43 or later.
