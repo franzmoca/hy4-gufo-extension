@@ -1810,33 +1810,24 @@ bool Session::Ffn(std::uint32_t il, std::uint32_t n, std::string* error) {
                   HY4_F16_X_HALF | HY4_F16_OUT_HALF, ex, error))
       return false;
     if (l.gate_exps.type != l.up_exps.type) return Fail(error, "hy4: gate and up experts differ in type");
-    // The routed plan: slots grouped by expert in 128-slot tiles.
+    // Build the routed plan directly on GPU (eliminates D2H + sync + H2D per
+    // MoE layer during prefill).
     const std::uint32_t slots = n * used;
-    HY4_CHECK(hipMemcpyAsync(s.ids_host, s.ids,
-                             std::size_t{slots} * sizeof(std::int32_t),
-                             hipMemcpyDeviceToHost, st));
-    HY4_CHECK(hipStreamSynchronize(st));
-    std::int32_t* rows = s.route_plan_host;
-    std::int32_t* bounds = rows + slots;
-    std::int32_t* tiles = bounds + c.n_expert + 1;
-    const std::uint32_t n_tiles =
-        hy4_f16_routed_plan(s.ids_host, slots, c.n_expert, rows, bounds, tiles);
-    const std::size_t plan = std::size_t{slots} + c.n_expert + 1 + n_tiles;
-    HY4_CHECK(hipMemcpyAsync(s.route_plan, s.route_plan_host,
-                             plan * sizeof(std::int32_t), hipMemcpyHostToDevice,
-                             st));
-    const std::int32_t* d_rows = s.route_plan;
-    const std::int32_t* d_bounds = d_rows + slots;
-    const std::int32_t* d_tiles = d_bounds + c.n_expert + 1;
+    std::int32_t* d_rows = s.route_plan;
+    std::int32_t* d_bounds = d_rows + slots;
+    std::int32_t* d_tiles = d_bounds + c.n_expert + 1;
+    const std::uint32_t max_tiles = hy4_f16_routed_max_tiles(slots, c.n_expert);
+    HY4_CHECK(hy4_f16_routed_plan_gpu(s.ids, slots, c.n_expert, d_rows,
+                                      d_bounds, d_tiles, max_tiles, st));
     // Gate and up with SwiGLU into FP16 rows (in ffn_c), then down.
     auto* mid = reinterpret_cast<std::uint16_t*>(s.ffn_c);
     HY4_CHECK(hy4_f16_routed(l.gate_exps.type, l.gate_exps.data, l.up_exps.data,
                              ExpertBytes(l.gate_exps), latent, used, d_rows,
-                             d_bounds, d_tiles, n_tiles, s.route_w,
+                             d_bounds, d_tiles, max_tiles, s.route_w,
                              c.swiglu_clamp[il], mid, f, c.n_latent, st));
     HY4_CHECK(hy4_f16_routed(l.down_exps.type, l.down_exps.data, nullptr,
                              ExpertBytes(l.down_exps), mid, 1, d_rows, d_bounds,
-                             d_tiles, n_tiles, nullptr, 0.0f, s.ffn_a,
+                             d_tiles, max_tiles, nullptr, 0.0f, s.ffn_a,
                              c.n_latent, f, st));
     HY4_CHECK(hy4_sum_slots(s.ffn_a, s.moe, n, used, c.n_latent, st));
     if (!MatVec(l.routed_up, s.moe, s.y, c.n_embd, c.n_latent, n, ex, error)) return false;
