@@ -403,7 +403,7 @@ private:
   // This session's rows of a layer's attention: cache rows, indexer
   // selection, taps and the attention itself.
   bool Attend(std::uint32_t il, std::uint32_t row0, std::uint32_t n,
-              std::string* error);
+              bool kv_stored, std::string* error);
   // The indexer's projections, over every part's rows.
   static bool IndexerProject(std::span<const Rows> parts, std::uint32_t il,
                              std::uint32_t n, std::string* error);
@@ -422,6 +422,10 @@ private:
   // The rope positions of the pass being evaluated, from its first position.
   std::vector<std::array<std::int32_t, 3>> chunk_rope_;
   std::int32_t chunk_delta_ = 0;
+  // Precomputed kpool groups completed by this session in the current pass.
+  std::uint32_t chunk_group_offset_ = 0;
+  std::uint32_t chunk_group_count_ = 0;
+  bool chunk_group_3d_ = false;
   // The pass's image rows: scratch row, image, its first row, count, and
   // the image's embeddings.
   struct ImageCopy {

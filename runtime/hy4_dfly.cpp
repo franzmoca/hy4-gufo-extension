@@ -211,6 +211,8 @@ Drafter::Drafter(Model& target) : target_(target), buf_(std::make_unique<Buffers
 // Host side of each slot's copies: the token before it, the confidence
 // logit and the draft.
 struct Drafter::HostIo {
+  std::int32_t tokens[kMaxSessions * kBlock];
+  std::int32_t pos[kMaxSessions * kBlock];
   std::int32_t prev[kMaxSessions];
   float conf[kMaxSessions];
   std::int32_t best[kMaxSessions];
@@ -648,19 +650,19 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
     }
   }
 
-  std::int32_t tokens[kMaxSessions * kBlock];
-  std::int32_t pos[kMaxSessions * kBlock];
+  HostIo& io = *io_;
   for (std::uint32_t s = 0; s < ns; ++s) {
     const std::uint32_t a = sessions[s]->Position();  // the anchor's position
     for (std::uint32_t i = 0; i < kBlock; ++i) {
-      tokens[s * kBlock + i] = i == 0 ? anchors[s] : mask_token_;
-      pos[s * kBlock + i] = static_cast<std::int32_t>(a + i) +
-                            sessions[s]->RopeDelta();  // text after any image
+      io.tokens[s * kBlock + i] = i == 0 ? anchors[s] : mask_token_;
+      io.pos[s * kBlock + i] =
+          static_cast<std::int32_t>(a + i) +
+          sessions[s]->RopeDelta();  // text after any image
     }
   }
-  HY4_CHECK(hipMemcpyAsync(b.tokens, tokens, n * sizeof(std::int32_t),
+  HY4_CHECK(hipMemcpyAsync(b.tokens, io.tokens, n * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, st));
-  HY4_CHECK(hipMemcpyAsync(b.pos, pos, n * sizeof(std::int32_t),
+  HY4_CHECK(hipMemcpyAsync(b.pos, io.pos, n * sizeof(std::int32_t),
                            hipMemcpyHostToDevice, st));
   HY4_CHECK(hy4_embed_q8_0(tw.tok_embd.data, b.tokens, n, kHidden, b.x, st));
 
@@ -735,9 +737,8 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
       return false;
     if (!MatVec(l.o, b.attv, y_buf, kHidden, kHeads * kHeadV, n, ex, error))
       return false;
-    HY4_CHECK(hy4_rms_norm(y_buf, l.post_proj_norm.f32(), y_buf, n, kHidden,
-                           kHidden, kEps, st));
-    HY4_CHECK(hy4_add(x_buf, y_buf, x_buf, std::uint64_t{n} * kHidden, st));
+    HY4_CHECK(hy4_rms_norm_add(y_buf, l.post_proj_norm.f32(), x_buf, n, kHidden,
+                               kEps, st));
 
     HY4_CHECK(hy4_rms_norm(x_buf, l.ffn_norm.f32(), b.xn, n, kHidden, kHidden,
                            kEps, st));
@@ -756,7 +757,6 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
   // token before it, through the target's LM head. The confidence head reads
   // the corrected hidden, so a slot it stops at skips the LM head. The
   // sessions still drafting share each slot's correction and head.
-  HostIo& io = *io_;
   std::int32_t prev[kMaxSessions];
   float accept[kMaxSessions];
   bool going[kMaxSessions];
@@ -785,17 +785,9 @@ bool Drafter::DraftBatch(std::span<const Session* const> sessions,
     HY4_CHECK(hipMemcpyAsync(b.prev, io.prev, na * sizeof(std::int32_t),
                              hipMemcpyHostToDevice, st));
     HY4_CHECK(hy4_embed_q8_0(tw.tok_embd.data, b.prev, na, kHidden, b.y, st));
-    HY4_CHECK(hipMemcpy2DAsync(b.cat, 2 * kHidden * sizeof(float), b.hs,
-                               kHidden * sizeof(float), kHidden * sizeof(float),
-                               na, hipMemcpyDeviceToDevice, st));
-    HY4_CHECK(hipMemcpy2DAsync(b.cat + kHidden, 2 * kHidden * sizeof(float),
-                               b.y, kHidden * sizeof(float),
-                               kHidden * sizeof(float), na,
-                               hipMemcpyDeviceToDevice, st));
-    HY4_CHECK(hy4_rms_norm(b.cat, corr_hnorm_.f32(), b.cat, na, kHidden,
-                           2 * kHidden, kEps, st));
-    HY4_CHECK(hy4_rms_norm(b.cat + kHidden, corr_enorm_.f32(), b.cat + kHidden,
-                           na, kHidden, 2 * kHidden, kEps, st));
+    HY4_CHECK(hy4_rms_norm_pair_cat(b.hs, corr_hnorm_.f32(), b.y,
+                                    corr_enorm_.f32(), b.cat, na, kHidden, kEps,
+                                    st));
     if (!SwigluVec(corr_gate_, corr_up_, b.ffa, b.ffb, b.ffc, kHidden, b.cat,
                    2 * kHidden, na, ex, error))
       return false;

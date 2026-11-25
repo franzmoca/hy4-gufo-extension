@@ -42,6 +42,16 @@ int hy4_rms_norm(const float* x, const float* weight, float* out, uint32_t rows,
 int hy4_rms_norm_half(const float* x, const float* weight, float* out,
                       uint16_t* out_half, uint32_t rows, uint32_t dim,
                       uint32_t stride, float eps, hipStream_t stream);
+/* Fused residual RMS norm: x[r] += rms_norm(y[r], weight, eps) for rows of
+ * width dim (contiguous stride == dim). */
+int hy4_rms_norm_add(const float* y, const float* weight, float* x,
+                     uint32_t rows, uint32_t dim, float eps,
+                     hipStream_t stream);
+/* Fused pair RMS norm + concat: out[r, 0:dim] = rms_norm(x1[r], w1),
+ * out[r, dim:2*dim] = rms_norm(x2[r], w2) (contiguous inputs of width dim). */
+int hy4_rms_norm_pair_cat(const float* x1, const float* w1, const float* x2,
+                          const float* w2, float* out, uint32_t rows,
+                          uint32_t dim, float eps, hipStream_t stream);
 
 /* iHC pre-mix of one layer half (llama.cpp build_hc_pre) for n tokens of
  * `hc` streams h[t, hc, dim]: mixes = fn [2 hc][hc dim] . rms_norm(flat h)
@@ -151,6 +161,11 @@ int hy4_gemv_swiglu(int type, const void* gate, const void* up, const float* x,
 int hy4_gemv_q8_0_grouped(const void* w, const float* x, float* y, uint32_t m, uint32_t k,
                           uint32_t groups, uint32_t n, uint64_t x_tok, uint64_t x_grp, uint64_t y_tok,
                           uint64_t y_grp, hipStream_t stream);
+/* Two Q8_0 [m][k] projections of the same x [n][k] stored side-by-side into
+ * y [n][2 * m]: y[t, 0:m] = w1 x[t], y[t, m:2*m] = w2 x[t]. */
+int hy4_gemv_q8_0_pair_strided(const void* w1, const void* w2, const float* x,
+                               float* y, uint32_t m, uint32_t k, uint32_t n,
+                               hipStream_t stream);
 
 /* Splits Q8_0 blocks into their values as binary16 bits (q, 32 per block)
  * and their scales (d, one per block), for hy4_mla_absorb. */
@@ -196,6 +211,14 @@ int hy4_mla_prep(float* qr, const float* q_norm, uint32_t q_lora, float* kva,
                  const float* kv_norm, uint32_t kv_lora, uint32_t dk,
                  const int32_t* pos, const int32_t* pos_hw, uint32_t n_rot,
                  float base, float eps, uint32_t n, hipStream_t stream);
+/* As hy4_mla_prep, and also stores each token's normalized/roped kva row as
+ * binary16 into kv_cache[(kv_pos[t] % kv_ring) * dk]. */
+int hy4_mla_prep_store(float* qr, const float* q_norm, uint32_t q_lora,
+                       float* kva, const float* kv_norm, uint32_t kv_lora,
+                       uint32_t dk, const int32_t* pos, const int32_t* pos_hw,
+                       uint32_t n_rot, float base, float eps,
+                       uint16_t* kv_cache, uint32_t kv_ring,
+                       const int32_t* kv_pos, uint32_t n, hipStream_t stream);
 
 /* MLA attention with learnable sinks over latent rows (llama.cpp
  * build_attn_mha with wv_b applied by the caller). q[t, h, 0:dk] holds the
@@ -305,6 +328,15 @@ int hy4_add_bias_rows(float* x, const float* bias, uint32_t n, uint32_t rows_per
 int hy4_kpool_pool(const float* rows, uint32_t ring, const int32_t* groups, uint32_t n_groups,
                    uint32_t kpool, const float* ape, const float* norm_w, float eps, float* pooled_out,
                    uint32_t pool_ring, uint32_t dim, hipStream_t stream);
+/* As hy4_kpool_pool, fused with 3D RoPE on the last n_rot elements of each
+ * pooled group row using group_pos[n_groups] and optional
+ * group_hw[n_groups][2]. */
+int hy4_kpool_pool_rope(const float* rows, uint32_t ring, const int32_t* groups,
+                        const int32_t* group_pos, const int32_t* group_hw,
+                        uint32_t n_groups, uint32_t kpool, const float* ape,
+                        const float* norm_w, float eps, uint32_t n_rot,
+                        float rope_base, float* pooled_out, uint32_t pool_ring,
+                        uint32_t dim, hipStream_t stream);
 
 /* Indexer scores: score[t, g] = sum_h relu(q[t, h] . pooled[g]) * w[t, h]
  * for g < n_pool[t] (others -inf), heads of dim floats, pooled rows dim
