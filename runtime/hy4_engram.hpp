@@ -39,7 +39,8 @@ public:
       std::span<const std::uint64_t> rows, std::uint8_t* out,
       bool urgent = false);
   /// Queues low-priority background reads of `rows` into the row cache so a
-  /// subsequent Start() hits RAM without blocking on NVMe I/O.
+  /// subsequent Start() hits RAM without blocking on NVMe I/O. Readers take
+  /// them only when no gather is waiting.
   void Prefetch(std::span<const std::uint64_t> rows);
   /// Waits for `gather`; false when a read failed.
   [[nodiscard]] bool Wait(Gather& gather);
@@ -77,6 +78,7 @@ private:
   std::condition_variable wake_;
   std::condition_variable done_;
   std::deque<Job> jobs_;
+  std::deque<Job> prefetch_;  // served only while jobs_ is empty
   bool stop_ = false;
 };
 
