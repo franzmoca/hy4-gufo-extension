@@ -47,8 +47,18 @@ constexpr std::uint32_t kDefaultContext = 32768;
 constexpr std::size_t kBatchTransferStreams = 16;
 // DFly2 drafts per step without --dfly-draft-tokens.
 constexpr std::int64_t kDefaultDraftTokens = 7;
-// See Hy4TextRunner::min_accept_.
+// See Hy4TextRunner::min_accept_ / min_accept_first_.
 constexpr float kDefaultMinAccept = 0.45f;
+// Slot-1 threshold at low concurrency (ns <= 2): once the 5-layer DFly2 trunk
+// pass is already paid, emitting the first draft down to ~0.30 recovers wasted
+// zero-draft rounds without over-drafting later slots.
+constexpr float kDefaultMinAcceptFirst = 0.30f;
+// Adaptive DFly2 cooldown: if a session's EWMA accepted tokens per DFly2 round
+// falls below break-even after warmup, skip DFly2 for a few steps before
+// probing again (HY4_DFLY_ADAPTIVE=0 disables).
+constexpr float kAdaptiveMinAcceptEwma = 0.22f;
+constexpr std::uint32_t kAdaptiveWarmupRounds = 6;
+constexpr std::uint32_t kAdaptiveCooldownSteps = 4;
 // At six or more concurrent sessions, 16 verify rows leave at most one draft
 // token per session and plain AR beats DFly2 on prose; prompt-lookup copies
 // still run at any batch width (HY4_DFLY_MAX_CONCURRENCY overrides).
@@ -188,6 +198,7 @@ public:
     (void)adapter_->Invalidate(*slot_);
     position_ = 0;
     lookup_.Clear();
+    ResetDflyTracker();
   }
 
   [[nodiscard]] std::shared_ptr<mem::StateAccount> state_account()
@@ -204,6 +215,28 @@ public:
   }
   /// Prompt lookup over the session's committed tokens.
   [[nodiscard]] lookup::PromptLookup<std::int32_t>& lookup() { return lookup_; }
+  bool ShouldSkipDfly(bool adaptive_enabled) noexcept {
+    if (!adaptive_enabled || dfly_cooldown_ == 0)
+      return false;
+    --dfly_cooldown_;
+    return true;
+  }
+  void ObserveDfly(std::uint32_t accepted, bool adaptive_enabled) noexcept {
+    if (!adaptive_enabled)
+      return;
+    dfly_ewma_acc_ =
+        0.75f * dfly_ewma_acc_ + 0.25f * static_cast<float>(accepted);
+    ++dfly_rounds_;
+    if (dfly_rounds_ >= kAdaptiveWarmupRounds &&
+        dfly_ewma_acc_ < kAdaptiveMinAcceptEwma) {
+      dfly_cooldown_ = kAdaptiveCooldownSteps;
+    }
+  }
+  void ResetDflyTracker() noexcept {
+    dfly_ewma_acc_ = 1.0f;
+    dfly_rounds_ = 0;
+    dfly_cooldown_ = 0;
+  }
   void set_images(std::shared_ptr<ImageSource> images) {
     images_ = std::move(images);
     session_->SetImages(images_);
@@ -212,6 +245,9 @@ public:
 private:
   std::shared_ptr<ImageSource> images_;
   lookup::PromptLookup<std::int32_t> lookup_;
+  float dfly_ewma_acc_{1.0f};
+  std::uint32_t dfly_rounds_{0};
+  std::uint32_t dfly_cooldown_{0};
   Session* session_{};
   cache::Adapter* adapter_{};
   cache::Slot* slot_{};
@@ -471,7 +507,9 @@ public:
     if (RequireState(state).position() != prefix.size()) {
       throw std::logic_error("Hy4 reused prefix does not match checkpoint");
     }
-    RequireState(state).lookup().BeginRequest();
+    auto& hy4 = RequireState(state);
+    hy4.lookup().BeginRequest();
+    hy4.ResetDflyTracker();
   }
 
   // The tokens a step from `offset` takes: at most max_input_tokens, never
@@ -525,6 +563,7 @@ public:
         StepTokens(hy4, prompt, offset, max_input_tokens);
     const auto tokens = EngineTokens(prompt.subspan(offset, consumed));
     hy4.lookup().BeginRequest();
+    hy4.ResetDflyTracker();
     std::string error;
     const PrefillYieldScope yields(hy4.session(), state);
     if (!hy4.session().Prompt(tokens, &error))
@@ -571,6 +610,7 @@ public:
     std::vector<std::vector<float>> logits;
     const auto tokens = EngineTokens(prompt.subspan(offset, *end - offset));
     hy4.lookup().BeginRequest();
+    hy4.ResetDflyTracker();
     std::string error;
     const PrefillYieldScope yields(hy4.session(), state);
     if (!hy4.session().PromptThrough(tokens, rows, &logits, &error))
@@ -810,7 +850,8 @@ private:
                        copy_room, &plan.proposals);
     }
     const bool draft = allow_dfly && !anchor.stop && plan.proposals.empty() &&
-                       drafter_ && session.TapsReady() && draft_room > 0;
+                       drafter_ && session.TapsReady() && draft_room > 0 &&
+                       !hy4.ShouldSkipDfly(dfly_adaptive_);
     if (anchor.stop || (plan.proposals.empty() && !draft)) {
       plan.step.stop = anchor.stop;
       if (anchor.stop) {
@@ -855,8 +896,10 @@ private:
     const auto t0 = std::chrono::steady_clock::now();
     if (!sessions.empty()) {
       std::string error;
+      const float first_thr =
+          sessions.size() <= 2 ? min_accept_first_ : min_accept_;
       if (!drafter_->DraftBatch(sessions, anchors, counts, min_accept_, drafts,
-                                &error, total_budget))
+                                &error, total_budget, first_thr))
         throw std::runtime_error("Hy4 draft failed: " + error);
     }
     const auto t1 = std::chrono::steady_clock::now();
@@ -924,6 +967,8 @@ private:
     hy4.set_position(session.Position());
     if (plan.copy.length != 0)
       hy4.lookup().Observe(plan.copy.start, proposals.size(), kept - 1);
+    if (plan.draft_count != 0)
+      hy4.ObserveDfly(kept - 1, dfly_adaptive_);
     if (profile_) {
       Profile& p = *profile_;
       p.rounds += 1;
@@ -1088,8 +1133,19 @@ private:
   std::uint32_t draft_tokens_{0};
   // Draft while the confidence head's chance that every draft so far is
   // accepted stays at least this (HY4_DFLY_MIN_ACCEPT overrides).
-  float min_accept_{std::getenv("HY4_DFLY_MIN_ACCEPT") ? std::strtof(std::getenv("HY4_DFLY_MIN_ACCEPT"), nullptr)
-                                                       : kDefaultMinAccept};
+  float min_accept_{
+      std::getenv("HY4_DFLY_MIN_ACCEPT")
+          ? std::strtof(std::getenv("HY4_DFLY_MIN_ACCEPT"), nullptr)
+          : kDefaultMinAccept};
+  float min_accept_first_{
+      std::getenv("HY4_DFLY_MIN_ACCEPT_FIRST")
+          ? std::strtof(std::getenv("HY4_DFLY_MIN_ACCEPT_FIRST"), nullptr)
+          : (std::getenv("HY4_DFLY_MIN_ACCEPT") ? min_accept_
+                                                : kDefaultMinAcceptFirst)};
+  bool dfly_adaptive_{
+      std::getenv("HY4_DFLY_ADAPTIVE")
+          ? std::strtol(std::getenv("HY4_DFLY_ADAPTIVE"), nullptr, 10) != 0
+          : true};
   std::size_t dfly_max_concurrency_{
       std::getenv("HY4_DFLY_MAX_CONCURRENCY")
           ? static_cast<std::size_t>(std::max<long>(
