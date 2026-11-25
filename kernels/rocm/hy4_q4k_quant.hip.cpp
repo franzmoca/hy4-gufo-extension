@@ -39,7 +39,7 @@ __device__ __forceinline__ int Q4Code(float iscale, float x, float min_v) {
 
 // ggml make_qkx2_quants(32, 15, x, w, L, &the_min, Laux, -1, 0.1, 20, false).
 __device__ float Qkx2Scale(const float (&x)[32], const float (&w)[32],
-                           float* the_min) {
+                           float* the_min, uint8_t (&L)[32]) {
   float min_v = x[0];
   float max_v = x[0];
   float sum_w = w[0];
@@ -55,6 +55,8 @@ __device__ float Qkx2Scale(const float (&x)[32], const float (&w)[32],
   if (min_v > 0.0f)
     min_v = 0.0f;
   if (max_v == min_v) {
+    for (int i = 0; i < 32; ++i)
+      L[i] = 0;
     *the_min = -min_v;
     return 0.0f;
   }
@@ -63,6 +65,7 @@ __device__ float Qkx2Scale(const float (&x)[32], const float (&w)[32],
   float best_error = 0.0f;
   for (int i = 0; i < 32; ++i) {
     const int l = Q4Code(iscale, x[i], min_v);
+    L[i] = static_cast<uint8_t>(l);
     const float diff = scale * static_cast<float>(l) + min_v - x[i];
     best_error += w[i] * (diff * diff);
   }
@@ -92,6 +95,8 @@ __device__ float Qkx2Scale(const float (&x)[32], const float (&w)[32],
       error += w[i] * (diff * diff);
     }
     if (error < best_error) {
+      for (int i = 0; i < 32; ++i)
+        L[i] = static_cast<uint8_t>(Q4Code(iscale, x[i], min_v));
       best_error = error;
       scale = this_scale;
       min_v = this_min;
@@ -138,6 +143,7 @@ __global__ void QuantizeToQ4KKernel(const void* __restrict__ src,
       static_cast<uint64_t>(blockIdx.x) * kPerBlock + local;
   const bool active = superblock < superblocks;
   float x[32];
+  uint8_t codes[32];  // make_qkx2_quants' L, kept where the scale rounds to 0
   if (active) {
     LoadSubblock<kSrc>(src, superblock * 8 + j, x);
     float sum_x2 = 0.0f;
@@ -148,7 +154,7 @@ __global__ void QuantizeToQ4KKernel(const void* __restrict__ src,
     for (int i = 0; i < 32; ++i)
       w[i] = av_x + __builtin_fabsf(x[i]);
     float the_min = 0.0f;
-    scales_s[local][j] = Qkx2Scale(x, w, &the_min);
+    scales_s[local][j] = Qkx2Scale(x, w, &the_min, codes);
     mins_s[local][j] = the_min;
   }
   __syncthreads();
@@ -196,7 +202,7 @@ __global__ void QuantizeToQ4KKernel(const void* __restrict__ src,
     const float dm = __half2float(dmin16) * static_cast<float>(m);
     for (int i = 0; i < 32; ++i) {
       const int l =
-          d != 0.0f ? max(0, min(15, NearestInt((x[i] + dm) / d))) : 0;
+          d != 0.0f ? max(0, min(15, NearestInt((x[i] + dm) / d))) : codes[i];
       codes_s[local][32 * j + i] = static_cast<uint8_t>(l);
     }
   }
