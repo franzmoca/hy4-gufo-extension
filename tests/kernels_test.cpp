@@ -1224,6 +1224,162 @@ void TestQuantizeBf16() {
          "quantize_q8_0_bf16 (" + std::to_string(mismatches) + " mismatches)");
 }
 
+// ggml's make_qkx2_quants(32, 15, x, w, L, &the_min, Laux, -1, 0.1, 20,
+// false) and quantize_row_q4_K_ref, in single precision without
+// contraction, as the reference for hy4_quantize_q4_k_*.
+float RefQkx2(const float* x, const float* w, uint8_t* L, float* the_min) {
+#pragma clang fp contract(off)
+  float min = x[0], max = x[0], sum_w = w[0], sum_x = sum_w * x[0];
+  for (int i = 1; i < 32; ++i) {
+    min = std::min(min, x[i]);
+    max = std::max(max, x[i]);
+    sum_w += w[i];
+    sum_x += w[i] * x[i];
+  }
+  if (min > 0.0f)
+    min = 0.0f;
+  if (max == min) {
+    std::fill(L, L + 32, 0);
+    *the_min = -min;
+    return 0.0f;
+  }
+  float iscale = 15.0f / (max - min);
+  float scale = 1.0f / iscale;
+  float best_error = 0.0f;
+  for (int i = 0; i < 32; ++i) {
+    const int l = (int)std::nearbyint(iscale * (x[i] - min));
+    L[i] = (uint8_t)std::max(0, std::min(15, l));
+    const float diff = scale * L[i] + min - x[i];
+    best_error += w[i] * (diff * diff);
+  }
+  uint8_t laux[32];
+  for (int is = 0; is <= 20; ++is) {
+    iscale = (-1.0f + 0.1f * is + 15.0f) / (max - min);
+    float sum_l = 0.0f, sum_l2 = 0.0f, sum_xl = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+      const int l = (int)std::nearbyint(iscale * (x[i] - min));
+      laux[i] = (uint8_t)std::max(0, std::min(15, l));
+      sum_l += w[i] * laux[i];
+      sum_l2 += w[i] * laux[i] * laux[i];
+      sum_xl += w[i] * laux[i] * x[i];
+    }
+    const float det = sum_w * sum_l2 - sum_l * sum_l;
+    if (det <= 0.0f)
+      continue;
+    float this_scale = (sum_w * sum_xl - sum_x * sum_l) / det;
+    float this_min = (sum_l2 * sum_x - sum_l * sum_xl) / det;
+    if (this_min > 0.0f) {
+      this_min = 0.0f;
+      this_scale = sum_xl / sum_l2;
+    }
+    float error = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+      const float diff = this_scale * laux[i] + this_min - x[i];
+      error += w[i] * (diff * diff);
+    }
+    if (error < best_error) {
+      std::copy(laux, laux + 32, L);
+      best_error = error;
+      scale = this_scale;
+      min = this_min;
+    }
+  }
+  *the_min = -min;
+  return scale;
+}
+
+std::vector<uint8_t> RefQ4K(const float* x) {
+#pragma clang fp contract(off)
+  uint8_t L[256];
+  float scales[8], mins[8], max_scale = 0.0f, max_min = 0.0f;
+  for (int j = 0; j < 8; ++j) {
+    float sum_x2 = 0.0f;
+    for (int l = 0; l < 32; ++l)
+      sum_x2 += x[32 * j + l] * x[32 * j + l];
+    const float av_x = std::sqrt(sum_x2 / 32.0f);
+    float w[32];
+    for (int l = 0; l < 32; ++l)
+      w[l] = av_x + std::fabs(x[32 * j + l]);
+    scales[j] = RefQkx2(x + 32 * j, w, L + 32 * j, &mins[j]);
+    max_scale = std::max(max_scale, scales[j]);
+    max_min = std::max(max_min, mins[j]);
+  }
+  const float inv_scale = max_scale > 0.0f ? 63.0f / max_scale : 0.0f;
+  const float inv_min = max_min > 0.0f ? 63.0f / max_min : 0.0f;
+  std::vector<uint8_t> out(144, 0);
+  uint8_t* sc = out.data() + 4;
+  for (int j = 0; j < 8; ++j) {
+    const uint8_t ls =
+        (uint8_t)std::min(63, (int)std::nearbyint(inv_scale * scales[j]));
+    const uint8_t lm =
+        (uint8_t)std::min(63, (int)std::nearbyint(inv_min * mins[j]));
+    if (j < 4) {
+      sc[j] = ls;
+      sc[j + 4] = lm;
+    } else {
+      sc[j + 4] = (uint8_t)((ls & 0xF) | ((lm & 0xF) << 4));
+      sc[j - 4] |= (uint8_t)((ls >> 4) << 6);
+      sc[j] |= (uint8_t)((lm >> 4) << 6);
+    }
+  }
+  const _Float16 d16 = (_Float16)(max_scale / 63.0f);
+  const _Float16 dmin16 = (_Float16)(max_min / 63.0f);
+  std::memcpy(out.data(), &d16, 2);
+  std::memcpy(out.data() + 2, &dmin16, 2);
+  for (int j = 0; j < 8; ++j) {
+    const uint8_t s =
+        j < 4 ? sc[j] & 63
+              : (uint8_t)((sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4));
+    const uint8_t m = j < 4 ? sc[j + 4] & 63
+                            : (uint8_t)((sc[j + 4] >> 4) | ((sc[j] >> 6) << 4));
+    const float d = (float)d16 * s;
+    if (d == 0.0f)
+      continue;  // keeps make_qkx2_quants' codes
+    const float dm = (float)dmin16 * m;
+    for (int i = 0; i < 32; ++i) {
+      const int l = (int)std::nearbyint((x[32 * j + i] + dm) / d);
+      L[32 * j + i] = (uint8_t)std::max(0, std::min(15, l));
+    }
+  }
+  uint8_t* q = out.data() + 16;
+  for (int j = 0; j < 256; j += 64, q += 32)
+    for (int l = 0; l < 32; ++l)
+      q[l] = (uint8_t)(L[j + l] | (L[j + l + 32] << 4));
+  return out;
+}
+
+// hy4_quantize_q4_k_half byte for byte against ggml's reference, with a
+// sub-block whose scale rounds to 0 next to its neighbours and an all-zero
+// super-block.
+void TestQuantizeQ4KGgml() {
+  const uint64_t superblocks = 600;
+  std::vector<uint16_t> src(superblocks * 256);
+  std::vector<float> values(src.size());
+  const auto r = Random(src.size(), -3, 3);
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    float v = r[i];
+    if (i / 32 % 8 == 3 && i / 256 % 5 == 1)
+      v *= 1e-4f;  // tiny sub-block: its 6-bit scale rounds to 0
+    if (i / 256 == 7)
+      v = 0.0f;
+    const _Float16 h = (_Float16)v;
+    std::memcpy(&src[i], &h, 2);
+    values[i] = (float)h;
+  }
+  auto* out = Device(std::vector<uint8_t>(superblocks * 144));
+  Expect(hy4_quantize_q4_k_half(Device(src), superblocks, out, nullptr) == 0,
+         "quantize_q4_k_half status");
+  const auto got = Host(out, superblocks * 144);
+  int mismatches = 0;
+  for (uint64_t b = 0; b < superblocks; ++b) {
+    const auto want = RefQ4K(values.data() + b * 256);
+    for (int i = 0; i < 144; ++i)
+      mismatches += got[b * 144 + i] != want[i];
+  }
+  Expect(mismatches == 0, "quantize_q4_k_half (" + std::to_string(mismatches) +
+                              " byte mismatches)");
+}
+
 void TestGatherRows() {
   const uint32_t rows = 50, words = 816;  // a 3,072-wide Q8_0 row
   std::vector<uint32_t> src(rows * words);
@@ -2708,6 +2864,7 @@ int main() {
   TestDecodeFusions();
   TestQuantizeHalf();
   TestQuantizeBf16();
+  TestQuantizeQ4KGgml();
   TestQuantizeQ4K();
   TestGatherRows();
   TestElementwise();
