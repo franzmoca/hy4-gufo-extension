@@ -379,7 +379,7 @@ __global__ void __launch_bounds__(kBlock)
     HcApplyNorm(const float* h, const float* partial, const float* scale,
                 const float* base, float* x, float* out, const float* weight,
                 float* post, uint32_t hc, uint32_t dim, float eps, float hc_eps,
-                float magnitude) {
+                float magnitude, _Float16* out_half = nullptr) {
   __shared__ float mix_s[kHcMaxMix + 1];
   __shared__ float pre_s[8];
   __shared__ float scratch[32];
@@ -419,10 +419,17 @@ __global__ void __launch_bounds__(kBlock)
     ss += xt[i] * xt[i];
   ss = BlockSum(ss, scratch);
   const float rscale = rsqrtf(ss / (float)dim + eps);
-  float* yt = out + (uint64_t)t * dim;
+  float* yt = out ? out + (uint64_t)t * dim : nullptr;
+  _Float16* yht = out_half ? out_half + (uint64_t)t * dim : nullptr;
   for (uint32_t i = threadIdx.x; i < dim; i += blockDim.x) {
     const float v = xt[i] * rscale;
-    yt[i] = weight ? v * weight[i] : v;
+    float y = weight ? v * weight[i] : v;
+    if (yt)
+      yt[i] = y;
+    if (yht) {
+      asm volatile("" : "+v"(y));
+      yht[i] = (_Float16)y;
+    }
   }
 }
 
@@ -497,7 +504,8 @@ __global__ void __launch_bounds__(kBlock)
     HcApplyNormFast(const float* h, const float* partial, const float* scale,
                     const float* base, float* x, float* out,
                     const float* weight, float* post, uint32_t dim, float eps,
-                    float hc_eps, float magnitude) {
+                    float hc_eps, float magnitude,
+                    _Float16* out_half = nullptr) {
   __shared__ float mix_s[kHcMaxMix + 1];
   __shared__ float pre_s[HC];
   __shared__ float scratch[32];
@@ -527,7 +535,7 @@ __global__ void __launch_bounds__(kBlock)
   for (uint32_t i = 0; i < HC; ++i)
     pre[i] = pre_s[i];
   const float* ht = h + (uint64_t)t * HC * dim;
-  float* xt = x + (uint64_t)t * dim;
+  float* xt = x ? x + (uint64_t)t * dim : nullptr;
   float xv[kPer];
 #pragma unroll
   for (uint32_t r = 0; r < kPer; ++r) {
@@ -537,7 +545,8 @@ __global__ void __launch_bounds__(kBlock)
 #pragma unroll
       for (uint32_t i = 0; i < HC; ++i)
         acc += ht[(uint64_t)i * dim + c] * pre[i];
-      xt[c] = acc;
+      if (xt)
+        xt[c] = acc;
     }
     xv[r] = acc;
   }
@@ -548,13 +557,20 @@ __global__ void __launch_bounds__(kBlock)
       ss += xv[r] * xv[r];
   ss = BlockSum(ss, scratch);
   const float rscale = rsqrtf(ss / (float)dim + eps);
-  float* yt = out + (uint64_t)t * dim;
+  float* yt = out ? out + (uint64_t)t * dim : nullptr;
+  _Float16* yht = out_half ? out_half + (uint64_t)t * dim : nullptr;
 #pragma unroll
   for (uint32_t r = 0; r < kPer; ++r) {
     const uint32_t c = threadIdx.x + r * kBlock;
     if (c < dim) {
       const float v = xv[r] * rscale;
-      yt[c] = weight ? v * weight[c] : v;
+      float y = weight ? v * weight[c] : v;
+      if (yt)
+        yt[c] = y;
+      if (yht) {
+        asm volatile("" : "+v"(y));
+        yht[c] = (_Float16)y;
+      }
     }
   }
 }
@@ -3274,6 +3290,59 @@ int hy4_hc_post_pre(const float* y, const float* post_prev, float* h,
         h, fn, partial, hc * dim, n, y, post_prev, hc, dim);
   HcApply<<<dim3(Blocks(dim, 64), n), kBlock, 0, stream>>>(
       h, partial, scale, base, out, post, hc, dim, eps, hc_eps, magnitude);
+  return Status();
+}
+
+int hy4_hc_post_pre_norm(const float* y, const float* post_prev, float* h,
+                         const float* fn, const float* scale, const float* base,
+                         float* x_scratch, float* out, uint16_t* out_half,
+                         const float* out_norm, float* post, uint32_t n,
+                         uint32_t hc, uint32_t dim, float eps, float hc_eps,
+                         float magnitude, hipStream_t stream) {
+  if (n == 0)
+    return 0;
+  if (hc > 8)
+    return 1;
+  float* partial = HcPartial(n);
+  if (!partial)
+    return 1;
+  const uint32_t n_mix = post ? 2 * hc : hc;
+  constexpr uint32_t kTok = 8;
+  const dim3 groups(kHcSlices, (n + kTok - 1) / kTok);
+  if (y) {
+    if (n >= kTok && n_mix == 8) {
+      HcMixTokens<kTok, 8, true><<<groups, kBlock, 0, stream>>>(
+          h, fn, partial, hc * dim, n, y, post_prev, hc, dim);
+    } else if (n >= kTok && n_mix == 4) {
+      HcMixTokens<kTok, 4, true><<<groups, kBlock, 0, stream>>>(
+          h, fn, partial, hc * dim, n, y, post_prev, hc, dim);
+    } else {
+      if (int rc = hy4_hc_post(y, h, post_prev, h, n, hc, dim, stream))
+        return rc;
+      HcMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(h, fn, partial, hc * dim,
+                                                       n_mix);
+    }
+  } else {
+    if (n >= kTok && n_mix == 8)
+      HcMixTokens<kTok, 8>
+          <<<groups, kBlock, 0, stream>>>(h, fn, partial, hc * dim, n);
+    else if (n >= kTok && n_mix == 4)
+      HcMixTokens<kTok, 4>
+          <<<groups, kBlock, 0, stream>>>(h, fn, partial, hc * dim, n);
+    else
+      HcMix<<<dim3(kHcSlices, n), kBlock, 0, stream>>>(h, fn, partial, hc * dim,
+                                                       n_mix);
+  }
+  constexpr uint32_t kPer = 12;
+  auto* oh = reinterpret_cast<_Float16*>(out_half);
+  if (hc == 4 && dim <= kPer * kBlock)
+    HcApplyNormFast<4, kPer><<<dim3(1, n), kBlock, 0, stream>>>(
+        h, partial, scale, base, nullptr, out, out_norm, post, dim, eps, hc_eps,
+        magnitude, oh);
+  else
+    HcApplyNorm<<<dim3(1, n), kBlock, 0, stream>>>(
+        h, partial, scale, base, x_scratch, out, out_norm, post, hc, dim, eps,
+        hc_eps, magnitude, oh);
   return Status();
 }
 
